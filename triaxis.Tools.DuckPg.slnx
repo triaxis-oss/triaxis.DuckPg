@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/triaxis.Tools.DuckPg/triaxis.Tools.DuckPg.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/triaxis.Tools.DuckPg.Tests/triaxis.Tools.DuckPg.Tests.csproj" />
+  </Folder>
+</Solution>

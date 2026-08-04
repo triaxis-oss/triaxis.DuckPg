@@ -1,0 +1,85 @@
+using System.CommandLine.Parsing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using triaxis.CommandLine;
+using Microsoft.Extensions.Hosting;
+
+namespace triaxis.Tools.DuckPg;
+
+[Command(Description = "Serves a stack of YAML, JSON and parquet layers over the PostgreSQL wire protocol.")]
+public class ServeCommand : LoggingCommand
+{
+    const string DefaultConfig = "duckpg.yaml";
+
+    [Argument(Description = "Layer directories, lowest first. Overrides the configuration.")]
+    public string[] Layers { get; set; } = [];
+
+    [Option("--config", "-c", Description = "Configuration file.")]
+    public string ConfigPath { get; set; } = DefaultConfig;
+
+    [Option("--listen", "-l", Description = "Listen address.")]
+    public string? ListenAddress { get; set; }
+
+    [Option("--write", "-w", Description = "Directory holding the topmost layer, which accepts writes.")]
+    public string? Write { get; set; }
+
+    [Option("--write-format", Description = "Format a table is persisted in when the write layer has no file for it yet.")]
+    public LayerFormat? WriteFormat { get; set; }
+
+    [Option("--writable", Description = "Accept writes without a write directory; they are lost on exit.")]
+    public bool Writable { get; set; }
+
+    [Option("--schema", Description = "Schema the published views live in.")]
+    public string? Schema { get; set; }
+
+    [Option("--key", "-k", Description = "Column identifying a row, for tables that name no key of their own. Repeatable.")]
+    public string[] Key { get; set; } = [];
+
+    [Option("--dacpac", Description = "A .dacpac to take column names, order, types and keys from.")]
+    public string? Dacpac { get; set; }
+
+    [Inject] private readonly IConfiguration _configuration = null!;
+    [Inject] private readonly ILoggerFactory _loggers = null!;
+
+    /// The configuration file is named on the command line, so the source can only be added once
+    /// the arguments are parsed. Defaults alone are enough to serve a directory, so the file is
+    /// only required when it was actually asked for.
+    public static void Configure(IToolBuilder builder) =>
+        builder.ConfigureConfiguration((context, configuration) =>
+        {
+            var parsed = context.GetInvocationContext().ParseResult;
+            configuration.AddYamlFile(
+                Path.GetFullPath(parsed.GetValue<string>("--config") ?? DefaultConfig),
+                optional: parsed.GetResult("--config") is not OptionResult { Implicit: false },
+                reloadOnChange: false);
+        });
+
+    public async Task ExecuteAsync(CancellationToken cancellation)
+    {
+        var config = _configuration.Get<Config>() ?? new Config();
+        // `layers:` may be written as a single directory; only the list form binds on its own.
+        if (_configuration["layers"] is { Length: > 0 } single) config.Layers = [single];
+        config.ResolvePaths(Path.GetDirectoryName(Path.GetFullPath(ConfigPath))!);
+
+        // Arguments win over the file, and are relative to the working directory rather than to it.
+        if (Layers.Length > 0) config.Layers = [.. Layers.Select(Path.GetFullPath)];
+        if (ListenAddress is not null) config.Listen = ListenAddress;
+        if (Write is not null) config.Write = Path.GetFullPath(Write);
+        if (WriteFormat is { } format) config.WriteFormat = format;
+        if (Writable) config.Writable = true;
+        if (Schema is not null) config.Schema = Schema;
+        if (Key.Length > 0) config.DefaultKey = Key;
+        if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
+
+        using var lake = new Lake(config, _loggers);
+
+        foreach (var table in lake.Catalog.Tables.Values)
+            Logger.LogInformation("{Schema}.{Table} <- {Layers}{Writable}{Virtual}",
+                table.Schema, table.Name,
+                table.Layers.Count == 0 ? "(declared only)" : string.Join(" | ", table.Layers.Select(l => l.Source.Path)),
+                table.Writable ? " [writable]" : "",
+                table.Virtuals.Count > 0 ? " +" + string.Join(",", table.Virtuals.Select(v => v.Name)) : "");
+
+        await lake.ListenAsync(cancellation);
+    }
+}

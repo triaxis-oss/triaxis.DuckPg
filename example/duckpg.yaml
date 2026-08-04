@@ -1,0 +1,50 @@
+# Everything here has a command-line equivalent except the per-table blocks at the bottom,
+# which is what does not fit an argument.
+#
+#   duckpg ./common ./tenant --write ./local
+#
+listen: 127.0.0.1:55432
+schema: lake
+
+# Layer directories, lowest first. Each holds <table>.yaml, <table>.json, <table>.parquet or
+# <table>/**/*.parquet -- the format is a property of the file, not of the layer.
+layers:
+  - ./common
+  - ./tenant
+  # `k=v` directories are partitions above the tables, so db=one/stock.parquet and
+  # db=two/stock.parquet are one `stock` with a `db` column -- one view across both databases.
+  - ./warehouse
+
+# The topmost layer, and the only one that accepts writes. Created if missing.
+write: ./local
+writeFormat: yaml
+
+# What identifies a row, for tables that neither declare their own key nor take one from a
+# dacpac. It applies only where a table actually has those columns.
+defaultKey: [customer_id]
+
+# DuckDB scopes SET VARIABLE per connection, and every session gets its own connection -- so a
+# startup parameter can be read back by the view.
+sessionVariables:
+  tenant: user
+
+# Columns added to every table that does not already have one, for the audit columns a compact
+# export strips because they are bulky and say little.
+columns:
+  - name: source_file
+    expr: coalesce(regexp_extract("_file", '[^/]+$'), 'seed')
+
+tables:
+  customers:
+    # Filtering on the session variable is row-level security for free: `psql -U emea` sees the
+    # EMEA customers, `psql -U admin` sees all of them.
+    filter: getvariable('tenant') = 'admin' OR region = getvariable('tenant')
+
+  orders:
+    key: [order_id]
+    columns:
+      - name: currency
+        const: EUR
+      - name: eur_cents
+        expr: amount * 100
+        type: BIGINT

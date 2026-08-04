@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>triaxis.Tools.DuckPg.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <!-- Downloaded, not referenced: only the native library is wanted, and the managed assemblies
+         next to it would collide with the ones the tool already brings. -->
+    <PackageDownload Include="DuckDB.NET.Bindings.Full" Version="[1.5.5]" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/triaxis.Tools.DuckPg/triaxis.Tools.DuckPg.csproj" />
+  </ItemGroup>
+
+  <!-- The tool links against the DuckDB installed on the machine; the tests carry their own, so a
+       clean checkout and a clean CI runner can both run them. -->
+  <Target Name="CopyDuckDbNative" BeforeTargets="PrepareForRun">
+    <ItemGroup>
+      <DuckDbNative Include="$(NuGetPackageRoot)duckdb.net.bindings.full/1.5.5/runtimes/$(NETCoreSdkRuntimeIdentifier)/native/*" />
+    </ItemGroup>
+    <Error Condition="'@(DuckDbNative)' == ''"
+           Text="No DuckDB native library for $(NETCoreSdkRuntimeIdentifier) in DuckDB.NET.Bindings.Full." />
+    <Copy SourceFiles="@(DuckDbNative)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
