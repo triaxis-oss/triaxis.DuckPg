@@ -3,17 +3,18 @@
 Point any PostgreSQL tool at a stack of YAML, JSON and parquet files — no driver, no server, no
 Spark — and add columns, access rules and writes the files never had.
 
-duckpg speaks the PostgreSQL v3 wire protocol and executes against DuckDB. Each table is published
-as a view over its layers, so a table can come from a shared YAML seed, a tenant's JSON overrides
-and a parquet export at once, with the topmost layer holding a row winning. The top layer accepts
-writes, and what a client writes is an ordinary layer file another instance can read.
+duckpg speaks the PostgreSQL v3 wire protocol — and, on a second port, the TDS protocol that
+Microsoft.Data.SqlClient speaks — and executes against DuckDB. Each table is published as a view
+over its layers, so a table can come from a shared YAML seed, a tenant's JSON overrides and a
+parquet export at once, with the topmost layer holding a row winning. The top layer accepts writes,
+and what a client writes is an ordinary layer file another instance can read.
 
 ```
-                 ┌──────────────────────────────┐
-  psql, Npgsql   │  local/      write layer     │  INSERT / UPDATE / DELETE land here
-  ──────────────►│  tenant/     JSON, parquet   │  a row shadows the same key below
-  wire protocol  │  common/     YAML seed       │
-                 └──────────────────────────────┘
+  psql, Npgsql     ┌──────────────────────────────┐
+  ────────────────►│  local/      write layer     │  INSERT / UPDATE / DELETE land here
+  pg wire protocol │  tenant/     JSON, parquet   │  a row shadows the same key below
+  ────────────────►│  common/     YAML seed       │
+  SqlClient, TDS   └──────────────────────────────┘
 ```
 
 ## Install
@@ -122,6 +123,79 @@ which is what a test wants.
 `CALL duckpg_reload()` rebuilds the catalog from the filesystem, picking up files that appeared
 since startup.
 
+## The TDS front door
+
+`--tds 127.0.0.1:1433` (or `tds:` in the file) opens a second listener speaking the protocol
+SQL Server speaks, so an application built on `Microsoft.Data.SqlClient` reads the same lake with
+no driver change:
+
+```csharp
+using var connection = new SqlConnection("Server=127.0.0.1,1433;Database=lake;User ID=sa;Encrypt=False");
+using var command = new SqlCommand("SELECT TOP 10 [order_id], ISNULL([note], '') FROM [dbo].[orders]", connection);
+```
+
+**`Encrypt=False` is required.** duckpg answers PRELOGIN with `ENCRYPT_NOT_SUP`, because TDS
+encrypts the login packet even when the session itself is plaintext, and that needs a certificate
+this tool has no business owning. Bind it to localhost.
+
+Both doors share one lake, one catalog and one write layer: a row inserted over TDS is in the same
+file a `psql` session reads a moment later, and `sessionVariables` filtering works the same, keyed
+on the login's user name.
+
+What SqlClient does, and what answers it:
+
+| | |
+|---|---|
+| Login, `SELECT`, typed `SqlDataReader` reads, `NULL`s | COLMETADATA / ROW / DONE |
+| Parameterised commands (`sp_executesql`) | RPC, with values bound as DuckDB parameters |
+| `cmd.Prepare()`, repeated execution (`sp_prepexec` / `sp_execute` / `sp_unprepare`) | handles held per session |
+| `SqlTransaction` commit and rollback | transaction manager requests, ENVCHANGE descriptors |
+| Multi-statement batches, `NextResult()` | one DONE per statement, the last one final |
+| `INSERT` / `UPDATE` / `DELETE` | the same write layer the PostgreSQL side writes |
+| Errors an application can recover from | ERROR tokens with SQL Server's own numbers (208, 102, 245, …) |
+| `CommandTimeout`, `cmd.Cancel()` | Attention → `duckdb_interrupt` → DONE with the attention bit |
+| Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
+| `SET NOCOUNT ON` and its relatives | accepted and ignored |
+
+Not implemented: TLS and SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
+`SqlBulkCopy`, table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA`
+emulation — so SSMS and EF Core scaffolding will not introspect the lake, though hand-written
+queries run.
+
+## The T-SQL it accepts
+
+A client sends T-SQL; DuckDB does not speak it. duckpg **parses** it — lexer, recursive-descent
+parser, and a renderer that emits DuckDB SQL from the tree. Nothing is rewritten by pattern
+matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
+
+| Written | Becomes |
+|---|---|
+| `[bracketed]`, `"quoted"` names | quoted identifiers |
+| `dbo.orders`, `app.dbo.orders`, bare `orders` | the lake's schema |
+| `[dbo].[orders].[id]`, `[app].[dbo].[orders].[id]` | the same schema, so a qualified column still finds its table |
+| `SELECT TOP 5`, `OFFSET … FETCH NEXT` | `LIMIT` / `OFFSET` |
+| `N'text'`, `0xDEAD` | `'text'`, `from_hex('DEAD')` |
+| `ISNULL`, `LEN`, `IIF`, `CHARINDEX`, `NEWID`, `GETDATE`, `GETUTCDATE`, `CEILING` | their DuckDB equivalents, argument order and all |
+| `DATEPART(day, d)`, `DATEDIFF`, `DATEADD` | `date_part('day', d)`, `date_diff`, interval arithmetic |
+| `CAST(x AS NVARCHAR(MAX))`, `INT`, `BIT`, `DATETIME2`, `UNIQUEIDENTIFIER`, `MONEY` | `VARCHAR`, `INTEGER`, `BOOLEAN`, `TIMESTAMP`, `UUID`, `DECIMAL(19,4)` |
+| `CONVERT(INT, x)` | `CAST(x AS INTEGER)` |
+| `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
+| `WITH (NOLOCK)` and other table hints | dropped |
+| `SET NOCOUNT ON`, isolation levels | no-ops |
+
+`+` becomes `||` only where one side is provably text — a string literal, a `CAST` to a character
+type, or a function that returns one. Everywhere else it stays arithmetic, because guessing would
+turn `1 + 2` into `'12'`.
+
+An ORM that qualifies everything it writes — LLBLGen Pro among them — is what this is for: table
+references, column references and `TOP(@p)` paging over a row-numbered derived table all land on
+the lake without the application knowing what it is talking to.
+
+A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, `MERGE`,
+`CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax error naming it, rather than
+passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
+`[a-z]` ranges have no DuckDB equivalent.
+
 ## Columns the files do not contain
 
 Each table is published as a generated view, so an extra column is just an extra projection:
@@ -200,7 +274,8 @@ variables and the tool's usual override files layer over it for free.
 
 | Key | Argument | Meaning |
 |---|---|---|
-| `listen` | `--listen`, `-l` | Listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
+| `listen` | `--listen`, `-l` | PostgreSQL listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
+| `tds` | `--tds` | TDS listen address, e.g. `127.0.0.1:1433`. Off unless set. |
 | `schema` | `--schema` | Schema the published views live in. Default `lake`. |
 | `layers` | positional | Layer directories, lowest first. |
 | `write` | `--write`, `-w` | Directory holding the writable top layer. |
@@ -237,7 +312,8 @@ fails differently. psql works too, but it is not what the shims are maintained f
 
 ## Known limitations
 
-- Trust auth only. No TLS, no SCRAM — bind to localhost.
+- Trust auth only, on both protocols. No TLS, no SCRAM; TDS refuses encryption outright, so
+  SqlClient needs `Encrypt=False`. Bind to localhost.
 - Statement description runs the query `LIMIT 0` to learn its shape, so describing is not free and
   a statement that cannot be wrapped in a subquery falls back to `NoData`.
 - DML rewriting is textual — it handles `UPDATE t SET a = …, b = … WHERE …` and `DELETE FROM t
@@ -248,13 +324,17 @@ fails differently. psql works too, but it is not what the shims are maintained f
 - Nothing compacts the lower layers: the write layer grows until someone rewrites the files below.
 - Two instances writing the same layer directory will overwrite each other. One writer per
   directory.
-- Only Npgsql is held to a conformance bar; anything else will need its own round of catalog shims.
+- Npgsql and Microsoft.Data.SqlClient are the two clients held to a conformance bar; anything else
+  will need its own round of catalog shims.
+- No `sys.*` or `INFORMATION_SCHEMA` emulation on the TDS side, so SQL Server tooling can query the
+  lake but not browse it.
 
 ## Development
 
 ```shell
 dotnet build
-dotnet test          # 54 tests: layers, the write layer, dacpac schemas, Npgsql conformance
+dotnet test          # 139 tests: layers, the write layer, dacpac schemas, the T-SQL parser,
+                     #             and Npgsql + SqlClient conformance
 ```
 
 The tests carry their own DuckDB — the native library is pulled out of `DuckDB.NET.Bindings.Full`

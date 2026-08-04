@@ -4,6 +4,8 @@
 #   duckpg ./common ./tenant --write ./local
 #
 listen: 127.0.0.1:55432
+# The same lake over the protocol SqlClient speaks; the connection string needs Encrypt=False.
+# tds: 127.0.0.1:1433
 schema: lake
 
 # Layer directories, lowest first. Each holds <table>.yaml, <table>.json, <table>.parquet or

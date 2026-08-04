@@ -1,0 +1,620 @@
+using System.Text;
+
+namespace triaxis.Tools.DuckPg.TSql;
+
+/// What the statement is being translated for: which schema `dbo` means, which `@parameters` were
+/// declared, and what the `@@variables` currently are.
+sealed record TSqlContext(
+    string Schema,
+    IReadOnlyDictionary<string, string> Variables,
+    IReadOnlySet<string> Parameters);
+
+/// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
+/// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
+sealed class TSqlWriter(TSqlContext context)
+{
+    readonly StringBuilder sql = new();
+
+    /// Names a query defines for itself. A common table expression is a table only inside the
+    /// query that declares it, so it must not be resolved against the lake's schema.
+    readonly HashSet<string> defined = new(StringComparer.OrdinalIgnoreCase);
+
+    public static string Write(Statement statement, TSqlContext context)
+    {
+        var writer = new TSqlWriter(context);
+        writer.Statement(statement);
+        return writer.sql.ToString();
+    }
+
+    TSqlWriter Put(string text)
+    {
+        sql.Append(text);
+        return this;
+    }
+
+    void Join<T>(IEnumerable<T> items, Action<T> write, string separator = ", ")
+    {
+        var first = true;
+        foreach (var item in items)
+        {
+            if (!first) Put(separator);
+            first = false;
+            write(item);
+        }
+    }
+
+    // ---- statements ------------------------------------------------------------------------------
+
+    void Statement(Statement statement)
+    {
+        switch (statement)
+        {
+            case SelectStatement select:
+                Query(select.Query);
+                return;
+
+            case InsertStatement insert:
+                Put("INSERT INTO ");
+                Table(insert.Target);
+                if (insert.Columns.Count > 0)
+                {
+                    Put(" (");
+                    Join(insert.Columns, c => Put(Quote(c)));
+                    Put(")");
+                }
+                switch (insert.Source)
+                {
+                    case InsertValues values:
+                        Put(" VALUES ");
+                        Join(values.Rows, row => { Put("("); Join(row, Expression); Put(")"); });
+                        return;
+                    case InsertQuery query:
+                        Put(" ");
+                        Query(query.Query);
+                        return;
+                }
+                return;
+
+            case UpdateStatement update:
+                Put("UPDATE ");
+                Table(update.Target);
+                Put(" SET ");
+                Join(update.Assignments, a => { Put(Quote(a.Column)); Put(" = "); Expression(a.Value); });
+                if (update.From is not null) { Put(" FROM "); Source(update.From); }
+                if (update.Where is not null) { Put(" WHERE "); Expression(update.Where); }
+                return;
+
+            case DeleteStatement delete:
+                Put("DELETE FROM ");
+                Table(delete.Target);
+                if (delete.From is not null) { Put(" USING "); Source(delete.From); }
+                if (delete.Where is not null) { Put(" WHERE "); Expression(delete.Where); }
+                return;
+
+            // The gateway already treats these as no-ops; rendering them keeps one path for
+            // everything a client sends.
+            case SetOptionStatement option:
+                Put("SET ").Put(option.Option);
+                return;
+
+            case TransactionStatement transaction:
+                Put(transaction.Action switch
+                {
+                    TransactionAction.Begin => "BEGIN TRANSACTION",
+                    TransactionAction.Commit => "COMMIT",
+                    TransactionAction.Rollback => "ROLLBACK",
+                    _ => throw new TSqlException("savepoints are not supported", 0),
+                });
+                return;
+
+            default:
+                throw new TSqlException($"cannot render {statement.GetType().Name}", 0);
+        }
+    }
+
+    // ---- queries ---------------------------------------------------------------------------------
+
+    void Query(Query query)
+    {
+        var scope = query.With.Select(cte => cte.Name.Text).Where(defined.Add).ToList();
+
+        if (query.With.Count > 0)
+        {
+            Put("WITH ");
+            Join(query.With, cte =>
+            {
+                Put(Quote(cte.Name));
+                if (cte.Columns.Count > 0) { Put(" ("); Join(cte.Columns, c => Put(Quote(c))); Put(")"); }
+                Put(" AS (");
+                Query(cte.Query);
+                Put(")");
+            });
+            Put(" ");
+        }
+
+        Body(query.Body);
+
+        if (query.OrderBy.Count > 0)
+        {
+            Put(" ORDER BY ");
+            Join(query.OrderBy, Order);
+        }
+
+        // TOP and OFFSET/FETCH are the same idea said twice; DuckDB says it once.
+        var top = (query.Body as SelectBody)?.Top;
+        if (top is not null && query.Fetch is not null)
+            throw new TSqlException("TOP and FETCH cannot both limit one query", 0);
+
+        if (query.Fetch is not null) { Put(" LIMIT "); Expression(query.Fetch); }
+        else if (top is not null) { Put(" LIMIT "); Expression(top is ParenExpr paren ? paren.Inner : top); }
+
+        if (query.Offset is not null) { Put(" OFFSET "); Expression(query.Offset); }
+
+        foreach (var name in scope) defined.Remove(name);
+    }
+
+    void Order(OrderTerm term)
+    {
+        Expression(term.Expr);
+        if (term.Descending) Put(" DESC");
+    }
+
+    void Body(QueryBody body)
+    {
+        switch (body)
+        {
+            case SelectBody select:
+                if (select.TopPercent) throw new TSqlException("TOP PERCENT is not supported", 0);
+                Put("SELECT ");
+                if (select.Distinct) Put("DISTINCT ");
+                Join(select.Items, item =>
+                {
+                    Expression(item.Expr);
+                    if (item.Alias is not null) Put(" AS ").Put(Quote(item.Alias));
+                });
+                if (select.From is not null) { Put(" FROM "); Source(select.From); }
+                if (select.Where is not null) { Put(" WHERE "); Expression(select.Where); }
+                if (select.GroupBy.Count > 0) { Put(" GROUP BY "); Join(select.GroupBy, Expression); }
+                if (select.Having is not null) { Put(" HAVING "); Expression(select.Having); }
+                return;
+
+            case SetOperationBody set:
+                Body(set.Left);
+                Put($" {set.Operator}{(set.All ? " ALL" : "")} ");
+                Body(set.Right);
+                return;
+
+            case ValuesBody values:
+                Put("VALUES ");
+                Join(values.Rows, row => { Put("("); Join(row, Expression); Put(")"); });
+                return;
+        }
+    }
+
+    // ---- table sources ---------------------------------------------------------------------------
+
+    void Source(TableSource source)
+    {
+        switch (source)
+        {
+            case NamedTableSource named:
+                Table(named.Name);
+                if (named.Alias is not null) Put(" AS ").Put(Quote(named.Alias));
+                return;
+
+            case DerivedTableSource derived:
+                Put("(");
+                Query(derived.Query);
+                Put(")");
+                if (derived.Alias is not null) Put(" AS ").Put(Quote(derived.Alias));
+                if (derived.Columns.Count > 0) { Put(" ("); Join(derived.Columns, c => Put(Quote(c))); Put(")"); }
+                return;
+
+            case FunctionTableSource function:
+                Expression(function.Call);
+                if (function.Alias is not null) Put(" AS ").Put(Quote(function.Alias));
+                if (function.Columns.Count > 0) { Put(" ("); Join(function.Columns, c => Put(Quote(c))); Put(")"); }
+                return;
+
+            case JoinSource join:
+                Source(join.Left);
+                Put(join.Kind switch
+                {
+                    JoinKind.Inner => " INNER JOIN ",
+                    JoinKind.Left => " LEFT JOIN ",
+                    JoinKind.Right => " RIGHT JOIN ",
+                    JoinKind.Full => " FULL JOIN ",
+                    _ => " CROSS JOIN ",
+                });
+                Source(join.Right);
+                if (join.On is not null) { Put(" ON "); Expression(join.On); }
+                return;
+        }
+    }
+
+    /// A column can carry the same qualification a table does -- LLBLGen writes
+    /// `[dbo].[Orders].[OrderID]` -- and the qualifier has to follow the table to the lake's
+    /// schema, or it names a table that is not the one in the FROM clause.
+    void Column(List<Name> parts)
+    {
+        if (parts.Count < 3)
+        {
+            Join(parts, part => Put(Quote(part)), ".");
+            return;
+        }
+
+        Qualifier(parts[..^1]);
+        Put(".").Put(Quote(parts[^1]));
+    }
+
+    void Qualifier(List<Name> parts)
+    {
+        if (parts.Count < 2) Join(parts, part => Put(Quote(part)), ".");
+        else Table(new TableName(parts));
+    }
+
+    /// A client says `dbo.orders`, or `[app].[dbo].[orders]`, and means the one table the lake
+    /// publishes. The database part names the server it came from, which is this one.
+    void Table(TableName name)
+    {
+        if (name.Parts.Count == 1 && defined.Contains(name.Table.Text))
+        {
+            Put(Quote(name.Table));
+            return;
+        }
+
+        var schema = name.Schema;
+        var resolved = schema is null || schema.Text.Equals("dbo", StringComparison.OrdinalIgnoreCase)
+            ? context.Schema
+            : schema.Text;
+
+        Put(SqlText.Quote(resolved)).Put(".").Put(Quote(name.Table));
+    }
+
+    // ---- expressions -----------------------------------------------------------------------------
+
+    void Expression(Expr expr)
+    {
+        switch (expr)
+        {
+            case Literal literal:
+                Put(literal.Kind switch
+                {
+                    LiteralKind.Number => literal.Text,
+                    LiteralKind.String => SqlText.Literal(literal.Text),
+                    LiteralKind.Binary => $"from_hex({SqlText.Literal(literal.Text)})",
+                    LiteralKind.Null => "NULL",
+                    LiteralKind.True => "TRUE",
+                    _ => "FALSE",
+                });
+                return;
+
+            case ColumnRef column:
+                Column(column.Parts);
+                return;
+
+            case StarRef star:
+                if (star.Qualifier.Count > 0) { Qualifier(star.Qualifier); Put("."); }
+                Put("*");
+                return;
+
+            case VariableRef variable:
+                Put(Variable(variable));
+                return;
+
+            case ParenExpr paren:
+                Put("(");
+                Expression(paren.Inner);
+                Put(")");
+                return;
+
+            case UnaryExpr unary:
+                Put(unary.Operator == "NOT" ? "NOT " : unary.Operator);
+                Expression(unary.Operand);
+                return;
+
+            case BinaryExpr binary:
+                Binary(binary);
+                return;
+
+            case CaseExpr caseExpr:
+                Put("CASE");
+                if (caseExpr.Operand is not null) { Put(" "); Expression(caseExpr.Operand); }
+                foreach (var (when, then) in caseExpr.Branches)
+                {
+                    Put(" WHEN ");
+                    Expression(when);
+                    Put(" THEN ");
+                    Expression(then);
+                }
+                if (caseExpr.Else is not null) { Put(" ELSE "); Expression(caseExpr.Else); }
+                Put(" END");
+                return;
+
+            case CastExpr cast:
+                Put("CAST(");
+                Expression(cast.Value);
+                Put(" AS ").Put(TypeName(cast.Type)).Put(")");
+                return;
+
+            case ConvertExpr convert:
+                if (convert.Style is not null)
+                    throw new TSqlException("CONVERT with a style is not supported; use FORMAT or CAST", 0);
+                Put("CAST(");
+                Expression(convert.Value);
+                Put(" AS ").Put(TypeName(convert.Type)).Put(")");
+                return;
+
+            case InExpr inExpr:
+                Expression(inExpr.Value);
+                Put(inExpr.Negated ? " NOT IN (" : " IN (");
+                if (inExpr.Subquery is not null) Query(inExpr.Subquery);
+                else Join(inExpr.Items, Expression);
+                Put(")");
+                return;
+
+            case BetweenExpr between:
+                Expression(between.Value);
+                Put(between.Negated ? " NOT BETWEEN " : " BETWEEN ");
+                Expression(between.Low);
+                Put(" AND ");
+                Expression(between.High);
+                return;
+
+            case LikeExpr like:
+                Expression(like.Value);
+                Put(like.Negated ? " NOT LIKE " : " LIKE ");
+                Expression(like.Pattern);
+                if (like.Escape is not null) { Put(" ESCAPE "); Expression(like.Escape); }
+                return;
+
+            case IsNullExpr isNull:
+                Expression(isNull.Value);
+                Put(isNull.Negated ? " IS NOT NULL" : " IS NULL");
+                return;
+
+            case ExistsExpr exists:
+                Put("EXISTS (");
+                Query(exists.Query);
+                Put(")");
+                return;
+
+            case SubqueryExpr subquery:
+                Put("(");
+                Query(subquery.Query);
+                Put(")");
+                return;
+
+            case FunctionCall call:
+                Function(call);
+                return;
+
+            default:
+                throw new TSqlException($"cannot render {expr.GetType().Name}", 0);
+        }
+    }
+
+    /// T-SQL spells string concatenation `+`, which in DuckDB is arithmetic. Only where one side is
+    /// provably text does this become `||` -- guessing on the rest would turn `1 + 2` into `'12'`.
+    void Binary(BinaryExpr binary)
+    {
+        var op = binary.Operator == "+" && (Textual(binary.Left) || Textual(binary.Right)) ? "||" : binary.Operator;
+        Expression(binary.Left);
+        Put($" {op} ");
+        Expression(binary.Right);
+    }
+
+    static readonly HashSet<string> TextFunctions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "substring", "upper", "lower", "ltrim", "rtrim", "trim", "concat", "replace", "left", "right",
+        "str", "format", "stuff", "reverse", "space",
+    };
+
+    static bool Textual(Expr expr) => expr switch
+    {
+        Literal { Kind: LiteralKind.String } => true,
+        ParenExpr paren => Textual(paren.Inner),
+        BinaryExpr { Operator: "+" } binary => Textual(binary.Left) || Textual(binary.Right),
+        CastExpr cast => cast.Type.Name.Contains("char", StringComparison.OrdinalIgnoreCase)
+                         || cast.Type.Name.Contains("text", StringComparison.OrdinalIgnoreCase),
+        FunctionCall { Name.Count: 1 } call => TextFunctions.Contains(call.Name[0].Text),
+        _ => false,
+    };
+
+    string Variable(VariableRef variable)
+    {
+        if (!variable.System)
+            return context.Parameters.Contains(variable.Name)
+                ? "$" + variable.Name
+                : throw new TSqlException($"undeclared variable @{variable.Name}", 0);
+
+        return context.Variables.TryGetValue(variable.Name, out var value)
+            ? value
+            : throw new TSqlException($"unsupported session value @@{variable.Name}", 0);
+    }
+
+    void Function(FunctionCall call)
+    {
+        if (call.Name.Count == 1 && Rewritten(call)) return;
+
+        // A function name is not an identifier to be quoted: `"COUNT"` is a column called COUNT.
+        Join(call.Name, part => Put(part.Quoted ? Quote(part) : part.Text), ".");
+        Put("(");
+        if (call.Distinct) Put("DISTINCT ");
+        Join(call.Arguments, Expression);
+        Put(")");
+
+        if (call.Over is null) return;
+
+        Put(" OVER (");
+        if (call.Over.PartitionBy.Count > 0)
+        {
+            Put("PARTITION BY ");
+            Join(call.Over.PartitionBy, Expression);
+        }
+        if (call.Over.OrderBy.Count > 0)
+        {
+            if (call.Over.PartitionBy.Count > 0) Put(" ");
+            Put("ORDER BY ");
+            Join(call.Over.OrderBy, Order);
+        }
+        Put(")");
+    }
+
+    /// The functions whose DuckDB equivalent is spelled differently, takes its arguments in another
+    /// order, or is not a function at all.
+    bool Rewritten(FunctionCall call)
+    {
+        var name = call.Name[0].Text.ToLowerInvariant();
+        var args = call.Arguments;
+
+        switch (name)
+        {
+            case "getdate" or "sysdatetime":
+                Put("current_localtimestamp()");
+                return true;
+
+            case "getutcdate" or "sysutcdatetime":
+                Put("timezone('UTC', now())");
+                return true;
+
+            case "newid":
+                Put("uuid()");
+                return true;
+
+            case "isnull" when args.Count == 2:
+                Call("coalesce", args);
+                return true;
+
+            // LEN ignores trailing spaces, which is a rule of its own rather than a spelling.
+            case "len" when args.Count == 1:
+                Put("length(rtrim(");
+                Expression(args[0]);
+                Put("))");
+                return true;
+
+            case "iif" when args.Count == 3:
+                Put("CASE WHEN ");
+                Expression(args[0]);
+                Put(" THEN ");
+                Expression(args[1]);
+                Put(" ELSE ");
+                Expression(args[2]);
+                Put(" END");
+                return true;
+
+            // CHARINDEX takes the needle first; instr takes the haystack first.
+            case "charindex" when args.Count >= 2:
+                Call("instr", [args[1], args[0]]);
+                return true;
+
+            case "datepart" or "datename" when args.Count == 2:
+                Put($"date_part({SqlText.Literal(DatePart(args[0]))}, ");
+                Expression(args[1]);
+                Put(")");
+                return true;
+
+            case "datediff" when args.Count == 3:
+                Put($"date_diff({SqlText.Literal(DatePart(args[0]))}, ");
+                Expression(args[1]);
+                Put(", ");
+                Expression(args[2]);
+                Put(")");
+                return true;
+
+            case "dateadd" when args.Count == 3:
+                Put("(");
+                Expression(args[2]);
+                Put(" + (");
+                Expression(args[1]);
+                Put($") * INTERVAL '1 {DatePart(args[0])}')");
+                return true;
+
+            case "ceiling" when args.Count == 1:
+                Call("ceil", args);
+                return true;
+
+            case "square" when args.Count == 1:
+                Put("(");
+                Expression(args[0]);
+                Put(") ^ 2");
+                return true;
+
+            case "scope_identity" or "ident_current":
+                throw new TSqlException($"{name}() has no meaning over files", 0);
+
+            default:
+                return false;
+        }
+    }
+
+    void Call(string name, List<Expr> arguments)
+    {
+        Put(name).Put("(");
+        Join(arguments, Expression);
+        Put(")");
+    }
+
+    /// The date part is written as a bare word in T-SQL and as a string everywhere else.
+    static string DatePart(Expr expr) => expr switch
+    {
+        ColumnRef { Parts.Count: 1 } part => Part(part.Parts[0].Text),
+        Literal { Kind: LiteralKind.String } literal => Part(literal.Text),
+        _ => throw new TSqlException("the date part has to be a name such as day or month", 0),
+    };
+
+    static string Part(string part) => part.ToLowerInvariant() switch
+    {
+        "yy" or "yyyy" => "year",
+        "qq" or "q" => "quarter",
+        "mm" or "m" => "month",
+        "dy" or "y" => "dayofyear",
+        "dd" or "d" => "day",
+        "wk" or "ww" => "week",
+        "dw" or "w" => "dayofweek",
+        "hh" => "hour",
+        "mi" or "n" => "minute",
+        "ss" or "s" => "second",
+        "ms" => "millisecond",
+        "mcs" => "microsecond",
+        "ns" => "nanosecond",
+        var other => other,
+    };
+
+    // ---- names and types -------------------------------------------------------------------------
+
+    /// Everything is quoted on the way out: DuckDB matches quoted identifiers without case anyway,
+    /// so quoting costs nothing and keeps a column called `order` from becoming a keyword.
+    static string Quote(Name name) => SqlText.Quote(name.Text);
+
+    string TypeName(TypeRef type)
+    {
+        var arguments = type.Arguments.Count > 0 && !type.Arguments[0].Equals("max", StringComparison.OrdinalIgnoreCase)
+            ? $"({string.Join(", ", type.Arguments)})"
+            : "";
+
+        return type.Name.ToLowerInvariant() switch
+        {
+            "bit" => "BOOLEAN",
+            "tinyint" => "UTINYINT",
+            "smallint" => "SMALLINT",
+            "int" or "integer" => "INTEGER",
+            "bigint" => "BIGINT",
+            "real" => "FLOAT",
+            "float" or "double precision" => "DOUBLE",
+            "money" => "DECIMAL(19,4)",
+            "smallmoney" => "DECIMAL(10,4)",
+            "decimal" or "numeric" => $"DECIMAL{(arguments.Length > 0 ? arguments : "(18,0)")}",
+            "date" => "DATE",
+            "time" => "TIME",
+            "datetime" or "datetime2" or "smalldatetime" => "TIMESTAMP",
+            "datetimeoffset" => "TIMESTAMPTZ",
+            "uniqueidentifier" => "UUID",
+            "binary" or "varbinary" or "image" => "BLOB",
+            "char" or "nchar" or "varchar" or "nvarchar" or "text" or "ntext" or "xml" or "sql_variant"
+                or "character" or "character varying" => "VARCHAR",
+            // Not a SQL Server type, so it is one the caller means literally -- DuckDB has many.
+            _ => type.Name.ToUpperInvariant() + arguments,
+        };
+    }
+}

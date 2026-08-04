@@ -64,6 +64,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         "bytea_output", "search_path", "role", "session_authorization", "idle_in_transaction_session_timeout",
         // `SET SESSION AUTHORIZATION DEFAULT` and `RESET ALL` are part of Npgsql's connection reset.
         "authorization", "all",
+        // What a SqlClient application sets on connect, none of which changes what a file holds.
+        "nocount", "ansi_nulls", "ansi_padding", "ansi_warnings", "arithabort", "concat_null_yields_null",
+        "quoted_identifier", "numeric_roundabort", "implicit_transactions", "cursor_close_on_commit",
+        "deadlock_priority", "lock_timeout", "textsize", "xact_abort", "fmtonly", "dateformat", "language",
+        "transaction",
     };
 
     static readonly Dictionary<string, string> SettingValues = new(StringComparer.OrdinalIgnoreCase)
