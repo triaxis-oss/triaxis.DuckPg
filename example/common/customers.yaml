@@ -1,0 +1,10 @@
+# The shared seed: what every tenant starts from.
+- customer_id: 1
+  name: ACME
+  region: emea
+- customer_id: 2
+  name: Globex
+  region: emea
+- customer_id: 3
+  name: Initech
+  region: amer
