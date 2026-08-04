@@ -67,8 +67,6 @@ static class PgTypes
         _ => -1,
     };
 
-    public static byte[] Encode(object? value) => Utf8(Render(value));
-
     /// The text rendering of a value, including the JSON a LIST, STRUCT or MAP turns into. The TDS
     /// side publishes the same string, so a nested value reads identically through either protocol.
     public static string Render(object? value) => value switch
@@ -79,50 +77,76 @@ static class PgTypes
         byte[] bytes => "\\x" + Convert.ToHexStringLower(bytes),
         Stream stream => "\\x" + Convert.ToHexStringLower(ReadAll(stream)),
         Guid g => g.ToString("D"),
-        DateTime dt => FormatTimestamp(dt),
-        DateTimeOffset dto => FormatTimestamp(dto.UtcDateTime) + "+00",
-        DateOnly d => d.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
-        TimeOnly t => t.ToString("HH:mm:ss.FFFFFF", CultureInfo.InvariantCulture),
+        DateTime dt => dt.ToString(TimestampFormat, CultureInfo.InvariantCulture),
+        DateTimeOffset dto => dto.UtcDateTime.ToString(TimestampFormat, CultureInfo.InvariantCulture) + "+00",
+        DateOnly d => d.ToString(DateFormat, CultureInfo.InvariantCulture),
+        TimeOnly t => t.ToString(TimeFormat, CultureInfo.InvariantCulture),
         TimeSpan ts => FormatInterval(ts),
-        float f => FormatFloat(f, f.ToString("R", CultureInfo.InvariantCulture)),
-        double d => FormatFloat(d, d.ToString("R", CultureInfo.InvariantCulture)),
+        float f => FloatName(f) ?? f.ToString("R", CultureInfo.InvariantCulture),
+        double d => FloatName(d) ?? d.ToString("R", CultureInfo.InvariantCulture),
         decimal m => m.ToString(CultureInfo.InvariantCulture),
         IDictionary or IEnumerable => ToJson(value),
         IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
         _ => value.ToString() ?? "",
     };
 
+    /// The same rendering written straight into the outgoing message. The scalars a result set is
+    /// mostly made of format into UTF-8 in place; the rest go through `Render`, which stays the one
+    /// place a type's text is decided.
+    public static void WriteText(Msg msg, object value)
+    {
+        switch (value)
+        {
+            case string s: msg.Utf8(s); break;
+            case bool b: msg.U8(b ? (byte)'t' : (byte)'f'); break;
+            case DateTime dt: msg.Format(dt, TimestampFormat); break;
+            case DateOnly d: msg.Format(d, DateFormat); break;
+            case float f when float.IsFinite(f): msg.Format(f, "R"); break;
+            case double d when double.IsFinite(d): msg.Format(d, "R"); break;
+            case sbyte or byte or short or ushort or int or uint or long or ulong or decimal or Guid:
+                msg.Format((IUtf8SpanFormattable)value);
+                break;
+            default: msg.Utf8(Render(value)); break;
+        }
+    }
+
     /// Binary results, which typed clients (Npgsql, the JDBC driver) ask for and cannot do without:
     /// in text format they hand every column back as a string.
-    public static byte[] EncodeBinary(int oid, object value)
+    public static void WriteBinary(Msg msg, int oid, object value)
     {
         switch (oid)
         {
-            case Bool: return [(byte)(Convert.ToBoolean(value) ? 1 : 0)];
-            case Int2: return BigEndian(2, b => BinaryPrimitives.WriteInt16BigEndian(b, Convert.ToInt16(value)));
-            case Int4: return BigEndian(4, b => BinaryPrimitives.WriteInt32BigEndian(b, Convert.ToInt32(value)));
-            case Int8: return BigEndian(8, b => BinaryPrimitives.WriteInt64BigEndian(b, Convert.ToInt64(value)));
-            case Float4: return BigEndian(4, b => BinaryPrimitives.WriteSingleBigEndian(b, Convert.ToSingle(value)));
-            case Float8: return BigEndian(8, b => BinaryPrimitives.WriteDoubleBigEndian(b, Convert.ToDouble(value)));
-            case Uuid: return ((Guid)value).ToByteArray(bigEndian: true);
-            case Bytea: return value switch { byte[] b => b, Stream s => ReadAll(s), _ => Encode(value) };
-            case Numeric: return EncodeNumeric(Convert.ToDecimal(value));
+            case Bool: msg.U8((byte)(Convert.ToBoolean(value) ? 1 : 0)); break;
+            case Int2: msg.I16(Convert.ToInt16(value)); break;
+            case Int4: msg.I32(Convert.ToInt32(value)); break;
+            case Int8: msg.I64(Convert.ToInt64(value)); break;
+            case Float4: msg.F32(Convert.ToSingle(value)); break;
+            case Float8: msg.F64(Convert.ToDouble(value)); break;
+            case Uuid: msg.Raw(((Guid)value).ToByteArray(bigEndian: true)); break;
+            case Numeric: WriteNumeric(msg, Convert.ToDecimal(value)); break;
 
-            case Date:
-                return BigEndian(4, b => BinaryPrimitives.WriteInt32BigEndian(b, (int)(AsDateTime(value) - PgEpoch).TotalDays));
+            case Bytea:
+                switch (value)
+                {
+                    case byte[] bytes: msg.Raw(bytes); break;
+                    case Stream stream: msg.Raw(ReadAll(stream)); break;
+                    default: WriteText(msg, value); break;
+                }
+                break;
+
+            case Date: msg.I32((int)(AsDateTime(value) - PgEpoch).TotalDays); break;
             case Timestamp:
-            case TimestampTz:
-                return BigEndian(8, b => BinaryPrimitives.WriteInt64BigEndian(b, (AsDateTime(value) - PgEpoch).Ticks / 10));
-            case Time:
-                return BigEndian(8, b => BinaryPrimitives.WriteInt64BigEndian(b, AsTimeSpan(value).Ticks / 10));
+            case TimestampTz: msg.I64((AsDateTime(value) - PgEpoch).Ticks / 10); break;
+            case Time: msg.I64(AsTimeSpan(value).Ticks / 10); break;
+
             case Interval:
                 var interval = AsTimeSpan(value);
-                var binary = new byte[16];
-                BinaryPrimitives.WriteInt64BigEndian(binary, (interval.Ticks - interval.Days * TimeSpan.TicksPerDay) / 10);
-                BinaryPrimitives.WriteInt32BigEndian(binary.AsSpan(8), interval.Days);
-                return binary;
+                msg.I64((interval.Ticks - interval.Days * TimeSpan.TicksPerDay) / 10)
+                   .I32(interval.Days)
+                   .I32(0); // months, which a TimeSpan cannot carry
+                break;
 
-            default: return Encode(value); // text, json and the JSON-rendered nested types
+            default: WriteText(msg, value); break; // text, json and the JSON-rendered nested types
         }
     }
 
@@ -158,13 +182,6 @@ static class PgTypes
         _ => raw,
     };
 
-    static byte[] BigEndian(int size, Action<byte[]> write)
-    {
-        var buffer = new byte[size];
-        write(buffer);
-        return buffer;
-    }
-
     static DateTime AsDateTime(object value) => value switch
     {
         DateTime dt => dt,
@@ -182,7 +199,7 @@ static class PgTypes
     };
 
     /// Mirror of DecodeNumeric: split the decimal string into base-10000 groups either side of the point.
-    static byte[] EncodeNumeric(decimal value)
+    static void WriteNumeric(Msg msg, decimal value)
     {
         var text = Math.Abs(value).ToString(CultureInfo.InvariantCulture);
         var point = text.IndexOf('.');
@@ -202,14 +219,8 @@ static class PgTypes
         while (groups.Count > 0 && groups[^1] == 0) groups.RemoveAt(groups.Count - 1);
         if (groups.Count == 0) weight = 0;
 
-        var buffer = new byte[8 + groups.Count * 2];
-        BinaryPrimitives.WriteInt16BigEndian(buffer, (short)groups.Count);
-        BinaryPrimitives.WriteInt16BigEndian(buffer.AsSpan(2), (short)weight);
-        BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(4), value < 0 ? (ushort)0x4000 : (ushort)0);
-        BinaryPrimitives.WriteInt16BigEndian(buffer.AsSpan(6), (short)scale);
-        for (var i = 0; i < groups.Count; i++)
-            BinaryPrimitives.WriteInt16BigEndian(buffer.AsSpan(8 + i * 2), groups[i]);
-        return buffer;
+        msg.I16(groups.Count).I16(weight).I16(value < 0 ? 0x4000 : 0).I16(scale);
+        foreach (var group in groups) msg.I16(group);
     }
 
     /// PostgreSQL sends numerics as base-10000 digit groups: ndigits, weight, sign, dscale, digits[].
@@ -232,20 +243,19 @@ static class PgTypes
 
     static readonly DateTime PgEpoch = new(2000, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
 
-    static byte[] Utf8(string s) => Encoding.UTF8.GetBytes(s);
-
-    static string FormatTimestamp(DateTime dt) =>
-        dt.ToString("yyyy-MM-dd HH:mm:ss.FFFFFF", CultureInfo.InvariantCulture);
+    const string TimestampFormat = "yyyy-MM-dd HH:mm:ss.FFFFFF", DateFormat = "yyyy-MM-dd",
+                 TimeFormat = "HH:mm:ss.FFFFFF";
 
     static string FormatInterval(TimeSpan ts) =>
         $"{(ts < TimeSpan.Zero ? "-" : "")}{Math.Abs(ts.Days) * 24 + Math.Abs(ts.Hours):00}:{Math.Abs(ts.Minutes):00}:{Math.Abs(ts.Seconds):00}" +
         (ts.Ticks % TimeSpan.TicksPerSecond != 0 ? $".{Math.Abs(ts.Ticks % TimeSpan.TicksPerSecond) / 10:000000}" : "");
 
-    static string FormatFloat(double v, string fallback) =>
+    /// PostgreSQL names the values a float cannot round-trip as digits; null means it can.
+    static string? FloatName(double v) =>
         double.IsPositiveInfinity(v) ? "Infinity"
         : double.IsNegativeInfinity(v) ? "-Infinity"
         : double.IsNaN(v) ? "NaN"
-        : fallback;
+        : null;
 
     /// DuckDB's LIST/STRUCT/MAP arrive as nested lists and dictionaries. Rendering them by hand
     /// rather than through a serializer keeps the scalars on the same text rules as every other

@@ -50,6 +50,32 @@ public class ClientTests : IDisposable
         Assert.Equal(["2/20.00/2026-08-02", "3/30.00/2026-08-03"], rows);
     }
 
+    /// Rows go out through a buffer that is flushed when full and a row buffer that grows to fit
+    /// the widest value, and neither seam shows on a three-row result: this one is wide enough to
+    /// grow the row, long enough to flush many times, and multi-byte so the two cannot agree on a
+    /// length by accident.
+    [Fact]
+    public void LongResultsStreamPastTheBuffers()
+    {
+        var wide = new string('č', 2000);
+        using var command = db.CreateCommand(
+            $"SELECT i, repeat('č', 2000) || i, CASE WHEN i % 2 = 0 THEN NULL ELSE i * 1.5 END " +
+            "FROM range(5000) t(i)");
+        using var reader = command.ExecuteReader();
+
+        var rows = 0;
+        while (reader.Read())
+        {
+            Assert.Equal(rows, reader.GetInt64(0));
+            Assert.Equal(wide + rows, reader.GetString(1));
+            Assert.Equal(rows % 2 == 0, reader.IsDBNull(2));
+            if (!reader.IsDBNull(2)) Assert.Equal(rows * 1.5, reader.GetDouble(2));
+            rows++;
+        }
+
+        Assert.Equal(5000, rows);
+    }
+
     [Fact]
     public void ColumnSchemaCarriesTheRealTypes()
     {
