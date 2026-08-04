@@ -14,6 +14,9 @@ sealed class Lake : IDisposable
 
     public PgServer Server { get; }
 
+    /// Null unless a TDS address was configured; a second front door is opt-in.
+    public TdsServer? Tds { get; }
+
     public Lake(Config config, ILoggerFactory loggers)
     {
         duck.Open();
@@ -31,9 +34,13 @@ sealed class Lake : IDisposable
 
         var gateway = new Gateway(config, Catalog, write, duck, loggers.CreateLogger<Gateway>());
         Server = new PgServer(config, gateway, duck, loggers);
+        if (config.Tds is { Length: > 0 } tds) Tds = new TdsServer(tds, gateway, duck, loggers);
     }
 
-    public Task ListenAsync(CancellationToken cancellation) => Server.ListenAsync(cancellation);
+    public Task ListenAsync(CancellationToken cancellation) =>
+        Tds is null
+            ? Server.ListenAsync(cancellation)
+            : Task.WhenAll(Server.ListenAsync(cancellation), Tds.ListenAsync(cancellation));
 
     public void Dispose() => duck.Dispose();
 }

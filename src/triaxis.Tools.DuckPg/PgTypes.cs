@@ -67,9 +67,11 @@ static class PgTypes
         _ => -1,
     };
 
-    public static byte[] Encode(object? value) => Utf8(ToText(value));
+    public static byte[] Encode(object? value) => Utf8(Render(value));
 
-    static string ToText(object? value) => value switch
+    /// The text rendering of a value, including the JSON a LIST, STRUCT or MAP turns into. The TDS
+    /// side publishes the same string, so a nested value reads identically through either protocol.
+    public static string Render(object? value) => value switch
     {
         null or DBNull => "",
         bool b => b ? "t" : "f",
@@ -269,7 +271,7 @@ static class PgTypes
 
             case sbyte or byte or short or ushort or int or uint or long or ulong
                  or float or double or decimal:
-                json.Append(ToText(value));
+                json.Append(Render(value));
                 break;
 
             case IDictionary map:
@@ -300,7 +302,7 @@ static class PgTypes
                 break;
 
             default:
-                WriteJsonString(json, ToText(value));
+                WriteJsonString(json, Render(value));
                 break;
         }
     }

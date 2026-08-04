@@ -3,6 +3,8 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
+    <!-- SqlClient refuses to run in invariant globalization mode; the tool itself has no such need. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
     <RootNamespace>triaxis.Tools.DuckPg.Tests</RootNamespace>
   </PropertyGroup>
 
@@ -12,6 +14,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
     <PackageReference Include="xunit.v3" Version="3.2.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />

@@ -4,6 +4,9 @@ sealed class Config
 {
     public string Listen { get; set; } = "127.0.0.1:55432";
 
+    /// Listen address for the TDS front door, which SqlClient speaks. Off unless it is set.
+    public string? Tds { get; set; }
+
     /// Schema the generated views live in.
     public string Schema { get; set; } = "lake";
 

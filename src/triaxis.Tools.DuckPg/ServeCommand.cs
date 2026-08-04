@@ -20,6 +20,9 @@ public class ServeCommand : LoggingCommand
     [Option("--listen", "-l", Description = "Listen address.")]
     public string? ListenAddress { get; set; }
 
+    [Option("--tds", Description = "Listen address for the TDS front door, which SqlClient speaks.")]
+    public string? Tds { get; set; }
+
     [Option("--write", "-w", Description = "Directory holding the topmost layer, which accepts writes.")]
     public string? Write { get; set; }
 
@@ -64,6 +67,7 @@ public class ServeCommand : LoggingCommand
         // Arguments win over the file, and are relative to the working directory rather than to it.
         if (Layers.Length > 0) config.Layers = [.. Layers.Select(Path.GetFullPath)];
         if (ListenAddress is not null) config.Listen = ListenAddress;
+        if (Tds is not null) config.Tds = Tds;
         if (Write is not null) config.Write = Path.GetFullPath(Write);
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;

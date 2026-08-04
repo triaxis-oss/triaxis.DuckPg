@@ -16,7 +16,9 @@ someone changing the code needs.
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
 | `DacpacSchema.cs` | `model.xml` out of a dacpac zip. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
-| `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The protocol. Rarely the thing that is wrong. |
+| `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
+| `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |
+| `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
 | `SqlText.cs` | Enough SQL scanning to find top-level keywords without a parser. |
 | `DuckDbLibrary.cs` | Finding the machine's DuckDB, and the AOT dependencies DuckDB.NET needs. |
 
@@ -43,6 +45,11 @@ someone changing the code needs.
 - **The type catalog describes the OIDs the gateway puts on the wire**, not DuckDB's own types.
   `Shims.Macros` replaces `pg_type` wholesale for that reason; DuckDB's has NULL oids and its own
   type names.
+- **The dialect is translated on the tree, never on the text.** `TSql/` parses T-SQL into an AST and
+  renders DuckDB SQL from it. A regex "fix" for a dialect difference belongs in the renderer as a
+  case, not in a string replacement — this is why `'a' + b` concatenates and `1 + 2` adds.
+- **A statement the parser does not cover is refused**, with the position. Passing unknown text
+  through to DuckDB moves the failure somewhere harder to read.
 - **AOT-clean**: no reflection-based serialization, no `JsonSerializer.Serialize<object>`. The
   project ships portable but the analysers stay on, so a regression shows up as a build warning
   (and warnings are errors here).
@@ -60,18 +67,38 @@ someone changing the code needs.
 - JSON type inference reads every integer as `BIGINT`; that is why a parquet layer's type wins, and
   why a dacpac is worth having.
 
+## What TDS demanded, and does not say out loud
+
+- **The TDS version in LOGINACK is big-endian**, though LOGIN7 sends it little-endian. Get it wrong
+  and SqlClient says "invalid or unsupported protocol version" with no further clue.
+- **The login response must carry a collation (ENVCHANGE 7).** Without one SqlClient throws a
+  `NullReferenceException` inside its own RPC writer the first time a string parameter is sent —
+  the failure never reaches the wire, so the server looks innocent.
+- **DuckDB reports a decimal column as plain `Decimal`.** Precision and scale come from
+  `reader.GetSchemaTable()`, and TDS has to declare both in COLMETADATA or every value truncates
+  to an integer.
+- **Encryption is refused with `ENCRYPT_NOT_SUP`**, which is why `Encrypt=False` is part of the
+  connection string. TDS otherwise encrypts the login packet even in a plaintext session.
+- **A cancel arrives on the same connection as the query**, unlike PostgreSQL's second connection.
+  It is only noticed between row packets; see `TdsSession.Cancelled`.
+- `SELECT COUNT(*)` gives a `long`, because DuckDB counts in BIGINT. An application that casts to
+  `int` will need `Convert.ToInt32`.
+
 ## Tests
 
-`dotnet test`. The suite is the specification — 54 tests across layer stacking, partitioned
-layouts, the write layer, dacpac schemas and Npgsql conformance. `TestLake` builds a lake in a temp
-directory from strings, and `Restart()` throws away everything in memory, which is how persistence
-is told from luck.
+`dotnet test`. The suite is the specification — 139 tests across layer stacking, partitioned
+layouts, the write layer, dacpac schemas, the T-SQL parser, and Npgsql + SqlClient conformance.
+`TSqlTests` is the cheap one to iterate on: it needs no server and no DuckDB. `TestLake` builds a
+lake in a temp directory from strings, and `Restart()` throws away everything in memory, which is
+how persistence is told from luck.
 
 The native DuckDB comes from `DuckDB.NET.Bindings.Full` via `PackageDownload` and a copy target —
 downloaded, not referenced, because its managed assemblies would collide with the tool's.
 
 A change to the merge-on-read SQL, the write path or the shims needs a test that would have failed
-before it. A change to the protocol needs one in `ClientTests`, since Npgsql is the bar.
+before it. A change to a protocol needs one in `ClientTests` (Npgsql) or `TdsTests` (SqlClient),
+since those two clients are the bar. The test project turns `InvariantGlobalization` off, because
+SqlClient refuses to run without ICU.
 
 ## Conventions
 
