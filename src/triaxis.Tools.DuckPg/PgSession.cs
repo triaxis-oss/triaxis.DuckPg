@@ -471,17 +471,21 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     int SendRows(DbDataReader reader, int maxRows, (int Oid, bool Binary)[] columns)
     {
         var sent = 0;
+        var row = new Msg();
         while (reader.Read())
         {
-            var message = new Msg().I16(reader.FieldCount);
-            for (var i = 0; i < reader.FieldCount; i++)
+            row.Clear();
+            row.I16(columns.Length);
+            for (var i = 0; i < columns.Length; i++)
             {
-                if (reader.IsDBNull(i)) { message.I32(-1); continue; }
+                if (reader.IsDBNull(i)) { row.I32(-1); continue; }
+                var at = row.BeginField();
                 var value = reader.GetValue(i);
-                var encoded = columns[i].Binary ? PgTypes.EncodeBinary(columns[i].Oid, value) : PgTypes.Encode(value);
-                message.I32(encoded.Length).Raw(encoded);
+                if (columns[i].Binary) PgTypes.WriteBinary(row, columns[i].Oid, value);
+                else PgTypes.WriteText(row, value);
+                row.EndField(at);
             }
-            wire.Send('D', message);
+            wire.Send('D', row);
             if (++sent == maxRows) break;
         }
         return sent;

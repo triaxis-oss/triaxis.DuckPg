@@ -59,7 +59,14 @@ someone changing the code needs.
 - Npgsql closes the connection on SQLSTATE `XX000`, so `PgError.SqlStateOf` mapping DuckDB's error
   text to real codes is what makes a failed query survivable. Cancellation must map to `57014`.
 - Npgsql hands back every column as `String` regardless of OID until the data goes out in binary
-  format — hence `EncodeBinary`, including base-10000 `numeric`.
+  format — hence `PgTypes.WriteBinary`, including base-10000 `numeric`.
+- A DataRow is a few bytes and a socket write is a syscall, which is what once held the PostgreSQL
+  wire to ~250k rows/s. Responses go out through a `BufferedStream`; only the write side, because
+  one cannot interleave reads and writes over a socket, and `PgWire` flushes before every read so
+  nothing can sit in the buffer while the server waits on the client.
+- With the syscalls gone, allocation is what is left: a row is formatted straight into a `Msg` that
+  the loop reuses (`Utf8`, `Format`, `BeginField`), never into a `byte[]` or a `string` per value.
+  Anything on the row path that returns a fresh array puts the ceiling back.
 - `Describe('S')` must answer, or `cmd.Prepare()` fails. DuckDB cannot bind a statement with open
   parameters, so typed `NULL`s are substituted and the query run `LIMIT 0`.
 - YamlDotNet's JSON emitter leaves control characters unescaped, and real exports carry tabs inside
