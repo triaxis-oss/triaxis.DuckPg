@@ -8,14 +8,23 @@ namespace triaxis.Tools.DuckPg;
 /// every table as a `SqlTable` element, so DacFx is not needed to get at it -- and DacFx would not
 /// run here anyway.
 ///
-/// One of these exists whether or not a dacpac does: without one it declares nothing, so the
-/// catalog asks the same questions either way.
+/// One of these exists whether or not a dacpac does: without one it declares nothing, so a lake
+/// with a schema and a lake without answer the same questions.
 sealed class DacpacSchema
 {
     static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
 
     readonly Dictionary<string, List<Column>> columns = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, string[]> keys = new(StringComparer.OrdinalIgnoreCase);
+    readonly Dictionary<(string Table, string Column), string> defaults = new();
+
+    public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
+    {
+        var path = config.Dacpac ?? Layer.FindDacpac(
+            [.. config.Layers, .. config.Write is null ? [] : (string[])[config.Write]], logger);
+
+        if (path is not null) Read(path, logger);
+    }
 
     public IReadOnlyCollection<string> Tables => columns.Keys;
 
@@ -23,33 +32,44 @@ sealed class DacpacSchema
 
     public string[] Key(string table) => keys.GetValueOrDefault(table) ?? [];
 
-    public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
-    {
-        var path = config.Dacpac ?? Layer.FindDacpac(
-            [.. config.Layers, .. config.Write is null ? [] : (string[])[config.Write]], logger);
+    /// The T-SQL a column defaults to, as the dacpac spells it -- `(getdate())`, `((0))`.
+    public string? Default(string table, string column) => defaults.GetValueOrDefault((table, column));
 
-        if (path is not null) Read(path);
-    }
-
-    void Read(string path)
+    void Read(string path, ILogger logger)
     {
         using var archive = ZipFile.OpenRead(path);
         var model = archive.GetEntry("model.xml")
             ?? throw new InvalidOperationException($"{path} has no model.xml");
         using var stream = model.Open();
 
+        var unread = new Dictionary<string, int>();
         foreach (var element in XDocument.Load(stream).Descendants(Dac + "Element"))
-            switch (element.Attribute("Type")?.Value)
+        {
+            var type = element.Attribute("Type")?.Value;
+            var read = type switch
             {
-                case "SqlTable": ReadTable(element); break;
-                case "SqlPrimaryKeyConstraint": ReadKey(element); break;
-            }
+                "SqlTable" => ReadTable(element),
+                "SqlPrimaryKeyConstraint" => ReadKey(element),
+                "SqlDefaultConstraint" => ReadDefault(element),
+                // Every other element is something this tool does not claim to read.
+                _ => true,
+            };
+            if (!read) unread[type!] = unread.GetValueOrDefault(type!) + 1;
+        }
+
+        // An element of a kind this tool does read, that it then made nothing of, is worth saying
+        // out loud: the shape of the format is the one thing here that is not in this repository's
+        // gift, and a property DacFx spells differently is otherwise indistinguishable from a
+        // schema that declares none.
+        foreach (var (kind, count) in unread)
+            logger.LogWarning("{Count} {Kind} elements in {Path} say nothing this build recognises",
+                count, kind, path);
     }
 
-    void ReadTable(XElement table)
+    bool ReadTable(XElement table)
     {
         var name = Unqualify(table.Attribute("Name")?.Value);
-        if (name is null) return;
+        if (name is null) return false;
 
         var declared = new List<Column>();
         foreach (var column in Related(table, "Columns"))
@@ -62,18 +82,16 @@ sealed class DacpacSchema
             declared.Add(new Column(columnName, DuckDbType(specifier)));
         }
 
-        if (declared.Count > 0) columns[name] = declared;
+        if (declared.Count == 0) return false;
+
+        columns[name] = declared;
+        return true;
     }
 
-    void ReadKey(XElement constraint)
+    bool ReadKey(XElement constraint)
     {
-        var table = Related(constraint, "DefiningTable").FirstOrDefault()
-            ?.Attribute("Name")?.Value ?? constraint.Elements(Dac + "Relationship")
-            .FirstOrDefault(r => r.Attribute("Name")?.Value == "DefiningTable")
-            ?.Descendants(Dac + "References").FirstOrDefault()?.Attribute("Name")?.Value;
-
-        var name = Unqualify(table);
-        if (name is null) return;
+        var name = Unqualify(Reference(constraint, "DefiningTable"));
+        if (name is null) return false;
 
         var key = Related(constraint, "ColumnSpecifications")
             .SelectMany(c => c.Elements(Dac + "Relationship")
@@ -83,7 +101,20 @@ sealed class DacpacSchema
             .OfType<string>()
             .ToArray();
 
-        if (key.Length > 0) keys[name] = key;
+        if (key.Length == 0) return false;
+
+        keys[name] = key;
+        return true;
+    }
+
+    /// A default belongs to the column it names, and the name says which table that is.
+    bool ReadDefault(XElement constraint)
+    {
+        if (Property(constraint, "DefaultExpressionScript") is not { Length: > 0 } expression) return false;
+        if (Parts(Reference(constraint, "ForColumn")) is not [.., var table, var column]) return false;
+
+        defaults[(table, column)] = expression;
+        return true;
     }
 
     /// Elements reached through a named relationship, which in this format always nests as
@@ -94,14 +125,37 @@ sealed class DacpacSchema
             .Elements(Dac + "Entry")
             .Elements(Dac + "Element");
 
-    /// Names are bracket-qualified: `[dbo].[TABLE].[Column]`. The last part is the one that matters.
-    static string? Unqualify(string? name)
+    /// What a relationship points at, whether it holds the element itself or a reference to one.
+    static string? Reference(XElement parent, string relationship) =>
+        Related(parent, relationship).FirstOrDefault()?.Attribute("Name")?.Value
+        ?? parent.Elements(Dac + "Relationship")
+            .Where(r => r.Attribute("Name")?.Value == relationship)
+            .Descendants(Dac + "References").FirstOrDefault()?.Attribute("Name")?.Value;
+
+    /// A property is an attribute when it is a word and a nested `Value` when it is a script.
+    static string? Property(XElement element, string name) =>
+        element.Elements(Dac + "Property").FirstOrDefault(p => p.Attribute("Name")?.Value == name) is not { } property
+            ? null
+            : property.Attribute("Value")?.Value ?? property.Element(Dac + "Value")?.Value;
+
+    /// Names are bracket-qualified: `[dbo].[TABLE].[Column]`.
+    static List<string> Parts(string? name)
     {
-        if (string.IsNullOrEmpty(name)) return null;
-        var last = name.LastIndexOf('[');
-        var end = name.IndexOf(']', last + 1);
-        return last < 0 || end < 0 ? name : name[(last + 1)..end];
+        var parts = new List<string>();
+        var at = 0;
+        while (name is not null && (at = name.IndexOf('[', at)) >= 0)
+        {
+            var end = name.IndexOf(']', at + 1);
+            if (end < 0) break;
+            parts.Add(name[(at + 1)..end]);
+            at = end + 1;
+        }
+        return parts;
     }
+
+    /// The last part is the one that matters -- and a name that brackets nothing is already it.
+    static string? Unqualify(string? name) =>
+        string.IsNullOrEmpty(name) ? null : Parts(name) is [.., var last] ? last : name;
 
     static string DuckDbType(XElement specifier)
     {
@@ -109,8 +163,7 @@ sealed class DacpacSchema
             .Where(r => r.Attribute("Name")?.Value == "Type")
             .Descendants(Dac + "References").FirstOrDefault()?.Attribute("Name")?.Value) ?? "nvarchar";
 
-        string? Property(string name) => specifier.Elements(Dac + "Property")
-            .FirstOrDefault(p => p.Attribute("Name")?.Value == name)?.Attribute("Value")?.Value;
+        string? Property(string name) => DacpacSchema.Property(specifier, name);
 
         return sql.ToLowerInvariant() switch
         {

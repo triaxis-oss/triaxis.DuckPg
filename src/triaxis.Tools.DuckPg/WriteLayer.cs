@@ -32,7 +32,11 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
     /// rebuilt from the files, so a reload picks up an edit made outside the gateway.
     public void Prepare(DuckDBConnection conn, Table table)
     {
-        var declared = string.Join(", ", table.Columns.Select(c => $"{SqlText.Quote(c.Name)} {c.Type}"));
+        // A declared default belongs on the table, where an INSERT that omits the column picks it up
+        // as it is written -- the expression itself, not the value the view fills a file's gaps
+        // with, because a row being written now can be stamped with now.
+        var declared = string.Join(", ", table.Columns.Select(c =>
+            $"{SqlText.Quote(c.Name)} {c.Type}" + (c.Default is null ? "" : $" DEFAULT {c.Default.Expr}")));
         var key = table.Key.Length > 0
             ? $", PRIMARY KEY ({string.Join(", ", table.Key.Select(SqlText.Quote))})"
             : "";

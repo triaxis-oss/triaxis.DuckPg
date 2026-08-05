@@ -228,7 +228,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// and every statement but the last says there is more to come.
     void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, object?> parameters, byte doneToken)
     {
-        var context = new TSqlContext(gateway.Config.Schema, Variables(), (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase));
+        var context = new TSqlContext(gateway.Config.Schema, Variables(),
+            (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"]);
         var statements = TSqlTranslator.Translate(sql, context);
 
         if (statements.Count == 0)

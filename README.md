@@ -179,6 +179,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `DATEPART(day, d)`, `DATEDIFF`, `DATEADD` | `date_part('day', d)`, `date_diff`, interval arithmetic |
 | `CAST(x AS NVARCHAR(MAX))`, `INT`, `BIT`, `DATETIME2`, `UNIQUEIDENTIFIER`, `MONEY` | `VARCHAR`, `INTEGER`, `BOOLEAN`, `TIMESTAMP`, `UUID`, `DECIMAL(19,4)` |
 | `CONVERT(INT, x)` | `CAST(x AS INTEGER)` |
+| `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
@@ -246,6 +247,34 @@ layer columns are cast to the declared type rather than to whatever inference gu
 A declared table no layer carries is published as well — empty, with its declared shape — so the
 catalog is the schema rather than a reflection of which files turned up. Such a table is writable
 like any other: an `INSERT` lands in the write layer and reads back.
+
+### Defaults
+
+A `SqlDefaultConstraint` fills in the column where a row has no value for it — a row that leaves the
+column out and one that spells out a null read the same by the time a file has been scanned, so both
+get the default. The expression is T-SQL and goes through the same translator as any statement, so
+`(getdate())`, `('new')` and `((0))` all mean what they say.
+
+**In the read layers it is evaluated once, when the lake is built.** `GETDATE()` becomes the moment
+duckpg started, not the moment a row was read: the view holds a value rather than a function, so a
+table scanned twice answers the same both times and a row's stamp does not depend on when someone
+looked at it. The same goes for `NEWID()` — one id for the run, not one per row. There is no better
+answer available: a row that was already in a file when duckpg opened it never said when it was
+written.
+
+**A written row is stamped as it is written.** The write layer declares the default on its own
+table, as the expression rather than as the frozen value, so an `INSERT` that omits the column gets
+`GETDATE()` answered then and there — and persists with the value in it, so the file says what the
+row is without the dacpac standing next to it. Nothing fills in the write layer afterwards: a row
+written with an explicit `NULL` stays null, because the write layer says what it holds.
+
+`SUSER_SNAME()` — the other half of a stock audit column — is answered too, as a string rather
+than as a principal DuckDB would have to keep: the session's login name for a statement a client
+sent, and the account duckpg itself runs as for a default, since nobody is connected when the lake
+is built. `USER_NAME()` and `ORIGINAL_LOGIN()` say the same thing.
+
+A default DuckDB cannot answer at all (`NEWSEQUENTIALID()` and friends) is dropped with a warning,
+on both sides, and the column keeps its `NULL`.
 
 **Autodetected when not given**: a single `.dacpac` sitting in a layer directory is used on its
 own. Several means none is assumed, and the tool says so — name one with `--dacpac`.

@@ -1,10 +1,16 @@
 using System.Data.Common;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.Logging;
+using triaxis.Tools.DuckPg.TSql;
 
 namespace triaxis.Tools.DuckPg;
 
-sealed record Column(string Name, string Type);
+/// A declared default, in both of the forms it is needed in: `Expr` is what a row written now gets,
+/// evaluated as it is written, and `Value` is what that expression was worth when the lake was
+/// built -- which is the only honest stamp for a row in a file that predates the question.
+sealed record ColumnDefault(string Expr, string Value);
+
+sealed record Column(string Name, string Type, ColumnDefault? Default = null);
 
 sealed record VirtualColumn(string Name, string Expr);
 
@@ -52,7 +58,9 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             var describedWrite = writeSource is null ? null
                 : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
 
-            var columns = schema.Columns(name) ?? Published(describedWrite is null ? layers : [.. layers, describedWrite]);
+            List<Column> columns = schema.Columns(name) is { } declared
+                ? [.. declared.Select(c => Defaulted(conn, name, c))]
+                : Published(describedWrite is null ? layers : [.. layers, describedWrite]);
             var writable = settings.Writable ?? write.Enabled;
             var partitions = layers.SelectMany(l => l.Source.Partitions)
                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -134,6 +142,50 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         return layers;
     }
 
+    // ---- declared defaults -----------------------------------------------------------------------
+
+    /// What each declared default came to, kept for the life of the process: a rebuild republishes
+    /// the view with the value this instance started with rather than stamping a new one.
+    readonly Dictionary<(string Expression, string Type), ColumnDefault?> evaluated = new();
+
+    Column Defaulted(DuckDBConnection conn, string table, Column column) =>
+        schema.Default(table, column.Name) is { } expression
+            ? column with { Default = Evaluate(conn, expression, column.Type) }
+            : column;
+
+    /// The declared default, translated on the tree like any other T-SQL, and then also run once to
+    /// see what it says. A default DuckDB cannot answer at build time it could not answer at write
+    /// time either, so one that throws is dropped with a warning and the column keeps its NULL.
+    ColumnDefault? Evaluate(DuckDBConnection conn, string expression, string type)
+    {
+        if (evaluated.TryGetValue((expression, type), out var declared)) return declared;
+
+        try
+        {
+            // Nobody is connected when the lake is built, so `SUSER_SNAME()` in a default is the
+            // account duckpg runs as -- the only user there is at that point.
+            var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                          new HashSet<string>(), Environment.UserName);
+            var expr = TSqlWriter.Write(TSqlParser.ParseExpression(expression), context);
+
+            using var command = conn.CreateCommand();
+            command.CommandText = $"SELECT CAST({expr} AS {type})::VARCHAR";
+            declared = command.ExecuteScalar() is string value
+                ? new ColumnDefault(expr, $"CAST({SqlText.Literal(value)} AS {type})")
+                : null;
+            logger.LogDebug("default {Expression} is {Expr}, worth {Value}",
+                expression, expr, declared?.Value ?? "NULL");
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning("default {Expression} ignored: {Reason}", expression, e.Message.ReplaceLineEndings(" "));
+            declared = null;
+        }
+
+        evaluated[(expression, type)] = declared;
+        return declared;
+    }
+
     // ---- the published shape ---------------------------------------------------------------------
 
     /// Columns in the order the topmost layer holding them puts them, so the shape follows the
@@ -212,19 +264,24 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         var projection = string.Join(", ", table.Columns.Select(Source)
             .Concat(table.Virtuals.Select(v => $"({v.Expr}) AS {SqlText.Quote(v.Name)}")));
 
-        // A column no layer carries -- one the schema declares, or a virtual one's base -- still
-        // has to be projected, as a typed NULL. The write layer always has every column.
+        // A column nothing below produces -- one the schema declares that no layer carries, or a
+        // virtual one's base -- still has to be projected, as a typed NULL. The write layer always
+        // has every column, and a read layer produces a defaulted one whether it carries it or not.
         string Source(Column column) =>
-            table.Writable || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
+            (table.Writable
+             || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
+             || (column.Default is not null && table.Layers.Count > 0)
                 ? $"r.{SqlText.Quote(column.Name)}"
-                : $"CAST(NULL AS {column.Type}) AS {SqlText.Quote(column.Name)}";
+                : $"CAST(NULL AS {column.Type})") + $" AS {SqlText.Quote(column.Name)}";
 
         // Each branch names its own columns and casts them to the published type; UNION ALL BY NAME
-        // fills a layer's gaps with NULL.
+        // fills a layer's gaps with NULL. Only a read layer fills its gaps with the declared default
+        // instead: a written row was there to be stamped as it was written, a row in a file below
+        // was not.
         var layers = table.Layers.Select(layer => Branch(table, layer.Columns, layer.Scan, layer.Source.Seq,
-                                                         layer.Source.HasFileName)).ToList();
+                                                         layer.Source.HasFileName, defaults: true)).ToList();
         if (table.Writable)
-            layers.Add(Branch(table, table.Columns, table.WriteName, write.Seq, named: false));
+            layers.Add(Branch(table, table.Columns, table.WriteName, write.Seq, named: false, defaults: false));
         if (layers.Count == 0)
             layers.Add("SELECT NULL::VARCHAR AS \"_file\", 0::BIGINT AS \"_seq\" WHERE false");
 
@@ -251,11 +308,27 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + shadowing;
     }
 
-    string Branch(Table table, List<Column> available, string scan, int seq, bool named)
+    string Branch(Table table, List<Column> available, string scan, int seq, bool named, bool defaults)
     {
+        // A layer that carries the column still has rows leaving it empty, so the default goes over
+        // the value rather than only where the column is missing from the file altogether.
+        string? Value(Column column, bool present)
+        {
+            var value = present ? $"CAST({SqlText.Quote(column.Name)} AS {column.Type})" : null;
+            var fill = defaults ? column.Default?.Value : null;
+            return (value, fill) switch
+            {
+                (null, null) => null,
+                (null, _) => fill,
+                (_, null) => value,
+                _ => $"COALESCE({value}, {fill})",
+            };
+        }
+
         var columns = string.Join(", ", table.Columns
-            .Where(c => available.Any(a => Same(a.Name, c.Name)))
-            .Select(c => $"CAST({SqlText.Quote(c.Name)} AS {c.Type}) AS {SqlText.Quote(c.Name)}"));
+            .Select(c => (Column: c, Value: Value(c, available.Any(a => Same(a.Name, c.Name)))))
+            .Where(c => c.Value is not null)
+            .Select(c => $"{c.Value} AS {SqlText.Quote(c.Column.Name)}"));
 
         return $"SELECT {(columns.Length > 0 ? columns + ", " : "")}" +
                $"{(named ? "\"filename\"" : "NULL::VARCHAR")} AS \"_file\", {seq}::BIGINT AS \"_seq\" FROM {scan}";

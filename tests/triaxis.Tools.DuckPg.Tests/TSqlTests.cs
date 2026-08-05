@@ -16,7 +16,8 @@ public class TSqlTests
                 ["rowcount"] = "0",
                 ["trancount"] = "0",
             },
-            new HashSet<string>(parameters, StringComparer.OrdinalIgnoreCase));
+            new HashSet<string>(parameters, StringComparer.OrdinalIgnoreCase),
+            "sa");
 
         return string.Join("; ", TSqlTranslator.Translate(sql, context));
     }
@@ -45,6 +46,9 @@ public class TSqlTests
     [InlineData("SELECT GETDATE()", "SELECT current_localtimestamp()")]
     [InlineData("SELECT GETUTCDATE()", "SELECT timezone('UTC', now())")]
     [InlineData("SELECT NEWID()", "SELECT uuid()")]
+    // Who is asking is answered by the session, not by a principal DuckDB would have to keep.
+    [InlineData("SELECT SUSER_SNAME()", "SELECT 'sa'")]
+    [InlineData("SELECT USER_NAME()", "SELECT 'sa'")]
     [InlineData("SELECT IIF(a > 1, 'big', 'small') FROM t",
         """SELECT CASE WHEN "a" > 1 THEN 'big' ELSE 'small' END FROM "lake"."t" """)]
     // CHARINDEX and instr disagree about which argument comes first.

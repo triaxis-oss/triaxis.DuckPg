@@ -8,7 +8,9 @@ static class Dacpac
 {
     static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
 
-    public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key);
+    public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key,
+                            (string Column, string Expression)[]? Defaults = null);
+
 
     public static void Write(string path, params TableModel[] tables)
     {
@@ -16,7 +18,9 @@ static class Dacpac
 
         var model = new XElement(Dac + "DataSchemaModel",
             new XElement(Dac + "Model",
-                tables.Select(Element).Concat(tables.Where(t => t.Key.Length > 0).Select(Key))));
+                tables.Select(Element)
+                      .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
+                      .Concat(tables.SelectMany(Defaults))));
 
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         using var entry = archive.CreateEntry("model.xml").Open();
@@ -28,6 +32,18 @@ static class Dacpac
             Rel("Columns", [.. table.Columns.Select(c =>
                 El("SqlSimpleColumn", $"[dbo].[{table.Name}].[{c.Column}]",
                     Rel("TypeSpecifier", El("SqlTypeSpecifier", null, Rel("Type", Ref($"[{c.Type}]"))))))]));
+
+    /// A default is its own element, pointing back at the column it belongs to.
+    static IEnumerable<XElement> Defaults(TableModel table) =>
+        (table.Defaults ?? []).Select(d =>
+            El("SqlDefaultConstraint", $"[dbo].[DF_{table.Name}_{d.Column}]",
+                Script("DefaultExpressionScript", d.Expression),
+                Rel("DefiningTable", Ref($"[dbo].[{table.Name}]")),
+                Rel("ForColumn", Ref($"[dbo].[{table.Name}].[{d.Column}]"))));
+
+    /// DacFx writes a script as a nested `Value`, in CDATA -- not as a property attribute.
+    static XElement Script(string name, string sql) =>
+        new(Dac + "Property", new XAttribute("Name", name), new XElement(Dac + "Value", new XCData(sql)));
 
     static XElement Key(TableModel table) =>
         El("SqlPrimaryKeyConstraint", $"[dbo].[PK_{table.Name}]",

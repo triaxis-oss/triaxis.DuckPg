@@ -3,11 +3,13 @@ using System.Text;
 namespace triaxis.Tools.DuckPg.TSql;
 
 /// What the statement is being translated for: which schema `dbo` means, which `@parameters` were
-/// declared, and what the `@@variables` currently are.
+/// declared, what the `@@variables` currently are, and who is asking -- a session's login name, or
+/// the account duckpg itself runs as when nothing is connected.
 sealed record TSqlContext(
     string Schema,
     IReadOnlyDictionary<string, string> Variables,
-    IReadOnlySet<string> Parameters);
+    IReadOnlySet<string> Parameters,
+    string User);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -23,6 +25,13 @@ sealed class TSqlWriter(TSqlContext context)
     {
         var writer = new TSqlWriter(context);
         writer.Statement(statement);
+        return writer.sql.ToString();
+    }
+
+    public static string Write(Expr expr, TSqlContext context)
+    {
+        var writer = new TSqlWriter(context);
+        writer.Expression(expr);
         return writer.sql.ToString();
     }
 
@@ -480,6 +489,12 @@ sealed class TSqlWriter(TSqlContext context)
 
             case "newid":
                 Put("uuid()");
+                return true;
+
+            // Who is asking is a fixed string here, not a lookup: there is no server-wide principal
+            // behind a lake of files, only the session that asked or the account serving it.
+            case "suser_sname" or "suser_name" or "user_name" or "original_login":
+                Put(SqlText.Literal(context.User));
                 return true;
 
             case "isnull" when args.Count == 2:
