@@ -226,6 +226,19 @@ public class TSqlTests
     [InlineData("INSERT INTO #staged (id) VALUES (1)", """INSERT INTO "#staged" ("id") VALUES (1)""")]
     public void RendersTemporaryTables(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// A savepoint is a promise to undo part of a transaction, and DuckDB has nothing to undo it
+    /// with. Marking one costs nothing; returning to one is refused rather than quietly not done,
+    /// which would keep the writes the caller asked to discard.
+    [Fact]
+    public void SavepointsAreMarkedAndNotRolledBackTo()
+    {
+        Assert.Equal("", Translate("SAVE TRANSACTION __ef_savepoint"));
+        Assert.Equal("ROLLBACK", Translate("ROLLBACK TRANSACTION"));
+
+        var refused = Assert.Throws<TSqlException>(() => Translate("ROLLBACK TRANSACTION [__ef_savepoint]"));
+        Assert.Contains("cannot be honoured", refused.Message);
+    }
+
     [Fact]
     public void ApplicationLocksRenderToNothing()
     {

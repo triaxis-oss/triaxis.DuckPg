@@ -563,6 +563,27 @@ public class TdsTests : IDisposable
                 new SqlCommand("SELECT COUNT(*) FROM #left_behind", connection).ExecuteScalar());
     }
 
+    /// EF Core marks a savepoint whenever it saves inside a transaction of the caller's, and rolls
+    /// back to it when that save fails. Marking one is free; rolling back to one is refused, since
+    /// the alternative is keeping writes the caller asked to be rid of.
+    [Fact]
+    public void SavepointsAreMarkedAndNotRolledBackTo()
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+
+        new SqlCommand("SAVE TRANSACTION __ef_savepoint", connection, transaction).ExecuteNonQuery();
+        new SqlCommand("INSERT INTO orders (order_id, amount) VALUES (7004, 1)", connection, transaction)
+            .ExecuteNonQuery();
+
+        var refused = Assert.Throws<SqlException>(() =>
+            new SqlCommand("ROLLBACK TRANSACTION __ef_savepoint", connection, transaction).ExecuteNonQuery());
+        Assert.Contains("cannot be honoured", refused.Message);
+
+        transaction.Commit();
+        Assert.Equal(4, Count(connection));
+    }
+
     /// An application takes one to serialise itself against the other connections of a database,
     /// which a lake has none of; what it must not do is fail, since the work is inside the
     /// transaction the lock was taken for.
