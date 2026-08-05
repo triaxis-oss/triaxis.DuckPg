@@ -148,7 +148,10 @@ lake in a temp directory from strings, and `Restart()` throws away everything in
 how persistence is told from luck.
 
 The native DuckDB comes from `DuckDB.NET.Bindings.Full` via `PackageDownload` and a copy target —
-downloaded, not referenced, because its managed assemblies would collide with the tool's.
+downloaded, not referenced, because its managed assemblies would collide with the tool's. The copy
+picks the RID folder by hand, so it has to know that the package ships macOS as one universal
+binary under `osx` while every other platform has a folder per RID; `-p:DuckDbRid=osx` exercises
+that path from anywhere.
 
 A change to the merge-on-read SQL, the write path or the shims needs a test that would have failed
 before it. A change to a protocol needs one in `ClientTests` (Npgsql) or `TdsTests` (SqlClient),
