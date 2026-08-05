@@ -29,7 +29,8 @@ sealed class Lake : IDisposable
         var write = new WriteLayer(config, loggers.CreateLogger<WriteLayer>());
         if (write.Directory is { } directory) Directory.CreateDirectory(directory);
 
-        Catalog = new Catalog(config, write, loggers.CreateLogger<Catalog>());
+        var schema = new DacpacSchema(config, loggers.CreateLogger<DacpacSchema>());
+        Catalog = new Catalog(config, write, schema, loggers.CreateLogger<Catalog>());
         Catalog.Build(duck);
 
         var gateway = new Gateway(config, Catalog, write, duck, loggers.CreateLogger<Gateway>());

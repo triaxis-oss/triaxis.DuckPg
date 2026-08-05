@@ -1,11 +1,15 @@
 using System.IO.Compression;
 using System.Xml.Linq;
+using Microsoft.Extensions.Logging;
 
 namespace triaxis.Tools.DuckPg;
 
 /// The declared schema, read straight out of a .dacpac. A dacpac is a zip whose `model.xml` holds
 /// every table as a `SqlTable` element, so DacFx is not needed to get at it -- and DacFx would not
 /// run here anyway.
+///
+/// One of these exists whether or not a dacpac does: without one it declares nothing, so the
+/// catalog asks the same questions either way.
 sealed class DacpacSchema
 {
     static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
@@ -19,21 +23,27 @@ sealed class DacpacSchema
 
     public string[] Key(string table) => keys.GetValueOrDefault(table) ?? [];
 
-    public static DacpacSchema Load(string path)
+    public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
+    {
+        var path = config.Dacpac ?? Layer.FindDacpac(
+            [.. config.Layers, .. config.Write is null ? [] : (string[])[config.Write]], logger);
+
+        if (path is not null) Read(path);
+    }
+
+    void Read(string path)
     {
         using var archive = ZipFile.OpenRead(path);
         var model = archive.GetEntry("model.xml")
             ?? throw new InvalidOperationException($"{path} has no model.xml");
         using var stream = model.Open();
 
-        var schema = new DacpacSchema();
         foreach (var element in XDocument.Load(stream).Descendants(Dac + "Element"))
             switch (element.Attribute("Type")?.Value)
             {
-                case "SqlTable": schema.ReadTable(element); break;
-                case "SqlPrimaryKeyConstraint": schema.ReadKey(element); break;
+                case "SqlTable": ReadTable(element); break;
+                case "SqlPrimaryKeyConstraint": ReadKey(element); break;
             }
-        return schema;
     }
 
     void ReadTable(XElement table)
