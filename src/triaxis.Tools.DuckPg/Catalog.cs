@@ -32,11 +32,9 @@ sealed record Table(
 
 /// Publishes each table as one view over its layers: the lowest layer at the bottom, the write
 /// layer on top, and -- where a key is declared -- the topmost row for a key winning.
-sealed class Catalog(Config config, WriteLayer write, ILogger<Catalog> logger)
+sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogger<Catalog> logger)
 {
     public Dictionary<string, Table> Tables { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-    readonly DacpacSchema? schema = Dacpac(config, logger);
 
     /// Schema holding the materialised YAML and JSON layers.
     const string LayerSchema = "layer";
@@ -54,7 +52,7 @@ sealed class Catalog(Config config, WriteLayer write, ILogger<Catalog> logger)
             var describedWrite = writeSource is null ? null
                 : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
 
-            var columns = schema?.Columns(name) ?? Published(describedWrite is null ? layers : [.. layers, describedWrite]);
+            var columns = schema.Columns(name) ?? Published(describedWrite is null ? layers : [.. layers, describedWrite]);
             var writable = settings.Writable ?? write.Enabled;
             var partitions = layers.SelectMany(l => l.Source.Partitions)
                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -82,12 +80,6 @@ sealed class Catalog(Config config, WriteLayer write, ILogger<Catalog> logger)
 
     static bool Same(string a, string b) => a.Equals(b, StringComparison.OrdinalIgnoreCase);
 
-    static DacpacSchema? Dacpac(Config config, ILogger logger)
-    {
-        var path = config.Dacpac ?? Layer.FindDacpac([.. config.Layers, .. config.Write is null ? [] : (string[])[config.Write]], logger);
-        return path is null ? null : DacpacSchema.Load(path);
-    }
-
     // ---- discovery -------------------------------------------------------------------------------
 
     /// Every table any layer carries, keyed case-insensitively -- an export that disagrees with
@@ -114,7 +106,7 @@ sealed class Catalog(Config config, WriteLayer write, ILogger<Catalog> logger)
 
         // A table the schema declares but no layer carries is still part of the shape: publish it
         // empty, so the catalog is the schema rather than a list of which files turned up.
-        foreach (var declared in schema?.Tables ?? [])
+        foreach (var declared in schema.Tables)
             if (!sources.ContainsKey(declared)) sources[declared] = ([], null);
 
         return sources.Select(s => (s.Key, s.Value.Layers, s.Value.Write))
@@ -196,7 +188,7 @@ sealed class Catalog(Config config, WriteLayer write, ILogger<Catalog> logger)
             table.Key.Length > 0 ? table.Key
             : config.DefaultKey.Length > 0 && config.DefaultKey.All(k => columns.Any(c => Same(c.Name, k)))
                 ? config.DefaultKey
-            : schema?.Key(name) is { Length: > 0 } declared && declared.All(k => columns.Any(c => Same(c.Name, k)))
+            : schema.Key(name) is { Length: > 0 } declared && declared.All(k => columns.Any(c => Same(c.Name, k)))
                 ? declared
             : [];
 
