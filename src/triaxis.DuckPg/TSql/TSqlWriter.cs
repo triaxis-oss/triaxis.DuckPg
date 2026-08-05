@@ -54,6 +54,10 @@ sealed class TSqlWriter(TSqlContext context)
 
     // ---- statements ------------------------------------------------------------------------------
 
+    /// Procedures answered by doing nothing, because what they arrange a lake has already arranged.
+    static readonly HashSet<string> Granted =
+        new(StringComparer.OrdinalIgnoreCase) { "sp_getapplock", "sp_releaseapplock" };
+
     void Statement(Statement statement)
     {
         switch (statement)
@@ -106,6 +110,16 @@ sealed class TSqlWriter(TSqlContext context)
             case SetOptionStatement option:
                 Put("SET ").Put(option.Option);
                 return;
+
+            // An application lock serialises a caller against the other connections of a shared
+            // database, and a lake is not one: it serves the application that owns its files. The
+            // exclusion asked for is already there, so granting it is rendering nothing -- the
+            // empty statement is the gateway's no-op, and a batched EXEC carries no result anyway.
+            case ExecuteStatement execute when Granted.Contains(execute.Procedure.Table.Text):
+                return;
+
+            case ExecuteStatement execute:
+                throw new TSqlException($"stored procedure {execute.Procedure.Table.Text} is not supported", 0);
 
             case TransactionStatement transaction:
                 Put(transaction.Action switch

@@ -91,6 +91,7 @@ sealed class TSqlParser
         if (Peek.Is("delete")) return Delete();
         if (Peek.Is("merge")) return Merge();
         if (Peek.Is("set")) return SetOption();
+        if (Peek.Is("exec") || Peek.Is("execute")) return Execute();
         if (Peek.Is("begin") || Peek.Is("commit") || Peek.Is("rollback") || Peek.Is("save")) return Transaction();
 
         throw new TSqlException($"unsupported statement `{Peek.Text}`", Peek.Position);
@@ -209,6 +210,40 @@ sealed class TSqlParser
 
         if (words.Count == 0) throw Unexpected("expected an option name");
         return new SetOptionStatement(string.Join(' ', words));
+    }
+
+    /// A procedure call, arguments and all. `EXEC ('…')` and `EXEC @rc = …` are refused here rather
+    /// than parsed: one is a batch a lake cannot see into, the other wants a variable to put a
+    /// result in, and nothing here has one.
+    Statement Execute()
+    {
+        if (!Accept("exec")) Expect("execute");
+
+        if (Peek.Kind == TokenKind.Variable)
+            throw new TSqlException("EXEC into a variable is not supported", Peek.Position);
+        if (Peek.Is(TokenKind.Operator, "("))
+            throw new TSqlException("EXEC of a string is not supported", Peek.Position);
+
+        var procedure = TableName();
+        var arguments = new List<ExecuteArgument>();
+
+        if (Peek.Kind != TokenKind.End && !Peek.Is(TokenKind.Operator, ";"))
+            do
+            {
+                Name? name = null;
+                if (Peek.Kind == TokenKind.Variable && Ahead(1).Is(TokenKind.Operator, "="))
+                {
+                    name = new Name(Take().Text, false);
+                    ExpectOperator("=");
+                }
+
+                var value = Expression();
+                if (Peek.Is("output") || Peek.Is("out"))
+                    throw new TSqlException("an OUTPUT argument is not supported", Peek.Position);
+                arguments.Add(new ExecuteArgument(name, value));
+            } while (AcceptOperator(","));
+
+        return new ExecuteStatement(procedure, arguments);
     }
 
     Statement Transaction()

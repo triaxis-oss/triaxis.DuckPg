@@ -528,6 +528,30 @@ public class TdsTests : IDisposable
         Assert.Equal([1, 2, 3], results);
     }
 
+    /// An application takes one to serialise itself against the other connections of a database,
+    /// which a lake has none of; what it must not do is fail, since the work is inside the
+    /// transaction the lock was taken for.
+    [Fact]
+    public void ApplicationLocksAreGranted()
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+
+        new SqlCommand("EXEC sp_getapplock @Resource = 'orders:reload', " +
+                       "@LockMode = 'Exclusive', @LockOwner = 'Transaction'", connection, transaction)
+            .ExecuteNonQuery();
+
+        new SqlCommand("INSERT INTO orders (order_id, amount) VALUES (7003, 1)", connection, transaction)
+            .ExecuteNonQuery();
+
+        new SqlCommand("EXEC sp_releaseapplock @Resource = 'orders:reload', " +
+                       "@LockOwner = 'Transaction'", connection, transaction)
+            .ExecuteNonQuery();
+
+        transaction.Commit();
+        Assert.Equal(4, Count(connection));
+    }
+
     [Fact]
     public void SessionOptionsAreAccepted()
     {

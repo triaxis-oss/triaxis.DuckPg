@@ -189,6 +189,13 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **An application lock is granted by doing nothing.** `EXEC sp_getapplock` asks to be serialised
+  against the other connections of a shared database; a lake serves the application that owns its
+  files, so the exclusion is already there and `TSqlWriter` renders the statement as nothing --
+  which `Gateway.Translate` already answers as `Plan.Empty`. Making it a real lock would promise
+  more than a lake can keep, since the files under it may be served by another process. `EXEC` of
+  anything else is refused by name: the parser covers the call so an ORM reaching for a procedure
+  is told which one is missing, not that `EXEC` is unparseable.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column
