@@ -2,6 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <DuckDbVersion>1.5.5</DuckDbVersion>
     <IsPackable>false</IsPackable>
     <!-- SqlClient refuses to run in invariant globalization mode; the tool itself has no such need. -->
     <InvariantGlobalization>false</InvariantGlobalization>
@@ -20,7 +21,7 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
     <!-- Downloaded, not referenced: only the native library is wanted, and the managed assemblies
          next to it would collide with the ones the tool already brings. -->
-    <PackageDownload Include="DuckDB.NET.Bindings.Full" Version="[1.5.5]" />
+    <PackageDownload Include="DuckDB.NET.Bindings.Full" Version="[$(DuckDbVersion)]" />
   </ItemGroup>
 
   <ItemGroup>
@@ -30,11 +31,18 @@
   <!-- The tool links against the DuckDB installed on the machine; the tests carry their own, so a
        clean checkout and a clean CI runner can both run them. -->
   <Target Name="CopyDuckDbNative" BeforeTargets="PrepareForRun">
+    <PropertyGroup>
+      <!-- macOS ships as one universal binary under `osx`, where every other platform has a folder
+           per RID, so the SDK's own `osx-arm64` finds nothing there. -->
+      <DuckDbRid Condition="'$(DuckDbRid)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">osx</DuckDbRid>
+      <DuckDbRid Condition="'$(DuckDbRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</DuckDbRid>
+      <DuckDbRuntime>$(NuGetPackageRoot)duckdb.net.bindings.full/$(DuckDbVersion)/runtimes/$(DuckDbRid)/native</DuckDbRuntime>
+    </PropertyGroup>
     <ItemGroup>
-      <DuckDbNative Include="$(NuGetPackageRoot)duckdb.net.bindings.full/1.5.5/runtimes/$(NETCoreSdkRuntimeIdentifier)/native/*" />
+      <DuckDbNative Include="$(DuckDbRuntime)/*" />
     </ItemGroup>
     <Error Condition="'@(DuckDbNative)' == ''"
-           Text="No DuckDB native library for $(NETCoreSdkRuntimeIdentifier) in DuckDB.NET.Bindings.Full." />
+           Text="No DuckDB native library in $(DuckDbRuntime): DuckDB.NET.Bindings.Full $(DuckDbVersion) carries none for $(DuckDbRid)." />
     <Copy SourceFiles="@(DuckDbNative)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
   </Target>
 
