@@ -338,6 +338,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
+| `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
 | `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
@@ -363,6 +364,12 @@ A `#table` is a temporary table, and DuckDB's belong to a connection exactly as 
 to a session — including going away when a pooled connection is handed out again. `##global` ones
 are refused: another connection cannot see them here. `SELECT … INTO` and `DROP TABLE` accept
 nothing else, since a lake's tables are the files under it.
+
+EF Core sends a batch of rows as a `MERGE` over `ON 1=0`, which is a multi-row insert with the
+matched branch made unreachable, and it is translated as one. Its `OUTPUT INSERTED.[key]` is not:
+that asks for a key the caller did not send, and a lake stores what it is given rather than
+generating anything — so a batch insert into a table with a store-generated key is refused, naming
+what it cannot answer.
 
 A savepoint is the one thing that is refused rather than approximated. `SAVE TRANSACTION` renders to
 nothing — marking a point costs nothing — but DuckDB has no savepoints to return to, so

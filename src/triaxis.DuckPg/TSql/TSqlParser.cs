@@ -165,9 +165,12 @@ sealed class TSqlParser
         return new UpdateStatement(target, null, assignments, from, where);
     }
 
-    /// `MERGE` is an update by another spelling: the target joined to a source on a condition. Only
-    /// the matched-update branch is covered -- the rest changes how many rows a table has, which is
-    /// the layer machinery's business and not one statement's.
+    /// `MERGE` is another statement by another spelling, and which one depends on the branch. An
+    /// update joined to its source is what `WHEN MATCHED THEN UPDATE` means. `WHEN NOT MATCHED THEN
+    /// INSERT` over a condition that cannot match is a multi-row insert, which is what EF Core sends
+    /// a batch of rows as. What is not covered is the conditional form, where the branch taken
+    /// depends on whether a row is already there: what a row's existence means across layers is the
+    /// layer machinery's, not one statement's.
     Statement Merge()
     {
         Expect("merge");
@@ -181,20 +184,72 @@ sealed class TSqlParser
         var on = Expression();
 
         Expect("when");
-        if (!Peek.Is("matched")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
+        var matched = !Accept("not");
         Expect("matched");
+        if (!matched && Accept("by") && !Accept("target"))
+            throw Unexpected("MERGE ... WHEN NOT MATCHED BY SOURCE is not supported");
         if (Peek.Is("and")) throw Unexpected("MERGE WHEN MATCHED AND is not supported");
         Expect("then");
+
+        var statement = matched
+            ? MergeUpdate(target, alias, source, on)
+            : MergeInsert(target, source, on);
+
+        if (Peek.Is("when")) throw Unexpected("only one MERGE branch at a time is supported");
+
+        // `OUTPUT INSERTED.<key>` asks for what the write made of each row, which is how a caller
+        // gets a key it did not send back. A lake writes down what it is given and makes up nothing,
+        // so there is nothing to hand back -- and saying so beats answering with the rows as sent.
+        if (Peek.Is("output"))
+            throw new TSqlException(
+                "MERGE ... OUTPUT is not supported: a lake stores the row it is given, so a column " +
+                "the statement does not insert has no value to read back", Peek.Position);
+
+        return statement;
+    }
+
+    Statement MergeUpdate(TableName target, Name? alias, TableSource source, Expr on)
+    {
         if (!Peek.Is("update")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
         Expect("update");
         Expect("set");
-        var assignments = Assignments();
-
-        if (Peek.Is("when")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
-        if (Peek.Is("output")) throw Unexpected("MERGE ... OUTPUT is not supported");
-
-        return new UpdateStatement(target, alias, assignments, source, on);
+        return new UpdateStatement(target, alias, Assignments(), source, on);
     }
+
+    /// The rows are the `USING` clause and the condition says nothing can match, so the branch is
+    /// the only one there is: every source row is inserted. A condition that *can* match would make
+    /// this an insert of what is not already there, which is a different statement -- one that has
+    /// to decide what "already there" means when the row it would shadow is in a layer below.
+    Statement MergeInsert(TableName target, TableSource source, Expr on)
+    {
+        if (!Never(on))
+            throw Unexpected("MERGE ... WHEN NOT MATCHED THEN INSERT is supported only over a condition " +
+                             "that cannot match, such as ON 1 = 0");
+
+        Expect("insert");
+        var columns = new List<Name>();
+        ExpectOperator("(");
+        do columns.Add(Identifier()); while (AcceptOperator(","));
+        ExpectOperator(")");
+
+        Expect("values");
+        var values = ParenthesisedList();
+
+        var body = new SelectBody(false, null, false, [.. values.Select(v => new SelectItem(v, null))],
+                                  null, source, null, [], null);
+        return new InsertStatement(target, columns, new InsertQuery(new Query([], body, [], null, null)));
+    }
+
+    /// `ON 1 = 0` and its spellings: what EF Core writes to say that this MERGE is an insert.
+    static bool Never(Expr on) => on switch
+    {
+        ParenExpr paren => Never(paren.Inner),
+        BinaryExpr { Operator: "=" or "<>", Left: Literal { Kind: LiteralKind.Number } left,
+                     Right: Literal { Kind: LiteralKind.Number } right } binary =>
+            (left.Text == right.Text) != (binary.Operator == "="),
+        Literal { Kind: LiteralKind.False } => true,
+        _ => false,
+    };
 
     List<Assignment> Assignments()
     {

@@ -528,6 +528,31 @@ public class TdsTests : IDisposable
         Assert.Equal([1, 2, 3], results);
     }
 
+    /// EF Core sends a batch of rows as a MERGE whose condition cannot match: the rows are the
+    /// USING clause and the insert branch takes all of them. It lands in the write layer like any
+    /// other insert, one statement and one count.
+    [Fact]
+    public void BatchInsertsArriveAsOneStatement()
+    {
+        using (var connection = Open())
+        {
+            using var command = new SqlCommand(
+                "MERGE [orders] USING (VALUES (@p0, @p1, 0), (@p2, @p3, 1)) AS i ([order_id], [amount], _Position) " +
+                "ON 1=0 WHEN NOT MATCHED THEN INSERT ([order_id], [amount]) VALUES (i.[order_id], i.[amount]);",
+                connection);
+            command.Parameters.AddWithValue("@p0", 7010);
+            command.Parameters.AddWithValue("@p1", 1.25m);
+            command.Parameters.AddWithValue("@p2", 7011);
+            command.Parameters.AddWithValue("@p3", 2.50m);
+
+            Assert.Equal(2, command.ExecuteNonQuery());
+        }
+
+        lake.Restart();
+        Assert.Equal(["7010|1.25", "7011|2.50"],
+            lake.Query("SELECT order_id, amount FROM lake.orders WHERE order_id >= 7010 ORDER BY order_id"));
+    }
+
     /// The shape a tool takes a snapshot with: drop what a previous run left, select the rows into
     /// a scratch table, work against it. The temporary table belongs to the connection, so it also
     /// has to be gone from the next session to be handed this one.
