@@ -109,6 +109,8 @@ sealed class TestLake : IDisposable
 
     /// SqlClient encrypts by default and duckpg refuses encryption, so `Encrypt=False` is part of
     /// the contract rather than a test shortcut.
+    public int TdsPort => lake!.Tds!.Endpoint.Port;
+
     public string SqlConnectionString(string user = "sa") =>
         $"Server=127.0.0.1,{lake!.Tds!.Endpoint.Port};Database=lake;User ID={user};Password=duckpg;" +
         "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=true";

@@ -344,20 +344,35 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         var rows = 0L;
         var started = Stopwatch.GetTimestamp();
 
+        var row = new TdsMsg();
+
+        // Sends what the caller says is safe to send, and answers whether the client gave up while
+        // it was going out -- a cancel is only visible between packets.
+        bool Flush(int count)
+        {
+            wire.SendUpTo(TdsMessage.Result, msg, count);
+            return Cancelled();
+        }
+
         while (reader.Read())
         {
-            msg.U8(TdsToken.Row);
+            // Built on its own, as though it began a packet -- which is where it lands when it does
+            // not fit in the one being filled, and the offset its values were chunked against.
+            row.Clear();
+            row.U8(TdsToken.Row);
             for (var i = 0; i < reader.FieldCount; i++)
-                TdsTypes.WriteValue(msg, columns[i], reader.IsDBNull(i) ? null : reader.GetValue(i));
+                TdsTypes.WriteValue(row, columns[i], reader.IsDBNull(i) ? null : reader.GetValue(i), wire.Payload);
+
+            // A row cut across the seam between two packets loses a client replaying a split read
+            // its place, so one that does not fit ends the packet here and starts the next.
+            if (msg.Length > 0 && msg.Length + row.Length > wire.Payload && Flush(msg.Length)) break;
+
+            msg.Raw(row.Body);
             rows++;
 
-            // Rows go out as soon as they fill a packet, and a cancel arriving mid-stream is only
-            // visible between them.
-            if (msg.Length >= wire.PacketSize)
-            {
-                wire.Send(TdsMessage.Result, msg, last: false);
-                if (Cancelled()) break;
-            }
+            // A row too big for any packet has to be cut, and is cut on the packet boundaries its
+            // own values were chunked to -- which are whole payloads from where the row started.
+            if (msg.Length >= wire.Payload && Flush(msg.Length / wire.Payload * wire.Payload)) break;
         }
 
         logger.LogDebug("{Rows} rows in {Elapsed:0.0} ms", rows, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -475,7 +490,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             {
                 var handle = ++handles;
                 prepared[handle] = new Prepared(Text(arguments, 2), Declaration(arguments, 1));
-                ReturnValue(msg, "handle", handle);
+                ReturnValue(msg, "handle", handle, wire.Payload);
                 Run(msg, prepared[handle].Statement,
                     Bind(prepared[handle].Declaration, arguments.Skip(3)), TdsToken.DoneInProc);
                 break;
@@ -485,7 +500,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             {
                 var handle = ++handles;
                 prepared[handle] = new Prepared(Text(arguments, 2), Declaration(arguments, 1));
-                ReturnValue(msg, "handle", handle);
+                ReturnValue(msg, "handle", handle, wire.Payload);
                 Done(msg, TdsToken.DoneInProc, Status.Final, 0);
                 break;
             }
@@ -552,12 +567,12 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         return bound;
     }
 
-    static void ReturnValue(TdsMsg msg, string name, int value)
+    static void ReturnValue(TdsMsg msg, string name, int value, int payload)
     {
         var column = new TdsColumn(TdsTypes.IntN, 4);
         msg.U8(0xAC).U16(0).BVarchar(name).U8(0x01).I32(0).U16(0x0001);
         TdsTypes.WriteTypeInfo(msg, column);
-        TdsTypes.WriteValue(msg, column, value);
+        TdsTypes.WriteValue(msg, column, value, payload);
     }
 
     // ---- transactions ----------------------------------------------------------------------------
