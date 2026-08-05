@@ -116,8 +116,11 @@ someone changing the code needs.
   types a string parameter as `NTEXT`, so `TdsTypes.ReadValue` has to know `TEXT`/`NTEXT`/`IMAGE`:
   four bytes of declared maximum instead of two, a collation on the text ones, and a four-byte
   value length where -1 is null. Nothing here ever sends them back.
-- `SELECT COUNT(*)` gives a `long`, because DuckDB counts in BIGINT. An application that casts to
-  `int` will need `Convert.ToInt32`.
+- **`COUNT` is an `int` in SQL Server and a BIGINT in DuckDB**, and an application casting the
+  scalar to `int` throws on the difference. `TSqlWriter.Function` casts a `COUNT` back, around the
+  window clause as well, and renders `COUNT_BIG` as the plain count -- which is how a caller asks
+  for the wide one on the database this stands in for. `SUM` has the same shape of problem and is
+  not fixed: SQL Server's answer depends on the argument's type, which is not on the tree.
 
 ## Tests
 

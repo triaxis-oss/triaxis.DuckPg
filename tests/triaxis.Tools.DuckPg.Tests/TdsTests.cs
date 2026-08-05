@@ -237,6 +237,21 @@ public class TdsTests : IDisposable
         Assert.Equal(["1/10.50/2026-08-01/first", "2/20.00/2026-08-02/second", "3/30.00/2026-08-03/null"], rows);
     }
 
+    /// An application written against SQL Server casts what COUNT returns to `int`, and DuckDB
+    /// counts in BIGINT -- so the count comes back narrowed, and COUNT_BIG is how to ask for the
+    /// wide one, exactly as it is on the database this stands in for.
+    [Fact]
+    public void CountIsAnIntAndCountBigIsNot()
+    {
+        using var connection = Open();
+
+        using var count = new SqlCommand("SELECT COUNT(*) FROM orders", connection);
+        Assert.Equal(3, Assert.IsType<int>(count.ExecuteScalar()));
+
+        using var wide = new SqlCommand("SELECT COUNT_BIG(*) FROM orders", connection);
+        Assert.Equal(3L, Assert.IsType<long>(wide.ExecuteScalar()));
+    }
+
     /// The login name, since that is the only user a lake of files has.
     [Fact]
     public void SaysWhoIsAsking()
@@ -307,7 +322,7 @@ public class TdsTests : IDisposable
         command.Parameters.AddWithValue("@min", 15m);
         command.Parameters.AddWithValue("@until", new DateTime(2026, 8, 2));
 
-        Assert.Equal(1L, command.ExecuteScalar());
+        Assert.Equal(1, command.ExecuteScalar());
     }
 
     [Fact]
@@ -371,9 +386,9 @@ public class TdsTests : IDisposable
         min.Value = 0m;
         command.Prepare();
 
-        Assert.Equal(3L, command.ExecuteScalar());
+        Assert.Equal(3, command.ExecuteScalar());
         command.Parameters[0].Value = 25m;
-        Assert.Equal(1L, command.ExecuteScalar());
+        Assert.Equal(1, command.ExecuteScalar());
     }
 
     [Fact]
