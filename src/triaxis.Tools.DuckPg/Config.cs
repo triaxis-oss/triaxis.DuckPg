@@ -32,6 +32,12 @@ sealed class Config
     /// single .dacpac sitting in a layer directory is picked up on its own.
     public string? Dacpac { get; set; }
 
+    /// Where the merged rows of a table more than one layer carries are written once, as a ZSTD
+    /// parquet the view then scans. A view is bound on every execution, so a table that cannot
+    /// change while the lake is up is worth binding as one file rather than as the merge that
+    /// produced it. Unset means no copy is made and every query does the merge.
+    public string? Cache { get; set; }
+
     /// DuckDB session variable -> startup parameter name ("user", "database", "application_name")
     /// or a "-c key=value" entry passed through libpq's `options`.
     public Dictionary<string, string> SessionVariables { get; set; } = new(StringComparer.OrdinalIgnoreCase);

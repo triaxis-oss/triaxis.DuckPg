@@ -49,7 +49,11 @@ someone changing the code needs.
   answer the same both times, and a row already in a file cannot say when it was written.
   `ColumnDefault.Expr` is what the write table declares, so a row being inserted is stamped as it is
   inserted. Filling the write branch in the view, or freezing the write table's default, each undoes
-  half of that.
+  half of that. A `--cache` copy carries no default at all: `Catalog.Over` applies it in the view
+  reading the copy, so a stamp belongs to the process answering rather than to a file outliving it.
+  Only a default the merge depends on -- on a key column, or under a filter or a virtual column --
+  is written into the copy. `Catalog.Signature` keys on a default's declared expression and not on
+  what it evaluated to, or every stamped table would rebuild on every restart.
 - **The type catalog describes the OIDs the gateway puts on the wire**, not DuckDB's own types.
   `Shims.Macros` replaces `pg_type` wholesale for that reason; DuckDB's has NULL oids and its own
   type names.
@@ -58,6 +62,12 @@ someone changing the code needs.
   case, not in a string replacement — this is why `'a' + b` concatenates and `1 + 2` adds.
 - **A statement the parser does not cover is refused**, with the position. Passing unknown text
   through to DuckDB moves the failure somewhere harder to read.
+- **A view is bound on every execution, not once when the lake is built.** DuckDB re-plans even a
+  prepared statement -- measured, `Prepare()` costs 0.06 ms and changes nothing -- so every
+  expression in a view definition is paid for by every query touching it, and on a wide table that
+  is most of what a small query costs. Hence: no cast to the type a layer already has, no merge
+  wrapper around a table only one layer carries, and `--cache` writing a merged table out once as
+  parquet. A plan cache above DuckDB would cache an object that re-plans anyway.
 - **AOT-clean**: no reflection-based serialization, no `JsonSerializer.Serialize<object>`. The
   project ships portable but the analysers stay on, so a regression shows up as a build warning
   (and warnings are errors here).

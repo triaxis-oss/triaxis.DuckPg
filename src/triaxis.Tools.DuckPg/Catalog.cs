@@ -1,4 +1,6 @@
 using System.Data.Common;
+using System.Security.Cryptography;
+using System.Text;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.Logging;
 using triaxis.Tools.DuckPg.TSql;
@@ -71,7 +73,9 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                                   writable, writeSource, settings.Filter);
 
             if (table.Writable) write.Prepare(conn, table);
-            Exec(conn, ViewDefinition(table));
+            Exec(conn, Cached(conn, table) is { } file
+                ? $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Over(table, file)}"
+                : ViewDefinition(table));
             Tables[name] = table;
         }
 
@@ -330,7 +334,104 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
 
     // ---- the view --------------------------------------------------------------------------------
 
-    string ViewDefinition(Table table)
+    /// A table published as one scan of its own merged rows, written out once. Only where there is
+    /// something to merge and nothing to write: one layer is already a single scan, and a writable
+    /// table's rows change under any copy of them. Null when no cache is configured or the table
+    /// does not qualify.
+    string? Cached(DuckDBConnection conn, Table table)
+    {
+        if (config.Cache is not { Length: > 0 } cache || table.Writable || table.Layers.Count < 2) return null;
+
+        var merged = Merged(table, defaults: !Deferrable(table));
+        Directory.CreateDirectory(cache);
+        var file = Path.Combine(cache, $"{table.Name}-{Fingerprint(Signature(table), table.Layers)}.parquet").Replace('\\', '/');
+
+        // Keyed by what produced it, so a restart over files that have not changed reuses the copy
+        // rather than deriving it again -- and one that has changed lands on a different name
+        // instead of quietly answering with the old rows.
+        if (File.Exists(file))
+        {
+            logger.LogDebug("reusing {File} for {Table}", file, table.Name);
+            return file;
+        }
+
+        // ZSTD rather than none or snappy: a third smaller than snappy for the same read, and a
+        // compressed scan beats an uncompressed one outright -- there is simply less to move.
+        Exec(conn, $"COPY ({merged}) TO {SqlText.Literal(file)} (FORMAT PARQUET, COMPRESSION ZSTD)");
+        logger.LogDebug("materialised {Table} into {File}", table.Name, file);
+
+        // Whatever this table used to be keyed by is now answering nothing.
+        foreach (var stale in Directory.EnumerateFiles(cache, $"{table.Name}-*.parquet"))
+            if (!Same(stale.Replace('\\', '/'), file)) File.Delete(stale);
+
+        return file;
+    }
+
+    /// Everything about a table that decides its merged rows, in a form that says the same thing
+    /// every time it is asked. A declared default appears as the expression it was declared as
+    /// rather than as what that expression was worth at startup: `(getdate())` answers differently
+    /// every run, and keying on the answer would rebuild every stamped table for no reason -- which
+    /// is most of them in a real schema.
+    static string Signature(Table table) =>
+        string.Join("\n", table.Columns.Select(c => $"{c.Name}:{c.Type}:{c.Default?.Expr}")
+            .Concat(table.Virtuals.Select(v => $"+{v.Name}={v.Expr}"))
+            .Concat(table.Layers.Select(l => $"@{l.Source.Seq}:{l.Scan}"))
+            .Append($"key={string.Join(",", table.Key)}")
+            .Append($"filter={table.Filter}"));
+
+    /// What a materialised copy is keyed by: everything about the table that decides its rows, and
+    /// the bytes of every file it reads. Same fingerprint, same rows.
+    static string Fingerprint(string signature, IEnumerable<TableLayer> layers)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        hash.AppendData(Encoding.UTF8.GetBytes(signature));
+
+        foreach (var file in layers.SelectMany(l => Files(l.Source)).OrderBy(f => f, StringComparer.Ordinal))
+        {
+            hash.AppendData(Encoding.UTF8.GetBytes(file));
+            using var stream = File.OpenRead(file);
+            hash.AppendData(SHA256.HashData(stream));
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset())[..16];
+    }
+
+    /// The files behind a source, which is one file or everything a `**/*.ext` glob reaches.
+    static IEnumerable<string> Files(LayerSource source)
+    {
+        var star = source.Path.IndexOf('*');
+        if (star < 0) return File.Exists(source.Path) ? [source.Path] : [];
+
+        var root = source.Path[..star].TrimEnd('/', '\\');
+        return Directory.Exists(root)
+            ? Directory.EnumerateFiles(root, "*" + Path.GetExtension(source.Path), SearchOption.AllDirectories)
+            : [];
+    }
+
+    static string Scan(string file) =>
+        $"read_parquet({SqlText.Literal(file)}, hive_partitioning=false)";
+
+    /// Whether a declared default can be left out of the copy and applied by the view reading it.
+    /// It can where nothing in the merge depends on it: a default on a key column decides which row
+    /// shadows which, and a filter or a virtual column reads the merged row, defaults and all. A
+    /// copy is a file that outlives the process that wrote it, so a default it does not carry is
+    /// stamped by whoever reads it -- which is what `(getdate())` meant before there was a copy.
+    bool Deferrable(Table table) =>
+        table.Filter is null && table.Virtuals.Count == 0 &&
+        !table.Key.Any(k => table.Columns.Any(c => Same(c.Name, k) && c.Default is not null));
+
+    /// The view over a copy: the stored column, with a deferred default over the top.
+    string Over(Table table, string file) =>
+        Deferrable(table) && table.Columns.Any(c => c.Default is not null)
+            ? "SELECT " + string.Join(", ", table.Columns.Select(c =>
+                  (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
+                  + $" AS {SqlText.Quote(c.Name)}")) + $" FROM {Scan(file)}"
+            : $"SELECT * FROM {Scan(file)}";
+
+    string ViewDefinition(Table table) =>
+        $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table)}";
+
+    string Merged(Table table, bool defaults = true)
     {
         // One layer and nothing to merge it with: the table *is* that layer, and everything the
         // merge needs around it -- the union, the sequence numbers, the row numbering that picks a
@@ -341,9 +442,9 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         // A filter or a virtual column reads the merged row rather than the file's, so those keep
         // the wrapper they are written against.
         if (!table.Writable && table.Layers is [var only] && table.Virtuals.Count == 0 && table.Filter is null)
-            return $"CREATE OR REPLACE VIEW {table.QualifiedName} AS SELECT " +
+            return "SELECT " +
                    string.Join(", ", table.Columns.Select(c =>
-                       (Value(c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults: true)
+                       (Value(c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)
                         ?? $"CAST(NULL AS {c.Type})") + $" AS {SqlText.Quote(c.Name)}")) +
                    $" FROM {only.Scan}";
 
@@ -356,7 +457,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         string Source(Column column) =>
             (table.Writable
              || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
-             || (column.Default is not null && table.Layers.Count > 0)
+             || (defaults && column.Default is not null && table.Layers.Count > 0)
                 ? $"r.{SqlText.Quote(column.Name)}"
                 : $"CAST(NULL AS {column.Type})") + $" AS {SqlText.Quote(column.Name)}";
 
@@ -365,7 +466,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         // instead: a written row was there to be stamped as it was written, a row in a file below
         // was not.
         var layers = table.Layers.Select(layer => Branch(table, layer.Columns, layer.Scan, layer.Source.Seq,
-                                                         layer.Source.HasFileName, defaults: true)).ToList();
+                                                         layer.Source.HasFileName, defaults)).ToList();
         if (table.Writable)
             layers.Add(Branch(table, table.Columns, table.WriteName, write.Seq, named: false, defaults: false));
         if (layers.Count == 0)
@@ -389,7 +490,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
               " ORDER BY r.\"_seq\" DESC) = 1"
             : "";
 
-        return $"CREATE OR REPLACE VIEW {table.QualifiedName} AS SELECT {projection} " +
+        return $"SELECT {projection} " +
                $"FROM ({string.Join(" UNION ALL BY NAME ", layers)}) r" +
                (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + shadowing;
     }
