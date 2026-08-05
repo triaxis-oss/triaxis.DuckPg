@@ -137,20 +137,24 @@ sealed class TSqlParser
             ExpectOperator(")");
         }
 
+        // T-SQL puts OUTPUT between the column list and the rows; it belongs to the statement
+        // rather than to either.
+        var output = Output();
+
         if (Accept("values"))
         {
             var rows = new List<List<Expr>>();
             do rows.Add(ParenthesisedList()); while (AcceptOperator(","));
-            return new InsertStatement(target, columns, new InsertValues(rows));
+            return new InsertStatement(target, columns, new InsertValues(rows), output);
         }
 
         if (Accept("default"))
         {
             Expect("values");
-            return new InsertStatement(target, columns, new InsertValues([[]]));
+            return new InsertStatement(target, columns, new InsertValues([[]]), output);
         }
 
-        return new InsertStatement(target, columns, new InsertQuery(Query()));
+        return new InsertStatement(target, columns, new InsertQuery(Query()), output);
     }
 
     Statement Update()
@@ -197,15 +201,43 @@ sealed class TSqlParser
 
         if (Peek.Is("when")) throw Unexpected("only one MERGE branch at a time is supported");
 
-        // `OUTPUT INSERTED.<key>` asks for what the write made of each row, which is how a caller
-        // gets a key it did not send back. A lake writes down what it is given and makes up nothing,
-        // so there is nothing to hand back -- and saying so beats answering with the rows as sent.
-        if (Peek.Is("output"))
-            throw new TSqlException(
-                "MERGE ... OUTPUT is not supported: a lake stores the row it is given, so a column " +
-                "the statement does not insert has no value to read back", Peek.Position);
+        var at = Peek.Position;
+        var output = Output();
+        if (output.Count == 0) return statement;
 
-        return statement;
+        return statement is InsertStatement insert
+            ? insert with { Output = output }
+            : throw new TSqlException("OUTPUT is supported on the insert a MERGE stands for, not the update", at);
+    }
+
+    /// `OUTPUT INSERTED.[id], i._Position` -- what the write made of each row, and which of the
+    /// rows sent it was. Both qualifiers name a column of the row being written, so which one it was
+    /// is settled here; `DELETED` names the row that was there before, and an insert replaces none.
+    List<OutputItem> Output()
+    {
+        var items = new List<OutputItem>();
+        if (!Accept("output")) return items;
+
+        do
+        {
+            if (Peek.Is("deleted"))
+                throw new TSqlException("OUTPUT DELETED names the row that was there before, " +
+                                        "and an insert replaces none", Peek.Position);
+
+            var column = Identifier();
+            while (AcceptOperator(".")) column = Identifier();
+
+            // Only the spelled-out alias: the word after an OUTPUT item is as likely to be the
+            // `VALUES` the rows follow, and taking that for a name loses the rest of the statement.
+            var alias = Accept("as") ? Identifier() : null;
+            items.Add(new OutputItem(column, alias));
+        } while (AcceptOperator(","));
+
+        if (Peek.Is("into"))
+            throw new TSqlException("OUTPUT ... INTO puts the rows somewhere else, which needs a " +
+                                    "table variable this does not have", Peek.Position);
+
+        return items;
     }
 
     Statement MergeUpdate(TableName target, Name? alias, TableSource source, Expr on)
@@ -237,7 +269,7 @@ sealed class TSqlParser
 
         var body = new SelectBody(false, null, false, [.. values.Select(v => new SelectItem(v, null))],
                                   null, source, null, [], null);
-        return new InsertStatement(target, columns, new InsertQuery(new Query([], body, [], null, null)));
+        return new InsertStatement(target, columns, new InsertQuery(new Query([], body, [], null, null)), []);
     }
 
     /// `ON 1 = 0` and its spellings: what EF Core writes to say that this MERGE is an insert.

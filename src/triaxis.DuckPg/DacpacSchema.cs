@@ -89,7 +89,8 @@ sealed class DacpacSchema
             if (Unqualify(column.Attribute("Name")?.Value) is not { } columnName) continue;
             if (Related(column, "TypeSpecifier").FirstOrDefault() is not { } specifier) continue;
 
-            declared.Add(new Column(columnName, DuckDbType(specifier)));
+            declared.Add(new Column(columnName, DuckDbType(specifier),
+                                    Identity: Property(column, "IsIdentity") == "True"));
         }
 
         if (declared.Count == 0) return false;

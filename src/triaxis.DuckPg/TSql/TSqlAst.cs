@@ -14,7 +14,14 @@ sealed record SelectIntoStatement(TableName Target, Query Query) : Statement;
 
 sealed record DropTableStatement(TableName Target, bool IfExists) : Statement;
 
-sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source) : Statement;
+/// `Output` is the `OUTPUT INSERTED.…` clause: what the insert made of each row, which is how a
+/// caller asks for a key it did not send. Empty for an insert that asks for nothing back.
+sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source,
+                              List<OutputItem> Output) : Statement;
+
+/// One column of an OUTPUT clause. Whether it was qualified by `INSERTED` or by the source's own
+/// alias is settled while parsing: either way it names a column of the rows being written.
+sealed record OutputItem(Name Column, Name? Alias);
 
 /// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
 /// alias: the assignments and the join condition both name it.

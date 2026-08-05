@@ -88,6 +88,7 @@ sealed class TSqlWriter(TSqlContext context)
                     Join(insert.Columns, c => Put(Quote(c)));
                     Put(")");
                 }
+                if (insert.Output.Count > 0) { Returning(insert); return; }
                 switch (insert.Source)
                 {
                     case InsertValues values:
@@ -160,6 +161,63 @@ sealed class TSqlWriter(TSqlContext context)
             default:
                 throw new TSqlException($"cannot render {statement.GetType().Name}", 0);
         }
+    }
+
+    /// An insert asked what it made of each row. The rows are projected under the target's own
+    /// column names and the answer is a `RETURNING` over them, which is the shape the gateway
+    /// materialises: it fills in what the store generates and answers from the rows it wrote.
+    /// Written flat, this is one statement short of legal -- the target is where the missing column
+    /// comes from, and only the catalog knows whether anything fills it.
+    void Returning(InsertStatement insert)
+    {
+        if (insert.Columns.Count == 0)
+            throw new TSqlException("an INSERT with OUTPUT has to name the columns it writes", 0);
+
+        List<Expr> values;
+        TableSource source;
+
+        switch (insert.Source)
+        {
+            // The rows have to stand where a table does, so that what was written can be read back
+            // off them rather than out of the statement.
+            case InsertValues rows:
+                source = new DerivedTableSource(new Query([], new ValuesBody(rows.Rows), [], null, null),
+                                                new Name("_rows", true), insert.Columns);
+                values = [.. insert.Columns.Select(c => (Expr)new ColumnRef([c]))];
+                break;
+
+            case InsertQuery { Query: { With.Count: 0, OrderBy.Count: 0, Offset: null, Fetch: null,
+                                        Body: SelectBody { Distinct: false, Top: null, Where: null,
+                                                           GroupBy.Count: 0, Having: null,
+                                                           From: { } from } body } }:
+                source = from;
+                values = [.. body.Items.Select(item => item.Expr)];
+                break;
+
+            default:
+                throw new TSqlException("OUTPUT is supported over the rows a statement lists, " +
+                                        "not over a query it reads them from", 0);
+        }
+
+        if (values.Count != insert.Columns.Count)
+            throw new TSqlException("the INSERT names a different number of columns than values", 0);
+
+        Put(" SELECT ");
+        Join(Enumerable.Range(0, values.Count), i =>
+        {
+            Expression(values[i]);
+            Put(" AS ").Put(Quote(insert.Columns[i]));
+        });
+
+        Put(" FROM ");
+        Source(source);
+
+        Put(" RETURNING ");
+        Join(insert.Output, item =>
+        {
+            Put(Quote(item.Column));
+            if (item.Alias is not null) Put(" AS ").Put(Quote(item.Alias));
+        });
     }
 
     // ---- queries ---------------------------------------------------------------------------------

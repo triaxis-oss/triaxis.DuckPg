@@ -269,7 +269,8 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         if (plan.Kind != PlanKind.Rows) { wire.Send('n'); return; }
 
         // Executing here is what makes the row description available; Execute drains the reader.
-        portal.Command = Command(plan.Steps[0], portal.Arguments);
+        Written(plan, portal.Arguments);
+        portal.Command = Command(plan.Steps[^1], portal.Arguments);
         portal.Reader = Execute(portal.Command);
         portal.Columns = Columns(portal.Reader, portal.ResultFormats);
         SendRowDescription(portal.Reader, portal.Columns);
@@ -312,7 +313,8 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         {
             if (portal.Reader is null)
             {
-                portal.Command = Command(plan.Steps[0], portal.Arguments);
+                Written(plan, portal.Arguments);
+                portal.Command = Command(plan.Steps[^1], portal.Arguments);
                 portal.Reader = Execute(portal.Command);
                 portal.Columns = Columns(portal.Reader, portal.ResultFormats);
             }
@@ -324,6 +326,18 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
             return;
         }
         RunPlan(plan, portal.Arguments, portal.ResultFormats);
+    }
+
+    /// Everything a rows plan does before it has rows to give: an insert asked what it wrote puts
+    /// them down first, and the last step is what answers.
+    void Written(Plan plan, object?[] arguments)
+    {
+        foreach (var step in plan.Steps[..^1])
+        {
+            using var command = Command(step, arguments);
+            command.ExecuteNonQuery();
+        }
+        if (plan.Steps.Length > 1) Persist(plan);
     }
 
     void Close(ref MsgReader reader)

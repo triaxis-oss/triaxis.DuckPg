@@ -339,6 +339,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
+| `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
 | `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
@@ -366,10 +367,17 @@ are refused: another connection cannot see them here. `SELECT … INTO` and `DRO
 nothing else, since a lake's tables are the files under it.
 
 EF Core sends a batch of rows as a `MERGE` over `ON 1=0`, which is a multi-row insert with the
-matched branch made unreachable, and it is translated as one. Its `OUTPUT INSERTED.[key]` is not:
-that asks for a key the caller did not send, and a lake stores what it is given rather than
-generating anything — so a batch insert into a table with a store-generated key is refused, naming
-what it cannot answer.
+matched branch made unreachable, and it is translated as one. Its `OUTPUT INSERTED.[key], i._Position`
+is answered: the rows are materialised, written from there, and read back from the same copy — so
+each key comes back beside the position of the row that got it. A column the rows do not carry and
+nothing generates is refused by name rather than answered with a null.
+
+**A store-generated key needs a dacpac that declares one.** A column the model marks `IsIdentity`
+draws from a sequence in the write layer, seeded past the highest value the files already hold when
+the table first grows a write branch — so keys carry on from the lake's own state, and a restart
+asks the files again rather than trusting what a previous process handed out. That sequence lives in
+one duckpg process: two of them serving the same write directory would hand out the same keys. It is
+the one place a lake invents a value; everything else it stores is what it was given.
 
 A savepoint is the one thing that is refused rather than approximated. `SAVE TRANSACTION` renders to
 nothing — marking a point costs nothing — but DuckDB has no savepoints to return to, so

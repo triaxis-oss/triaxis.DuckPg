@@ -167,8 +167,84 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         else
             RejectVirtual(table, columnList, "INSERT");
 
+        if (SqlText.FindKeyword(rest, "RETURNING") is var returning && returning > 0)
+            return RewriteReturning(table, columnList!, rest, returning);
+
+        // A declared identity the statement leaves out is filled where every other value comes
+        // from -- in the rows being written, so the same statement decides it and writes it.
+        if (columnList is not null && Generated(table, columnList) is { Count: > 0 } generated)
+        {
+            var source = rest[(MatchingParen(rest) + 1)..].Trim();
+            rest = $"({string.Join(", ", columnList.Select(SqlText.Quote).Concat(Quoted(generated)))}) " +
+                   $"SELECT *, {string.Join(", ", NextValues(table, generated))} FROM ({source}) AS \"_rows\"";
+        }
+
         return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = table.Name });
     }
+
+    /// An insert that is asked what it wrote -- `OUTPUT INSERTED.<key>`, which is how EF Core gets a
+    /// store-generated key back. The rows are materialised first, so what the store generates is
+    /// decided once and can be both written down and answered from; the answer is the last step,
+    /// which is what makes this a plan that returns rows with a write in front of it.
+    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning)
+    {
+        var select = rest[(MatchingParen(rest) + 1)..returning];
+        var from = SqlText.FindKeyword(select, "FROM");
+        var answered = rest[(returning + "RETURNING".Length)..];
+
+        // A client writing DuckDB's own `INSERT ... VALUES ... RETURNING` names no source of its
+        // own, so the rows it lists become one -- under the names the column list gives them.
+        var (projection, source) = from >= 0
+            ? (select[(SqlText.FindKeyword(select, "SELECT") + 6)..from], select[from..])
+            : (string.Join(", ", columns.Select(SqlText.Quote)),
+               $"FROM ({select.Trim()}) AS \"_rows\" ({string.Join(", ", columns.Select(SqlText.Quote))})");
+
+        // A column the rows do not carry is one the store would have to make up. A declared identity
+        // is the only one anything here makes up, and it is made up once, in the rows below.
+        var generated = Generated(table, columns);
+        var carried = new List<string>();
+        foreach (var name in Answered(answered))
+        {
+            if (name == "*")
+                throw new PgError("0A000", "RETURNING * cannot be answered: name the columns, since what " +
+                                           "a lake writes down is what it was given");
+            if (columns.Contains(name, StringComparer.OrdinalIgnoreCase)) continue;
+            if (generated.Any(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
+            if (table.Has(name))
+                throw new PgError("0A000", $"OUTPUT of `{name}` cannot be answered: a lake stores the row it is " +
+                                           "given, and nothing here generates one the caller did not send");
+            else carried.Add(name);
+        }
+
+        var written = string.Join(", ", columns.Select(SqlText.Quote).Concat(Quoted(generated)));
+
+        return Promoting(table, new Plan(PlanKind.Rows, [
+            $"CREATE OR REPLACE TEMP TABLE duckpg_written AS SELECT {projection}" +
+            string.Concat(carried.Select(c => $", {SqlText.Quote(c)}")) +
+            string.Concat(generated.Zip(NextValues(table, generated))
+                .Select(g => $", {g.Second} AS {SqlText.Quote(g.First.Name)}")) +
+            $" {source}",
+            $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written",
+            $"SELECT {answered} FROM duckpg_written"],
+            "INSERT") with { Dirty = table.Name });
+    }
+
+    /// The declared identities a statement does not name, and so leaves to the store.
+    static List<Column> Generated(Table table, List<string> columns) =>
+        [.. table.Columns.Where(c => c.Identity && !columns.Contains(c.Name, StringComparer.OrdinalIgnoreCase))];
+
+    static IEnumerable<string> Quoted(IEnumerable<Column> columns) => columns.Select(c => SqlText.Quote(c.Name));
+
+    static IEnumerable<string> NextValues(Table table, IEnumerable<Column> columns) =>
+        columns.Select(c => $"nextval({SqlText.Literal(Catalog.Sequence(table, c))})");
+
+    /// The columns an OUTPUT clause reads, which is the first name of each item it lists.
+    static IEnumerable<string> Answered(string clause) =>
+        SqlText.SplitList(clause, ',')
+            .Select(item => item.Trim())
+            .Select(item => item.StartsWith('"')
+                ? item[1..item.IndexOf('"', 1)]
+                : item.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0]);
 
     /// The parenthesised group after the table name is a column list unless it opens a subquery.
     static List<string>? ExplicitColumnList(string rest)
@@ -290,7 +366,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         return plan with
         {
-            Steps = [.. Catalog.Promotion(table, tombstones), .. plan.Steps],
+            Steps = [.. Catalog.Promotion(admin, table, tombstones), .. plan.Steps],
             Promoted = table.Name,
             Tombstoned = tombstones ? table.Name : null,
         };
