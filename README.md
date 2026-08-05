@@ -64,8 +64,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 Positional arguments are the layer directories, lowest first. `--listen`, `--write`,
 `--write-format`, `--writable`, `--schema`, `--key` (repeatable), `--dacpac`, `--cache` and
 `--config` each override the file when both are given; argument paths are relative to the working
-directory, file paths to the file. A file named explicitly with `--config` must exist, so a typo is an error rather
-than a silent fallback to defaults.
+directory, file paths to the file. A file named explicitly with `--config` must exist, so a typo is
+an error rather than a silent fallback to defaults.
 
 `-v` traces each translated statement with its DuckDB execution time and row count (execution and
 row streaming are timed apart, since DuckDB returns before the rows are pulled); `-vv` adds the
@@ -122,9 +122,10 @@ that accepts writes:
 - `INSERT` appends to the write layer.
 - `DELETE` removes the row from the write layer and records its key in `local/.deleted/<table>`,
   which hides that row in every layer below.
-- `UPDATE` is the two together: the new rows are computed first, then the old keys tombstoned, then
-  the new rows appended. A `FROM` clause joins the target to somewhere else for its new values,
-  which is also what a matched-only `MERGE` becomes.
+- `UPDATE` computes the new rows first, then replaces them in the write layer, where they shadow
+  whatever is beneath. Only an update that *moves* a row's key leaves the old key behind with
+  nothing above it, and only that one records a tombstone. A `FROM` clause joins the target to
+  somewhere else for its new values, which is also what a matched-only `MERGE` becomes.
 
 A write is persisted as soon as DuckDB commits it — immediately for a bare statement, at `COMMIT`
 for one inside a transaction, and never for one that is rolled back. Restarting the gateway reads
@@ -135,7 +136,8 @@ write branch or its tombstone check, and grows them when a write first arrives. 
 bound on every execution, that branch would otherwise be paid for by every read of a table nobody
 has written to — measurably, +22% on a table and +50% on a view over several. The promotion travels
 in the plan of the write that caused it, so a rolled-back write leaves nothing behind and the next
-one simply promotes again.
+one simply promotes again. The tombstone check arrives the same way, separately: it costs the same
+flat ~1 ms whatever the table looks like, so it is not bound until a row has actually been hidden.
 
 ## Caching the merge
 

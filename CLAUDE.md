@@ -37,9 +37,12 @@ someone changing the code needs.
   transaction. `Catalog.promoted` is only set once that write commits -- a rolled-back promotion is
   made again rather than assumed, which is why the DDL is `IF NOT EXISTS` and the view rewrite is
   `CREATE OR REPLACE`. A table whose directory already holds rows or tombstones is prepared at
-  build, because those rows have to be loaded. A `--cache` copy survives the promotion:
-  `Catalog.Underlay` puts it below the write branch, since the copy is the read layers and a write
-  does not touch those.
+  build, because those rows have to be loaded. The tombstone check is promoted separately and by
+  the same rules: measured, it costs a flat ~1 ms regardless of the table's width, because it binds
+  one subquery over one key column -- so it waits for a row to actually be hidden. An `UPDATE` only
+  hides one when it moves a key; otherwise the rewritten row shadows what is beneath it on its own.
+  A `--cache` copy survives the promotion: `Catalog.Underlay` puts it below the write branch, since
+  the copy is the read layers and a write does not touch those.
 - **The write layer holds effective state, not a log.** A deleted row leaves the write table and
   gains a tombstone; a re-inserted one comes back with no tombstone bookkeeping. There is no
   per-row sequence number, and adding one back means re-deriving what shadows what.

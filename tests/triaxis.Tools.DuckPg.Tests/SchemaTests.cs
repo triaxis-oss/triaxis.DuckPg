@@ -485,4 +485,68 @@ public class SchemaTests
         }
     }
 
+
+    /// The tombstone check costs the same whatever a table looks like, and until something has
+    /// actually been hidden below it answers nothing. An ordinary update does not hide anything --
+    /// the rewritten row lands under the key it already had, where it shadows what is beneath it.
+    [Fact]
+    public void TheTombstoneCheckArrivesWithTheFirstRowItHides()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2)), (2, 20.00::DECIMAL(10,2))) t(order_id, amount)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+        lake.Config.DefaultKey = ["order_id"];
+        lake.Start();
+
+        string Definition() => lake.Query(
+            "SELECT sql FROM duckdb_views() WHERE schema_name = 'lake' AND view_name = 'orders'")[0];
+
+        lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (3, 30.00)");
+        Assert.DoesNotContain("__del", Definition());
+
+        lake.Execute("UPDATE lake.orders SET amount = 11.00 WHERE order_id = 1");
+        Assert.DoesNotContain("__del", Definition());
+        Assert.Equal(["1|11.00", "2|20.00", "3|30.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        // Moving a key leaves the old one behind with nothing above it, so it has to be hidden.
+        lake.Execute("UPDATE lake.orders SET order_id = 9 WHERE order_id = 2");
+        Assert.Contains("__del", Definition());
+        Assert.Equal(["1|11.00", "3|30.00", "9|20.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        lake.Restart();
+        Assert.Equal(["1|11.00", "3|30.00", "9|20.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// A delete hides a row below, so it brings the check with it.
+    [Fact]
+    public void ADeleteBringsTheTombstoneCheck()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2)), (2, 20.00::DECIMAL(10,2))) t(order_id, amount)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+        lake.Config.DefaultKey = ["order_id"];
+        lake.Start();
+
+        lake.Execute("DELETE FROM lake.orders WHERE order_id = 1");
+        Assert.Contains("__del", lake.Query(
+            "SELECT sql FROM duckdb_views() WHERE schema_name = 'lake' AND view_name = 'orders'")[0]);
+        Assert.Equal(["2|20.00"], lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        // A deleted row that comes back needs no tombstone bookkeeping -- it simply shadows again.
+        lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 99.00)");
+        Assert.Equal(["1|99.00", "2|20.00"], lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        lake.Restart();
+        Assert.Equal(["1|99.00", "2|20.00"], lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+    }
+
 }

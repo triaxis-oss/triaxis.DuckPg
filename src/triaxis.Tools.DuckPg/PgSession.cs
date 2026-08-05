@@ -36,6 +36,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     readonly Dictionary<string, string> startup = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> pendingWrites = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> pendingPromotions = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> pendingTombstones = new(StringComparer.OrdinalIgnoreCase);
 
     char transactionStatus = 'I';
     bool skipUntilSync;
@@ -404,6 +405,12 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
             else gateway.Promoted(promoted);
         }
 
+        if (plan.Tombstoned is { } tombstoned)
+        {
+            if (transactionStatus == 'T') pendingTombstones.Add(tombstoned);
+            else gateway.Tombstoned(tombstoned);
+        }
+
         if (plan.Dirty is { } dirty)
         {
             if (transactionStatus == 'T') pendingWrites.Add(dirty);
@@ -412,13 +419,16 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         else if (plan.Tag == "COMMIT")
         {
             foreach (var table in pendingPromotions) gateway.Promoted(table);
+            foreach (var table in pendingTombstones) gateway.Tombstoned(table);
             foreach (var table in pendingWrites) gateway.Persist(table);
             pendingPromotions.Clear();
+            pendingTombstones.Clear();
             pendingWrites.Clear();
         }
         else if (plan.Tag == "ROLLBACK")
         {
             pendingPromotions.Clear();
+            pendingTombstones.Clear();
             pendingWrites.Clear();
         }
     }
