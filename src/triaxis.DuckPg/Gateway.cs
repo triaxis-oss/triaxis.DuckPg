@@ -201,13 +201,14 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         // A column the rows do not carry is one the store would have to make up. A declared identity
         // is the only one anything here makes up, and it is made up once, in the rows below.
+        if (SqlText.SplitList(answered, ',').Any(item => item.Trim() == "*"))
+            throw new PgError("0A000", "RETURNING * cannot be answered: name the columns, since what a lake " +
+                                       "writes down is what it was given");
+
         var generated = Generated(table, columns);
         var carried = new List<string>();
         foreach (var name in Answered(answered))
         {
-            if (name == "*")
-                throw new PgError("0A000", "RETURNING * cannot be answered: name the columns, since what " +
-                                           "a lake writes down is what it was given");
             if (columns.Contains(name, StringComparer.OrdinalIgnoreCase)) continue;
             if (generated.Any(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
             if (table.Has(name))
@@ -245,9 +246,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     static IEnumerable<string> Answered(string clause) =>
         SqlText.SplitList(clause, ',')
             .Select(item => item.Trim())
-            .Select(item => item.StartsWith('"')
-                ? item[1..item.IndexOf('"', 1)]
-                : item.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0]);
+            .Where(item => item.StartsWith('"'))
+            .Select(item => item[1..item.IndexOf('"', 1)]);
 
     /// The parenthesised group after the table name is a column list unless it opens a subquery.
     static List<string>? ExplicitColumnList(string rest)
@@ -265,6 +265,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var reference = SqlText.ReadTableRef(sql, SqlText.FindKeyword(sql, "UPDATE") + 6);
         if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("UPDATE", sql);
         RequireKey(table, "UPDATE");
+
+        // What the statement was asked to hand back is answered from the rows it wrote, so it comes
+        // off the end before anything else is read: it is no part of the predicate that follows SET.
+        var (answered, rest) = Answers(sql);
+        sql = rest;
 
         var alias = ReadAlias(sql, reference.End);
         var set = SqlText.FindKeyword(sql, "SET", reference.End);
@@ -298,12 +303,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
-        return Promoting(table, Plan.Count("UPDATE",
-            [Keys(table, scan, qualifier, predicate),
+        string[] steps = [
+            Keys(table, scan, qualifier, predicate),
             $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
             .. moves ? (string[])[Tombstone(table)] : [],
             Evict(table),
-            $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"])
+            $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"];
+
+        // Every row the update touched, as the update left it -- which is what `duckpg_updated`
+        // already holds, so answering costs one more read of a table the plan had to build anyway.
+        if (answered is not null)
+            return Promoting(table, new Plan(PlanKind.Rows,
+                [.. steps, $"SELECT {answered} FROM duckpg_updated"], "UPDATE")
+                with { Dirty = table.Name }, tombstones: moves);
+
+        return Promoting(table, Plan.Count("UPDATE", steps)
             with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name }, tombstones: moves);
     }
 
@@ -316,17 +330,45 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("DELETE", sql);
         RequireKey(table, "DELETE");
 
+        var (answered, rest) = Answers(sql);
+        sql = rest;
+
         // The target may be named by an alias the statement bound to it, and the predicate will
         // then say so too -- so the scan carries the alias rather than dropping it.
         var alias = DeleteAlias(sql, reference.End);
         var scan = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
         var where = SqlText.FindKeyword(sql, "WHERE", reference.End);
 
-        return Promoting(table, Plan.Count("DELETE",
+        string[] steps = [
             Keys(table, scan, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
-            Evict(table))
+            Evict(table)];
+
+        // A deleted row is gone by the time anything could read it, so what can be answered for is
+        // what was collected before it went: the keys, and whatever the statement made of them.
+        if (answered is not null)
+        {
+            foreach (var name in Answered(answered))
+                if (!table.Key.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    throw new PgError("0A000", $"OUTPUT of `{name}` on a DELETE cannot be answered: " +
+                                               "the row is gone, and only its key was read first");
+
+            return Promoting(table, new Plan(PlanKind.Rows,
+                [.. steps, $"SELECT {answered} FROM duckpg_keys"], "DELETE")
+                with { Dirty = table.Name }, tombstones: true);
+        }
+
+        return Promoting(table, Plan.Count("DELETE", steps)
             with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name }, tombstones: true);
+    }
+
+    /// The `RETURNING` clause a statement ends with, and the statement without it. A lake answers
+    /// one off the rows it wrote rather than out of the target, so it is taken apart here rather
+    /// than handed to DuckDB -- which would see the target's columns and none of the plan's.
+    static (string? Answered, string Statement) Answers(string sql)
+    {
+        var at = SqlText.FindKeyword(sql, "RETURNING");
+        return at < 0 ? (null, sql) : (sql[(at + "RETURNING".Length)..].Trim(), sql[..at]);
     }
 
     /// The keys a statement touches, taken from the merged view before anything moves.

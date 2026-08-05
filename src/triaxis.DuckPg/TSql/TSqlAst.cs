@@ -19,17 +19,19 @@ sealed record DropTableStatement(TableName Target, bool IfExists) : Statement;
 sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source,
                               List<OutputItem> Output) : Statement;
 
-/// One column of an OUTPUT clause. Whether it was qualified by `INSERTED` or by the source's own
-/// alias is settled while parsing: either way it names a column of the rows being written.
-sealed record OutputItem(Name Column, Name? Alias);
+/// One item of an OUTPUT clause: a column of the rows being written, or a constant -- EF Core sends
+/// `OUTPUT 1` to count the rows a statement touched. Whether a column was qualified by `INSERTED` or
+/// by the source's own alias is settled while parsing; either way it names one of those rows.
+sealed record OutputItem(Expr Value, Name? Alias);
 
 /// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
 /// alias: the assignments and the join condition both name it.
 sealed record UpdateStatement(TableName Target, Name? Alias, List<Assignment> Assignments, TableSource? From,
-                              Expr? Where) : Statement;
+                              Expr? Where, List<OutputItem> Output) : Statement;
 
 /// `Alias` is the target's own, which `DELETE FROM [s] FROM [t] AS [s]` names instead of the table.
-sealed record DeleteStatement(TableName Target, Name? Alias, TableSource? From, Expr? Where) : Statement;
+sealed record DeleteStatement(TableName Target, Name? Alias, TableSource? From, Expr? Where,
+                              List<OutputItem> Output) : Statement;
 
 /// `SET NOCOUNT ON`, `SET TRANSACTION ISOLATION LEVEL …` — session options a client sets and a
 /// lake has no opinion about.

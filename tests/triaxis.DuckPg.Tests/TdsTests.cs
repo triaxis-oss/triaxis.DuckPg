@@ -568,6 +568,33 @@ public class TdsTests : IDisposable
         Assert.Equal(["3"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
     }
 
+    /// `OUTPUT 1` counts the rows a statement touched, which is all EF Core reads it for -- so it is
+    /// one row per row written, and the count SqlClient reports is that many.
+    [Fact]
+    public void AWriteAnswersWithARowPerRowItTouched()
+    {
+        using var connection = Open();
+
+        // The batch EF sends it in, session options and all.
+        Assert.Equal(2, new SqlCommand(
+            "SET IMPLICIT_TRANSACTIONS OFF; SET NOCOUNT ON; " +
+            "UPDATE [orders] SET [note] = 'x' OUTPUT 1 WHERE [order_id] < 3;", connection).ExecuteNonQuery());
+
+        Assert.Equal(["x", "x"], Rows(connection, "SELECT note FROM orders WHERE order_id < 3 ORDER BY order_id"));
+
+        Assert.Equal(1, new SqlCommand(
+            "DELETE FROM [orders] OUTPUT 1 WHERE [order_id] = 3", connection).ExecuteNonQuery());
+        Assert.Equal(2, Count(connection));
+    }
+
+    static List<string> Rows(SqlConnection connection, string sql)
+    {
+        var rows = new List<string>();
+        using var reader = new SqlCommand(sql, connection).ExecuteReader();
+        while (reader.Read()) rows.Add(reader.GetValue(0)?.ToString() ?? "");
+        return rows;
+    }
+
     /// The shape a tool takes a snapshot with: drop what a previous run left, select the rows into
     /// a scratch table, work against it. The temporary table belongs to the connection, so it also
     /// has to be gone from the next session to be handed this one.

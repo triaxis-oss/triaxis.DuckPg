@@ -223,6 +223,18 @@ public class TSqlTests
     public void RendersAnAliasedDeleteTarget(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// The OUTPUT clause sits between SET and WHERE, so a statement carrying one does not end at its
+    /// assignments. `OUTPUT 1` is how EF Core counts the rows a statement touched.
+    [Theory]
+    [InlineData("UPDATE [orders] SET [amount] = 1 OUTPUT 1 WHERE [id] = 2",
+        """UPDATE "lake"."orders" SET "amount" = 1 WHERE "id" = 2 RETURNING 1""")]
+    [InlineData("DELETE FROM [orders] OUTPUT 1 WHERE [id] = 2",
+        """DELETE FROM "lake"."orders" WHERE "id" = 2 RETURNING 1""")]
+    [InlineData("UPDATE [orders] SET [amount] = 1 OUTPUT INSERTED.[amount] AS [was] WHERE [id] = 2",
+        """UPDATE "lake"."orders" SET "amount" = 1 WHERE "id" = 2 RETURNING "amount" AS "was""" + "\"")]
+    public void RendersTheOutputClauseAWriteCarries(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
     [Theory]
     // Anything that changes which rows exist is the layer machinery's business, not one statement's.
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE")]

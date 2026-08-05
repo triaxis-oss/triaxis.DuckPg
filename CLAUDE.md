@@ -189,6 +189,12 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **The OUTPUT clause sits between SET and WHERE**, so an UPDATE carrying one does not end at its
+  assignments -- read that way, `OUTPUT` looks like the start of a statement nothing covers. What it
+  asks for is answered off what the plan already built: `duckpg_updated` holds every row as the
+  update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
+  therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
+  touched, needs neither.
 - **A DELETE's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
   is what EF Core's `ExecuteDelete` writes, and taking `s` for a table name pushed the real one into
   `USING` and left the delete against nothing. `TSqlParser.Aliased` resolves it where the clause

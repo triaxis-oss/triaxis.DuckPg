@@ -341,6 +341,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
+| `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
 | `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |

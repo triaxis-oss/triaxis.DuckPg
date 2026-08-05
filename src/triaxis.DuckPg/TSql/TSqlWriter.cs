@@ -110,6 +110,7 @@ sealed class TSqlWriter(TSqlContext context)
                 Join(update.Assignments, a => { Put(Quote(a.Column)); Put(" = "); Expression(a.Value); });
                 if (update.From is not null) { Put(" FROM "); Source(update.From); }
                 if (update.Where is not null) { Put(" WHERE "); Expression(update.Where); }
+                Answers(update.Output);
                 return;
 
             case DeleteStatement delete:
@@ -118,6 +119,7 @@ sealed class TSqlWriter(TSqlContext context)
                 if (delete.Alias is not null) Put(" AS ").Put(Quote(delete.Alias));
                 if (delete.From is not null) { Put(" USING "); Source(delete.From); }
                 if (delete.Where is not null) { Put(" WHERE "); Expression(delete.Where); }
+                Answers(delete.Output);
                 return;
 
             // The gateway already treats these as no-ops; rendering them keeps one path for
@@ -213,10 +215,20 @@ sealed class TSqlWriter(TSqlContext context)
         Put(" FROM ");
         Source(source);
 
+        Answers(insert.Output);
+    }
+
+    /// What a statement was asked to hand back, which DuckDB spells `RETURNING`. A lake answers it
+    /// off the rows it wrote rather than out of the target, so the gateway takes this clause apart
+    /// again -- but a statement it does not rewrite is left one DuckDB can run as it stands.
+    void Answers(List<OutputItem> output)
+    {
+        if (output.Count == 0) return;
+
         Put(" RETURNING ");
-        Join(insert.Output, item =>
+        Join(output, item =>
         {
-            Put(Quote(item.Column));
+            Expression(item.Value);
             if (item.Alias is not null) Put(" AS ").Put(Quote(item.Alias));
         });
     }

@@ -164,9 +164,12 @@ sealed class TSqlParser
         Expect("set");
 
         var assignments = Assignments();
+        // T-SQL puts the OUTPUT clause between SET and WHERE, which is why the statement cannot end
+        // at its assignments.
+        var output = Output();
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
-        return new UpdateStatement(target, null, assignments, from, where);
+        return new UpdateStatement(target, null, assignments, from, where, output);
     }
 
     /// `MERGE` is another statement by another spelling, and which one depends on the branch. An
@@ -221,15 +224,23 @@ sealed class TSqlParser
         do
         {
             if (Peek.Is("deleted"))
-                throw new TSqlException("OUTPUT DELETED names the row that was there before, " +
-                                        "and an insert replaces none", Peek.Position);
+                throw new TSqlException("OUTPUT DELETED names the row as it was before, which is not " +
+                                        "kept: an insert replaces none, and a write keeps what it wrote",
+                                        Peek.Position);
+
+            // A constant -- `OUTPUT 1`, which is how EF Core counts the rows a statement touched.
+            if (Peek.Kind is not (TokenKind.Word or TokenKind.QuotedName))
+            {
+                items.Add(new OutputItem(Primary(), Accept("as") ? Identifier() : null));
+                continue;
+            }
 
             var column = Identifier();
             while (AcceptOperator(".")) column = Identifier();
 
             // Only the spelled-out alias: the word after an OUTPUT item is as likely to be the
             // `VALUES` the rows follow, and taking that for a name loses the rest of the statement.
-            items.Add(new OutputItem(column, Accept("as") ? Identifier() : null));
+            items.Add(new OutputItem(new ColumnRef([column]), Accept("as") ? Identifier() : null));
         } while (AcceptOperator(","));
 
         if (Peek.Is("into"))
@@ -244,7 +255,7 @@ sealed class TSqlParser
         if (!Peek.Is("update")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
         Expect("update");
         Expect("set");
-        return new UpdateStatement(target, alias, Assignments(), source, on);
+        return new UpdateStatement(target, alias, Assignments(), source, on, []);
     }
 
     /// The rows are the `USING` clause and the condition says nothing can match, so the branch is
@@ -306,15 +317,16 @@ sealed class TSqlParser
         var at = Peek.Position;
         var target = TableName();
         var from = Accept("from") ? TableSource() : null;
+        var output = Output();
         var where = Accept("where") ? Expression() : null;
 
         if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
-            return new DeleteStatement(target, null, from, where);
+            return new DeleteStatement(target, null, from, where, output);
 
         // Joined to something else, the delete is against one side of a join and filtered by the
         // other -- a different statement, and one whose rows a lake decides differently.
         return ReferenceEquals(source, from)
-            ? new DeleteStatement(source.Name, source.Alias, null, where)
+            ? new DeleteStatement(source.Name, source.Alias, null, where, output)
             : throw new TSqlException("DELETE from an alias joined to another table is not supported", at);
     }
 
