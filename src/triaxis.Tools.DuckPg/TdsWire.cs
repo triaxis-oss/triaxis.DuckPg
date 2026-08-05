@@ -61,6 +61,8 @@ sealed class TdsMsg
 
     public TdsMsg Raw(ReadOnlySpan<byte> s) { buf.Write(s); return this; }
 
+    public void Clear() => buf.SetLength(0);
+
     public ReadOnlySpan<byte> Body => buf.GetBuffer().AsSpan(0, (int)buf.Length);
 
     /// Drops bytes already sent, so a long result streams instead of being held whole.
@@ -139,6 +141,10 @@ sealed class TdsWire(Stream stream, ILogger logger)
     /// What the client asked for in LOGIN7, within reason. Responses are chunked to it.
     public int PacketSize { get; set; } = 4096;
 
+    /// What one packet carries, and so where a value has to break off and start a new chunk. TDS's
+    /// smallest legal packet is 512, and a client that negotiated one has a buffer that size.
+    public int Payload => Math.Max(PacketSize, 512) - 8;
+
     /// A client that cancels sends an Attention on the same connection, so a query in flight has
     /// to be able to notice one arriving without blocking on the socket.
     public bool DataAvailable => stream is NetworkStream { DataAvailable: true };
@@ -167,35 +173,53 @@ sealed class TdsWire(Stream stream, ILogger logger)
         return (type, payload.ToArray());
     }
 
-    public void Send(byte type, TdsMsg msg) => Send(type, msg, last: true);
-
-    /// Sends the whole packets the buffer holds; only the last call of a message ends it. What is
-    /// left over stays in the buffer for the next call.
-    public void Send(byte type, TdsMsg msg, bool last)
+    /// Sends the first <paramref name="count"/> bytes as packets that do not end the message; the
+    /// rest stays buffered. The last of them may be short -- a packet is allowed to be, and ending
+    /// one early is how a caller keeps a row out of the seam between two packets.
+    public void SendUpTo(byte type, TdsMsg msg, int count)
     {
         var body = msg.Body;
-        var chunk = Math.Max(PacketSize - 8, 512);
         var sent = 0;
 
         lock (stream)
         {
-            while (body.Length - sent >= chunk)
+            while (count - sent > Payload)
             {
-                Packet(type, body.Slice(sent, chunk), end: false);
-                sent += chunk;
+                Packet(type, body.Slice(sent, Payload), end: false);
+                sent += Payload;
             }
-
-            if (last)
+            if (count > sent)
             {
-                Packet(type, body[sent..], end: true);
-                sent = body.Length;
+                Packet(type, body.Slice(sent, count - sent), end: false);
+                sent = count;
             }
-
             stream.Flush();
         }
 
-        logger.LogTrace(">> {Type} {Length}{End}", type, sent, last ? " end" : "");
+        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length}", type, sent);
         msg.Consume(sent);
+    }
+
+    /// Sends everything the buffer holds, ending the message.
+    public void Send(byte type, TdsMsg msg)
+    {
+        var body = msg.Body;
+        var sent = 0;
+
+        lock (stream)
+        {
+            while (body.Length - sent > Payload)
+            {
+                Packet(type, body.Slice(sent, Payload), end: false);
+                sent += Payload;
+            }
+
+            Packet(type, body[sent..], end: true);
+            stream.Flush();
+        }
+
+        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length} end", type, body.Length);
+        msg.Consume(body.Length);
     }
 
     void Packet(byte type, ReadOnlySpan<byte> body, bool end)

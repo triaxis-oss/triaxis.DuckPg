@@ -95,6 +95,23 @@ someone changing the code needs.
   connection string. TDS otherwise encrypts the login packet even in a plaintext session.
 - **A cancel arrives on the same connection as the query**, unlike PostgreSQL's second connection.
   It is only noticed between row packets; see `TdsSession.Cancelled`.
+- **Nothing may be cut across the seam between two packets.** SqlClient reassembles a read that
+  ended mid-packet by replaying the framing it had begun, and framing split across the seam loses
+  it its place -- it then reads response bytes as a length, and the failure surfaces much later,
+  usually as an `ArgumentOutOfRangeException` while the reader is being closed. Two mechanisms keep
+  it out of the seam, and they have to agree about where the seam is:
+  - Each row is built on its own (`TdsSession.Rows`) as though it began a packet. One that does not
+    fit in the packet being filled ends that packet where it is -- short -- and starts the next.
+  - A MAX value's chunks stop at the packet boundary rather than running through it
+    (`TdsTypes.WritePlp`), measured from the row's own start, which is why the row is built at
+    offset zero: for a row too big for any packet, that is where the cuts really fall.
+
+  Flushing after the row that overflows instead cuts inside it, which is a different bug that looks
+  the same. This is invisible on a fast loopback and constant over a real network, because TCP
+  decides how often a read ends mid-packet. `TdsTests.LongResultsSurviveASplitRead` forces the split
+  so it is deterministic, and `PacketsEndWhereRowsDo` checks the framing itself rather than the
+  client's tolerance of it -- SqlClient survives some violations and not others, which is how the
+  first version of this fix passed while leaving wide rows broken.
 - `SELECT COUNT(*)` gives a `long`, because DuckDB counts in BIGINT. An application that casts to
   `int` will need `Convert.ToInt32`.
 

@@ -1,4 +1,7 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using Microsoft.Data.SqlClient;
 
 namespace triaxis.Tools.DuckPg.Tests;
@@ -32,6 +35,183 @@ public class TdsTests : IDisposable
         var connection = new SqlConnection(lake.SqlConnectionString());
         connection.Open();
         return connection;
+    }
+
+    /// Hands the client the server's bytes a few at a time, which is what a network does to a big
+    /// response anyway -- only not on demand. SqlClient reassembles a read that ended mid-packet by
+    /// replaying the framing it had begun, so a value or a row cut across the seam between two
+    /// packets loses it its place, and the failure surfaces later as a length read out of payload.
+    /// Nothing here is timing-dependent once the split is forced.
+    sealed class SplitDelivery(int target, int piece) : IDisposable
+    {
+        readonly TcpListener listener = Bind();
+
+        static TcpListener Bind()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            return listener;
+        }
+
+        readonly MemoryStream captured = new();
+
+        /// Everything the server sent, for checking the framing rather than the client's tolerance
+        /// of it -- SqlClient survives some violations and not others, which is how one of these
+        /// went unnoticed.
+        public byte[] Captured { get { lock (captured) return captured.ToArray(); } }
+
+        public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        public SplitDelivery Start()
+        {
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var client = await listener.AcceptTcpClientAsync();
+                    var server = new TcpClient();
+                    await server.ConnectAsync(IPAddress.Loopback, target);
+                    client.NoDelay = server.NoDelay = true;
+                    _ = Copy(client.GetStream(), server.GetStream(), int.MaxValue);
+                    _ = Copy(server.GetStream(), client.GetStream(), piece, captured);
+                }
+            });
+            return this;
+        }
+
+        static async Task Copy(Stream from, Stream to, int piece, MemoryStream? capture = null)
+        {
+            var buffer = new byte[64 * 1024];
+            try
+            {
+                while (true)
+                {
+                    var read = await from.ReadAsync(buffer);
+                    if (read == 0) return;
+                    if (capture is not null) lock (capture) capture.Write(buffer, 0, read);
+                    for (var at = 0; at < read; at += piece)
+                    {
+                        await to.WriteAsync(buffer.AsMemory(at, Math.Min(piece, read - at)));
+                        await to.FlushAsync();
+                    }
+                }
+            }
+            catch (Exception) { }
+        }
+
+        public void Dispose() => listener.Stop();
+    }
+
+    /// Twenty columns of a few characters each: a row far shorter than a packet, but long enough
+    /// that packets fill several rows in and land inside one unless a row ends them.
+    static string WideRows(int rows) =>
+        "SELECT " + string.Join(", ", Enumerable.Range(0, 20).Select(i => $"repeat('c', 12) AS c{i}")) +
+        $" FROM range({rows})";
+
+    [Theory]
+    // Rows wider than a packet, rows far narrower, rows narrower but wide enough to straddle, and a
+    // packet size that makes every row span several -- the ways a row and a packet can line up.
+    [InlineData("SELECT repeat('x', 1000) AS s FROM range(60)", 60, 4096)]
+    [InlineData("SELECT 'y' AS s FROM range(4000)", 4000, 4096)]
+    [InlineData("WIDE", 400, 4096)]
+    [InlineData("WIDE", 400, 8000)]
+    [InlineData("SELECT repeat('x', 1000) AS s FROM range(20)", 20, 512)]
+    public void LongResultsSurviveASplitRead(string sql, int expected, int packet)
+    {
+        if (sql == "WIDE") sql = WideRows(expected);
+
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 13).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            $"Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false;Packet Size={packet}");
+        connection.Open();
+
+        using var command = new SqlCommand(sql, connection) { CommandTimeout = 30 };
+        using var reader = command.ExecuteReader();
+
+        var rows = 0;
+        while (reader.Read())
+        {
+            for (var i = 0; i < reader.FieldCount; i++) reader.GetString(i);
+            rows++;
+        }
+
+        Assert.Equal(expected, rows);
+    }
+
+    /// The invariant behind the test above, checked on the bytes instead of on the client: a row
+    /// that fits in a packet is inside one. What a client does with a row cut across the seam
+    /// varies -- what the server sends should not.
+    [Fact]
+    public void PacketsEndWhereRowsDo()
+    {
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 4096).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false;Packet Size=8000");
+        connection.Open();
+
+        using (var command = new SqlCommand(WideRows(400), connection))
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) { }
+
+        Thread.Sleep(200);
+        var (boundaries, rows) = Frame(delivery.Captured);
+
+        Assert.True(rows.Count == 400, $"walked {rows.Count} rows");
+        Assert.True(boundaries.Count > 20, $"only {boundaries.Count} packets");
+        Assert.DoesNotContain(rows, row => boundaries.Any(at => row.Start < at && at < row.End));
+    }
+
+    /// Reassembles the longest response in a capture, and reports where its packets ended and where
+    /// its rows did. Every column of `WideRows` is a MAX string, so a row is the row token and one
+    /// PLP value per column: eight bytes of total length, chunks, and an empty chunk to end it.
+    static (List<int> Boundaries, List<(int Start, int End)> Rows) Frame(byte[] captured)
+    {
+        List<int> boundaries = [], longest = [];
+        List<byte> message = [], result = [];
+
+        for (var at = 0; at + 8 <= captured.Length;)
+        {
+            var length = BinaryPrimitives.ReadUInt16BigEndian(captured.AsSpan(at + 2));
+            message.AddRange(captured[(at + 8)..(at + length)]);
+            boundaries.Add(message.Count);
+
+            if ((captured[at + 1] & 1) != 0) // end of message
+            {
+                if (message.Count > result.Count) (result, longest) = (message, boundaries);
+                (message, boundaries) = ([], []);
+            }
+            at += length;
+        }
+
+        var body = result.ToArray();
+        var rows = new List<(int, int)>();
+        var columns = BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(1));
+        var i = 3; // past the COLMETADATA token and its column count
+
+        for (var c = 0; c < columns; c++)
+        {
+            i += 4 + 2 + 1 + 2 + 5;      // user type, flags, NVARCHAR token, length, collation
+            i += 1 + body[i] * 2;        // name
+        }
+
+        while (i < body.Length && body[i] == 0xD1)
+        {
+            var start = i++;
+            for (var c = 0; c < columns; c++)
+            {
+                i += 8;                  // total length
+                for (var chunk = BinaryPrimitives.ReadInt32LittleEndian(body.AsSpan(i));
+                     chunk != 0;
+                     chunk = BinaryPrimitives.ReadInt32LittleEndian(body.AsSpan(i)))
+                    i += 4 + chunk;
+                i += 4;                  // the empty chunk
+            }
+            rows.Add((start, i));
+        }
+
+        return (longest, rows);
     }
 
     [Fact]

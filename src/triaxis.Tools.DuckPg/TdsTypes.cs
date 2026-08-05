@@ -117,7 +117,9 @@ static class TdsTypes
 
     // ---- values ----------------------------------------------------------------------------------
 
-    public static void WriteValue(TdsMsg msg, TdsColumn column, object? value)
+    /// <paramref name="payload"/> is what one packet holds: a MAX value is chunked to it, so no
+    /// chunk of it crosses a packet boundary.
+    public static void WriteValue(TdsMsg msg, TdsColumn column, object? value, int payload)
     {
         if (value is null or DBNull)
         {
@@ -170,11 +172,11 @@ static class TdsTypes
                 return;
 
             case VarBinary:
-                WritePlp(msg, AsBytes(value));
+                WritePlp(msg, AsBytes(value), payload);
                 return;
 
             default:
-                WritePlp(msg, Encoding.Unicode.GetBytes(PgTypes.Render(value)));
+                WritePlp(msg, Encoding.Unicode.GetBytes(PgTypes.Render(value)), payload);
                 return;
         }
     }
@@ -236,11 +238,25 @@ static class TdsTypes
         msg.U8(length + 5).Raw(b[..length]).Raw(Days(utc)).Raw(minutes);
     }
 
-    /// A MAX value is sent as its total length, then one chunk, then an empty chunk to end it.
-    static void WritePlp(TdsMsg msg, byte[] value)
+    /// A MAX value is sent as its total length, then chunks, then an empty chunk to end it. Each
+    /// chunk stops at the packet boundary rather than running through it: SqlClient reassembles a
+    /// read that ended mid-packet by replaying the value's framing, and a chunk spanning the
+    /// boundary loses it its place there -- it then reads response bytes as the next length, which
+    /// surfaces much later and looks like anything but this. SQL Server itself never emits one,
+    /// because it fills a packet and starts a chunk in the next.
+    static void WritePlp(TdsMsg msg, byte[] value, int payload)
     {
         msg.I64(value.Length);
-        if (value.Length > 0) msg.I32(value.Length).Raw(value);
+
+        var at = 0;
+        while (at < value.Length)
+        {
+            // The chunk header goes in first, so the room left is measured from after it.
+            var take = Math.Min(value.Length - at, payload - (msg.Length + 4) % payload);
+            msg.I32(take).Raw(value.AsSpan(at, take));
+            at += take;
+        }
+
         msg.I32(0);
     }
 
