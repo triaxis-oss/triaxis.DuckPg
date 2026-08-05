@@ -85,8 +85,9 @@ sealed class TSqlParser
 
     Statement Statement()
     {
-        if (Peek.Is("select") || Peek.Is("with") || Peek.Is("values")) return new SelectStatement(Query());
+        if (Peek.Is("select") || Peek.Is("with") || Peek.Is("values")) return SelectOrInto();
         if (Peek.Is("insert")) return Insert();
+        if (Peek.Is("drop")) return Drop();
         if (Peek.Is("update")) return Update();
         if (Peek.Is("delete")) return Delete();
         if (Peek.Is("merge")) return Merge();
@@ -95,6 +96,30 @@ sealed class TSqlParser
         if (Peek.Is("begin") || Peek.Is("commit") || Peek.Is("rollback") || Peek.Is("save")) return Transaction();
 
         throw new TSqlException($"unsupported statement `{Peek.Text}`", Peek.Position);
+    }
+
+    /// A query, unless it names somewhere to put the rows: `SELECT … INTO` creates a table, which
+    /// is a statement's business and not a query's. The INTO is lifted off the body here so that
+    /// nothing below the statement has to know it was ever there.
+    Statement SelectOrInto()
+    {
+        var query = Query();
+        return query.Body is SelectBody { Into: { } target } body
+            ? new SelectIntoStatement(target, query with { Body = body with { Into = null } })
+            : new SelectStatement(query);
+    }
+
+    /// `DROP TABLE [IF EXISTS] #t`, which is how a client clears the scratch table it made. What a
+    /// lake publishes is a layer file, so dropping one is not a statement it takes.
+    Statement Drop()
+    {
+        Expect("drop");
+        if (!Peek.Is("table")) throw Unexpected("only DROP TABLE is supported");
+        Expect("table");
+
+        var ifExists = false;
+        if (Accept("if")) { Expect("exists"); ifExists = true; }
+        return new DropTableStatement(TableName(), ifExists);
     }
 
     Statement Insert()
@@ -372,6 +397,7 @@ sealed class TSqlParser
         var items = new List<SelectItem>();
         do items.Add(SelectItem()); while (AcceptOperator(","));
 
+        var into = Accept("into") ? TableName() : null;
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
 
@@ -383,7 +409,7 @@ sealed class TSqlParser
         }
 
         var having = Accept("having") ? Expression() : null;
-        return new SelectBody(distinct, top, percent, items, from, where, groupBy, having);
+        return new SelectBody(distinct, top, percent, items, into, from, where, groupBy, having);
     }
 
     SelectItem SelectItem()

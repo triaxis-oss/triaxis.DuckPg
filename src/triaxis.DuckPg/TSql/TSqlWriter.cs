@@ -66,6 +66,19 @@ sealed class TSqlWriter(TSqlContext context)
                 Query(select.Query);
                 return;
 
+            case SelectIntoStatement into:
+                Put("CREATE TEMP TABLE ");
+                TempTable(into.Target);
+                Put(" AS ");
+                Query(into.Query);
+                return;
+
+            case DropTableStatement drop:
+                Put("DROP TABLE ");
+                if (drop.IfExists) Put("IF EXISTS ");
+                TempTable(drop.Target);
+                return;
+
             case InsertStatement insert:
                 Put("INSERT INTO ");
                 Table(insert.Target);
@@ -189,6 +202,10 @@ sealed class TSqlWriter(TSqlContext context)
         {
             case SelectBody select:
                 if (select.TopPercent) throw new TSqlException("TOP PERCENT is not supported", 0);
+                // Lifted off by the statement that owns it, so one here is an INTO in a subquery,
+                // a set operation or a CTE -- places that have nowhere to put a table.
+                if (select.Into is { } into)
+                    throw new TSqlException($"SELECT ... INTO {into.Table.Text} is a statement of its own", 0);
                 Put("SELECT ");
                 if (select.Distinct) Put("DISTINCT ");
                 Join(select.Items, item =>
@@ -285,7 +302,7 @@ sealed class TSqlWriter(TSqlContext context)
     /// publishes. The database part names the server it came from, which is this one.
     void Table(TableName name)
     {
-        if (name.Parts.Count == 1 && defined.Contains(name.Table.Text))
+        if (name.Parts.Count == 1 && (defined.Contains(name.Table.Text) || Temporary(name)))
         {
             Put(Quote(name.Table));
             return;
@@ -297,6 +314,28 @@ sealed class TSqlWriter(TSqlContext context)
             : schema.Text;
 
         Put(SqlText.Quote(resolved)).Put(".").Put(Quote(name.Table));
+    }
+
+    /// `#t` is a temporary table, and DuckDB's belong to a connection exactly as SQL Server's
+    /// belong to a session -- so it needs no schema and must not be given the lake's. `##t` is a
+    /// different promise: a global temporary table is one another connection can see, and there is
+    /// nothing here to share it with.
+    static bool Temporary(TableName name)
+    {
+        if (name.Parts.Count != 1 || !name.Table.Text.StartsWith('#')) return false;
+        if (name.Table.Text.StartsWith("##"))
+            throw new TSqlException($"global temporary table {name.Table.Text} is not supported", 0);
+        return true;
+    }
+
+    /// Where a statement makes or unmakes a table, rather than reads one. The lake's own tables are
+    /// files: what is in them is a layer's business, and that they exist at all is the config's.
+    void TempTable(TableName name)
+    {
+        if (!Temporary(name))
+            throw new TSqlException($"{name.Table.Text} is not a temporary table, " +
+                                    "and a lake's tables are the files under it", 0);
+        Put(Quote(name.Table));
     }
 
     /// OPENJSON is a derived table here, and its columns are projected rather than resolved: a

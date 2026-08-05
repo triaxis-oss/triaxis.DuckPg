@@ -213,6 +213,19 @@ public class TSqlTests
         Assert.Equal("COMMIT", Translate("COMMIT TRAN"));
     }
 
+    /// A scratch table the client makes for itself: DuckDB's temporary tables belong to a
+    /// connection, which is what SQL Server means by a session, so `#t` needs no schema and must
+    /// not be given the lake's.
+    [Theory]
+    [InlineData("DROP TABLE IF EXISTS #staged", """DROP TABLE IF EXISTS "#staged" """)]
+    [InlineData("DROP TABLE #staged", """DROP TABLE "#staged" """)]
+    [InlineData("SELECT a.id, a.amount INTO #staged FROM orders a WHERE a.id > 0",
+        """CREATE TEMP TABLE "#staged" AS SELECT "a"."id", "a"."amount" FROM "lake"."orders" AS "a" WHERE "a"."id" > 0""")]
+    [InlineData("SELECT s.id FROM #staged s JOIN orders o ON o.id = s.id",
+        """SELECT "s"."id" FROM "#staged" AS "s" INNER JOIN "lake"."orders" AS "o" ON "o"."id" = "s"."id" """)]
+    [InlineData("INSERT INTO #staged (id) VALUES (1)", """INSERT INTO "#staged" ("id") VALUES (1)""")]
+    public void RendersTemporaryTables(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
+
     [Fact]
     public void ApplicationLocksRenderToNothing()
     {
@@ -223,11 +236,18 @@ public class TSqlTests
 
     [Theory]
     [InlineData("CREATE TABLE t (a INT)", "unsupported statement")]
+    [InlineData("SELECT TOP 5 PERCENT * FROM t", "TOP PERCENT")]
     [InlineData("EXEC sp_who", "sp_who is not supported")]
     [InlineData("EXEC ('SELECT 1')", "EXEC of a string")]
     [InlineData("EXEC @rc = sp_getapplock @Resource = 'r'", "EXEC into a variable")]
     [InlineData("EXEC sp_getapplock @Resource = 'r', @Result = @out OUTPUT", "OUTPUT argument")]
-    [InlineData("SELECT TOP 5 PERCENT * FROM t", "TOP PERCENT")]
+    // A lake's tables are the files under it: making or dropping one is not a statement's to do.
+    [InlineData("SELECT * INTO staging FROM orders", "not a temporary table")]
+    [InlineData("DROP TABLE orders", "not a temporary table")]
+    [InlineData("DROP VIEW v", "only DROP TABLE")]
+    // A global temporary table is one another connection can see, and there is none to share with.
+    [InlineData("SELECT * INTO ##shared FROM orders", "global temporary table")]
+    [InlineData("SELECT (SELECT x INTO #t FROM u) FROM v", "statement of its own")]
     [InlineData("SELECT CONVERT(VARCHAR, d, 120) FROM t", "CONVERT with a style")]
     [InlineData("SELECT * FROM", "expected a name")]
     [InlineData("SELECT 'unterminated", "unterminated")]

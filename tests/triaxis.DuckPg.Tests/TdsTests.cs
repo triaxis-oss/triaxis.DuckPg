@@ -528,6 +528,41 @@ public class TdsTests : IDisposable
         Assert.Equal([1, 2, 3], results);
     }
 
+    /// The shape a tool takes a snapshot with: drop what a previous run left, select the rows into
+    /// a scratch table, work against it. The temporary table belongs to the connection, so it also
+    /// has to be gone from the next session to be handed this one.
+    [Fact]
+    public void TemporaryTablesAreMadeAndDropped()
+    {
+        using var connection = Open();
+
+        new SqlCommand("DROP TABLE IF EXISTS #snapshot", connection).ExecuteNonQuery();
+        new SqlCommand("SELECT o.order_id, o.amount INTO #snapshot FROM orders o WHERE o.order_id < 3",
+                       connection).ExecuteNonQuery();
+
+        Assert.Equal(2, new SqlCommand("SELECT COUNT(*) FROM #snapshot", connection).ExecuteScalar());
+        Assert.Equal(30.50m, new SqlCommand(
+            "SELECT SUM(s.amount) FROM #snapshot s JOIN orders o ON o.order_id = s.order_id",
+            connection).ExecuteScalar());
+
+        new SqlCommand("DROP TABLE #snapshot", connection).ExecuteNonQuery();
+        Assert.Throws<SqlException>(() =>
+            new SqlCommand("SELECT COUNT(*) FROM #snapshot", connection).ExecuteScalar());
+    }
+
+    /// A pooled connection is handed back out as a new session, and what the old one made goes with
+    /// it -- SqlClient resets the connection it reuses, and the reset is where the dropping happens.
+    [Fact]
+    public void PooledConnectionsDoNotInheritTemporaryTables()
+    {
+        using (var connection = Open())
+            new SqlCommand("SELECT o.order_id INTO #left_behind FROM orders o", connection).ExecuteNonQuery();
+
+        using (var connection = Open())
+            Assert.Throws<SqlException>(() =>
+                new SqlCommand("SELECT COUNT(*) FROM #left_behind", connection).ExecuteScalar());
+    }
+
     /// An application takes one to serialise itself against the other connections of a database,
     /// which a lake has none of; what it must not do is fail, since the work is inside the
     /// transaction the lock was taken for.

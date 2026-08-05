@@ -149,16 +149,21 @@ sealed class TdsWire(Stream stream, ILogger logger)
     /// to be able to notice one arriving without blocking on the socket.
     public bool DataAvailable => stream is NetworkStream { DataAvailable: true };
 
-    public (byte Type, byte[] Payload)? ReadMessage()
+    /// `Reset` is how a pooled connection says it is a new session: SqlClient marks the first
+    /// message it sends on a connection it took back out of the pool, rather than calling
+    /// `sp_reset_connection` the way an older client does.
+    public (byte Type, byte[] Payload, bool Reset)? ReadMessage()
     {
         var payload = new MemoryStream();
         byte type;
+        var reset = false;
 
         while (true)
         {
             if (!TryReadFully(header)) return null;
             type = header[0];
             var status = header[1];
+            reset |= (status & 0x08) != 0;
             var length = BinaryPrimitives.ReadUInt16BigEndian(header.AsSpan(2));
             if (length < 8) throw new ProtocolException($"bad packet length {length}");
 
@@ -170,7 +175,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
         }
 
         logger.LogTrace("<< {Type} {Length}", type, payload.Length);
-        return (type, payload.ToArray());
+        return (type, payload.ToArray(), reset);
     }
 
     /// Sends the first <paramref name="count"/> bytes as packets that do not end the message; the
