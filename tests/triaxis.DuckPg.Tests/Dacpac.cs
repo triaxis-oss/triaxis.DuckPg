@@ -9,7 +9,8 @@ static class Dacpac
     static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
 
     public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key,
-                            (string Column, string Expression)[]? Defaults = null);
+                            (string Column, string Expression)[]? Defaults = null,
+                            string[]? Identity = null);
 
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
@@ -36,7 +37,14 @@ static class Dacpac
         El("SqlTable", $"[dbo].[{table.Name}]",
             Rel("Columns", [.. table.Columns.Select(c =>
                 El("SqlSimpleColumn", $"[dbo].[{table.Name}].[{c.Column}]",
+                    Identity(table, c.Column),
                     Rel("TypeSpecifier", El("SqlTypeSpecifier", null, Rel("Type", Ref($"[{c.Type}]"))))))]));
+
+    /// A store-generated column says so with a property of its own, as DacFx writes it.
+    static object[] Identity(TableModel table, string column) =>
+        table.Identity?.Contains(column) == true
+            ? [new XElement(Dac + "Property", new XAttribute("Name", "IsIdentity"), new XAttribute("Value", "True"))]
+            : [];
 
     static XElement View(ViewModel view) =>
         El("SqlView", $"[dbo].[{view.Name}]", Script("QueryScript", view.Query));

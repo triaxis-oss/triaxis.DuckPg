@@ -194,8 +194,19 @@ publish a temp-directory convention as API.
   `TSqlParser.Never`, which is EF Core's `ON 1=0` -- is a multi-row insert, and that is how a batch
   of rows arrives. A condition that *can* match is refused: what "already there" means when the row
   it would shadow is in a layer below is the layer machinery's, not one statement's. `OUTPUT` is
-  refused with it -- a lake stores the row it is given, so a column the statement does not insert
-  has nothing to read back, which is exactly the store-generated key EF asks for.
+  answered by writing the rows down first: `Gateway.RewriteReturning` materialises them into
+  `duckpg_written`, inserts from that, and reads the answer off the same copy -- which is why the
+  plan returns rows *and* writes, and why both sessions run every step but the last as a write.
+  DuckDB's `RETURNING` cannot do it alone: it sees the target's columns and not the source's, so
+  `i._Position` -- the row EF is asking about -- is not something it can hand back.
+- **A key the store fills in comes from a declared identity and nowhere else.** A dacpac column
+  marked `IsIdentity` gets a sequence in the write layer (`Catalog.Sequence`), seeded past the
+  highest value the merged view holds when the table grows its write branch -- at build for a table
+  that already carries rows, in the promotion otherwise, which is the only moment the count is both
+  needed and cheap. `Gateway.Generated` fills it for any insert that leaves it out, so the plain
+  statement and the answered one decide it the same way. It is per process, so two serving the same
+  write directory would collide; and an OUTPUT naming anything else a lake does not generate is
+  refused, since the alternative is answering with a null the caller would store.
 - **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**
   `SAVE TRANSACTION` renders to nothing -- marking a point costs nothing -- but
   `ROLLBACK TRANSACTION <name>` throws instead of rendering a plain `ROLLBACK` or nothing at all:

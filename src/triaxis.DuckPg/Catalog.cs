@@ -12,7 +12,9 @@ namespace triaxis.DuckPg;
 /// built -- which is the only honest stamp for a row in a file that predates the question.
 sealed record ColumnDefault(string Expr, string Value);
 
-sealed record Column(string Name, string Type, ColumnDefault? Default = null);
+/// `Identity` is a column the declaring schema says the store fills in: the caller does not send it
+/// and asks for it back. Nothing else in a lake generates a value a file does not hold.
+sealed record Column(string Name, string Type, ColumnDefault? Default = null, bool Identity = false);
 
 sealed record VirtualColumn(string Name, string Expr);
 
@@ -94,6 +96,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
             if (!carries && Cached(conn, table) is { } file) copies[name] = file;
             Exec(conn, ViewDefinition(table, carries, tombstoned.Contains(name)));
+            if (carries) foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             Tables[name] = table;
         }
 
@@ -468,9 +471,33 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// What a first write to a table costs: the tables the write layer keeps for it, and the view
     /// rewritten to read them. Repeatable on purpose -- a statement that rolled back leaves the
     /// catalog as it was, and the next write says the same thing again.
-    public string[] Promotion(Table table, bool tombstones) =>
-        [.. write.Definition(table, ifNotExists: true),
+    public string[] Promotion(DuckDBConnection conn, Table table, bool tombstones) =>
+        [.. Sequences(conn, table),
+         .. write.Definition(table, ifNotExists: true),
          ViewDefinition(table, writable: true, tombstones || Tombstoned(table))];
+
+    /// Where a store-generated column draws its values from, one sequence per column and both named
+    /// after it, in the write layer's own schema.
+    public static string Sequence(Table table, Column column) =>
+        $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote($"{table.Name}__{column.Name}__seq")}";
+
+    /// A declared identity starts after what the lake already holds: the files are the state, so the
+    /// first key handed out is the one past the highest of them. Asked once, when the table grows
+    /// its write branch -- a lake that reloads asks the files again, which is what makes a key it
+    /// generated last time not one it generates twice.
+    public string[] Sequences(DuckDBConnection conn, Table table)
+    {
+        var sequences = new List<string>();
+        foreach (var column in table.Columns.Where(c => c.Identity))
+        {
+            using var command = conn.CreateCommand();
+            command.CommandText =
+                $"SELECT coalesce(max({SqlText.Quote(column.Name)}), 0) + 1 FROM {table.QualifiedName}";
+            sequences.Add($"CREATE SEQUENCE IF NOT EXISTS {Sequence(table, column)} " +
+                          $"START {Convert.ToInt64(command.ExecuteScalar())}");
+        }
+        return [.. sequences];
+    }
 
     public bool Promoted(Table table) => promoted.Contains(table.Name);
 

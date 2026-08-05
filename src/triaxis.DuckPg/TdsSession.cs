@@ -263,9 +263,19 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
             case PlanKind.Rows:
             {
-                using var command = Command(plan.Steps[0], parameters);
+                // An insert asked what it wrote puts the rows down before it can answer with them;
+                // whatever came first, the last step is the one that has rows.
+                foreach (var step in plan.Steps[..^1])
+                {
+                    using var written = Command(step, parameters);
+                    written.ExecuteNonQuery();
+                }
+
+                using var command = Command(plan.Steps[^1], parameters);
                 using var reader = Execute(command);
                 var rows = Rows(msg, reader);
+                if (plan.Steps.Length > 1) Persist(plan);
+
                 rowCount = rows;
                 Done(msg, doneToken, (last ? Status.Final : Status.More) | Status.Count, rows);
                 return;

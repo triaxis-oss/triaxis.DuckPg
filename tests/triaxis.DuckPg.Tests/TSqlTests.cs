@@ -189,6 +189,29 @@ public class TSqlTests
                 """, "p0", "p1", "p2", "p3"));
     }
 
+    /// The rows are projected under the target's own column names and the answer is a RETURNING over
+    /// them, so the gateway can write them down and answer from the same rows -- including the
+    /// column the caller did not send, which is what it is asking for.
+    [Fact]
+    public void AnInsertAskedWhatItWroteReturnsIt()
+    {
+        Assert.Equal(
+            """INSERT INTO "lake"."orders" ("amount") SELECT "i"."amount" AS "amount" """ +
+            """FROM (VALUES ($p0, 0), ($p1, 1)) AS "i" ("amount", "_Position") RETURNING "order_id", "_Position" """.Trim(),
+            Translate("""
+                MERGE [orders] USING (VALUES (@p0, 0), (@p1, 1)) AS i ([amount], _Position)
+                ON 1=0
+                WHEN NOT MATCHED THEN INSERT ([amount]) VALUES (i.[amount])
+                OUTPUT INSERTED.[order_id], i._Position;
+                """, "p0", "p1"));
+
+        // The single-row form: the rows still have to stand where a table does.
+        Assert.Equal(
+            """INSERT INTO "lake"."orders" ("amount") SELECT "amount" AS "amount" """ +
+            """FROM (VALUES ($p0)) AS "_rows" ("amount") RETURNING "order_id" """.Trim(),
+            Translate("INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[order_id] VALUES (@p0)", "p0"));
+    }
+
     [Theory]
     // Anything that changes which rows exist is the layer machinery's business, not one statement's.
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE")]
@@ -198,18 +221,19 @@ public class TSqlTests
         "WHEN MATCHED AND")]
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x " +
         "WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "only one MERGE branch")]
-    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x OUTPUT inserted.x",
-        "OUTPUT")]
     // An insert branch over a condition that can match is an insert of what is not already there,
     // and what "already there" means when the row is in a layer below is not one statement's call.
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON t.id = i.id WHEN NOT MATCHED THEN INSERT (id) VALUES (i.id)",
         "a condition that cannot match")]
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED BY SOURCE THEN DELETE",
         "NOT MATCHED BY SOURCE")]
-    // The key EF Core asks for back is the one thing a lake cannot make up.
-    [InlineData("MERGE t USING (VALUES (1, 0)) AS i (id, _Position) ON 1=0 WHEN NOT MATCHED THEN " +
-        "INSERT (id) VALUES (i.id) OUTPUT INSERTED.id, i._Position",
-        "has no value to read back")]
+    // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
+    // the answer than the answer.
+    [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED THEN " +
+        "INSERT (id) VALUES (i.id) OUTPUT DELETED.id", "an insert replaces none")]
+    [InlineData("INSERT INTO t (a) OUTPUT INSERTED.a INTO @kept VALUES (1)", "puts the rows somewhere else")]
+    [InlineData("MERGE t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x OUTPUT inserted.x",
+        "not the update")]
     public void RefusesTheMergeBranchesItDoesNotDo(string tsql, string expected) =>
         Assert.Contains(expected, Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
 
