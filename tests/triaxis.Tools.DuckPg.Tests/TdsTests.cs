@@ -340,6 +340,27 @@ public class TdsTests : IDisposable
         Assert.True(reader.IsDBNull(8));
     }
 
+    /// The legacy LOB types. Nothing on this side produces them, but an old client sends them:
+    /// LLBLGen on `System.Data.SqlClient` types a string parameter as NTEXT.
+    [Fact]
+    public void ParametersCarryTheLegacyLobTypes()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @n AS n, @t AS t, @i AS i, @e AS e", connection);
+        command.Parameters.Add("@n", System.Data.SqlDbType.NText).Value = new string('n', 9000);
+        command.Parameters.Add("@t", System.Data.SqlDbType.Text).Value = "text";
+        command.Parameters.Add("@i", System.Data.SqlDbType.Image).Value = new byte[] { 1, 2, 3 };
+        command.Parameters.Add("@e", System.Data.SqlDbType.NText).Value = DBNull.Value;
+
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read());
+
+        Assert.Equal(new string('n', 9000), reader.GetString(0));
+        Assert.Equal("text", reader.GetString(1));
+        Assert.Equal("010203", Convert.ToHexString((byte[])reader.GetValue(2)));
+        Assert.True(reader.IsDBNull(3));
+    }
+
     [Fact]
     public void PreparedCommandsRunTwice()
     {

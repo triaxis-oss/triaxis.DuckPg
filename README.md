@@ -148,6 +148,7 @@ What SqlClient does, and what answers it:
 |---|---|
 | Login, `SELECT`, typed `SqlDataReader` reads, `NULL`s | COLMETADATA / ROW / DONE |
 | Parameterised commands (`sp_executesql`) | RPC, with values bound as DuckDB parameters |
+| Parameters typed `NTEXT`, `TEXT`, `IMAGE` by an older client | read as the strings and blobs they are |
 | `cmd.Prepare()`, repeated execution (`sp_prepexec` / `sp_execute` / `sp_unprepare`) | handles held per session |
 | `SqlTransaction` commit and rollback | transaction manager requests, ENVCHANGE descriptors |
 | Multi-statement batches, `NextResult()` | one DONE per statement, the last one final |
