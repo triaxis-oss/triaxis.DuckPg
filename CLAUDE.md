@@ -122,6 +122,11 @@ someone changing the code needs.
   for the wide one on the database this stands in for. `SUM` is not narrowed the same way: what
   SQL Server returns depends on the argument's type, which is not on the tree. It does arrive as a
   number rather than as text, which is a different bug -- see the type names below.
+- **`OPENJSON` is a derived table, not a function call.** EF Core passes a collection as one JSON
+  parameter and unpacks it with `OPENJSON(@p) WITH ([value] int '$')`, so the columns the WITH
+  clause declares are projected in the subquery `TSqlWriter.OpenJson` renders. Resolving them where
+  they are *used* instead would mean rewriting column references against an alias, which is the
+  thing the tree is meant to avoid.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column

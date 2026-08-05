@@ -157,6 +157,7 @@ What SqlClient does, and what answers it:
 | `CommandTimeout`, `cmd.Cancel()` | Attention → `duckdb_interrupt` → DONE with the attention bit |
 | Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
 | `SET NOCOUNT ON` and its relatives | accepted and ignored |
+| `OPENJSON(@p) WITH (…)` — EF Core's list parameter | a derived table over the JSON, one row per element |
 | `COUNT`, `COUNT_BIG` | an `int` and a `bigint`, as on SQL Server — DuckDB counts in BIGINT either way |
 | `SUM` of an integer column, `UBIGINT`, `HUGEINT` | `DECIMAL(38,0)` — a number, since no SQL Server integer is that wide |
 
