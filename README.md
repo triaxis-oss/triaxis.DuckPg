@@ -158,6 +158,7 @@ What SqlClient does, and what answers it:
 | Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
 | `SET NOCOUNT ON` and its relatives | accepted and ignored |
 | `COUNT`, `COUNT_BIG` | an `int` and a `bigint`, as on SQL Server — DuckDB counts in BIGINT either way |
+| `SUM` of an integer column, `UBIGINT`, `HUGEINT` | `DECIMAL(38,0)` — a number, since no SQL Server integer is that wide |
 
 Not implemented: TLS and SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
 `SqlBulkCopy`, table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA`

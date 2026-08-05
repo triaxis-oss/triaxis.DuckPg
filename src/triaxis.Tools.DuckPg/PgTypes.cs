@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections;
+using System.Numerics;
 using System.Globalization;
 using System.Text;
 
@@ -12,21 +13,22 @@ static class PgTypes
                      Float4 = 700, Float8 = 701, Unknown = 705, Varchar = 1043, Date = 1082, Time = 1083,
                      Timestamp = 1114, TimestampTz = 1184, Interval = 1186, Numeric = 1700, Uuid = 2950;
 
-    /// DuckDB's type name as reported by the reader -> PG OID. Types PG has no equivalent for
+    /// DuckDB's type name as reported by the reader -> PG OID. The names are the reader's own --
+    /// `UnsignedBigInt`, `TimestampMs` -- not the SQL spellings. Types PG has no equivalent for
     /// (LIST, STRUCT, MAP, ...) are surfaced as text holding their JSON rendering.
     public static int Oid(string duckType) => duckType.ToLowerInvariant() switch
     {
         "boolean" => Bool,
-        "tinyint" or "smallint" or "utinyint" => Int2,
-        "integer" or "usmallint" => Int4,
-        "bigint" or "uinteger" => Int8,
-        "hugeint" or "uhugeint" or "ubigint" or "decimal" => Numeric,
+        "tinyint" or "smallint" or "unsignedtinyint" => Int2,
+        "integer" or "unsignedsmallint" => Int4,
+        "bigint" or "unsignedinteger" => Int8,
+        "hugeint" or "unsignedhugeint" or "unsignedbigint" or "decimal" => Numeric,
         "float" => Float4,
         "double" => Float8,
         "blob" or "bit" => Bytea,
         "date" => Date,
         "time" or "timetz" => Time,
-        "timestamp" or "timestamp_s" or "timestamp_ms" or "timestamp_ns" => Timestamp,
+        "timestamp" or "timestamps" or "timestampms" or "timestampns" => Timestamp,
         "timestamptz" => TimestampTz,
         "interval" => Interval,
         "uuid" => Uuid,
@@ -123,7 +125,7 @@ static class PgTypes
             case Float4: msg.F32(Convert.ToSingle(value)); break;
             case Float8: msg.F64(Convert.ToDouble(value)); break;
             case Uuid: msg.Raw(((Guid)value).ToByteArray(bigEndian: true)); break;
-            case Numeric: WriteNumeric(msg, Convert.ToDecimal(value)); break;
+            case Numeric: WriteNumeric(msg, value); break;
 
             case Bytea:
                 switch (value)
@@ -198,10 +200,15 @@ static class PgTypes
         _ => TimeSpan.Parse(value.ToString() ?? "0", CultureInfo.InvariantCulture),
     };
 
-    /// Mirror of DecodeNumeric: split the decimal string into base-10000 groups either side of the point.
-    static void WriteNumeric(Msg msg, decimal value)
+    /// Mirror of DecodeNumeric: split the decimal string into base-10000 groups either side of the
+    /// point. A HUGEINT arrives as a BigInteger, which no decimal is wide enough to hold and which
+    /// has no point to split at -- both come down to digits and a sign.
+    static void WriteNumeric(Msg msg, object value)
     {
-        var text = Math.Abs(value).ToString(CultureInfo.InvariantCulture);
+        var negative = value is BigInteger big ? big.Sign < 0 : Convert.ToDecimal(value) < 0;
+        var text = value is BigInteger integer
+            ? BigInteger.Abs(integer).ToString(CultureInfo.InvariantCulture)
+            : Math.Abs(Convert.ToDecimal(value)).ToString(CultureInfo.InvariantCulture);
         var point = text.IndexOf('.');
         var whole = point < 0 ? text : text[..point];
         var fraction = point < 0 ? "" : text[(point + 1)..];
@@ -219,7 +226,7 @@ static class PgTypes
         while (groups.Count > 0 && groups[^1] == 0) groups.RemoveAt(groups.Count - 1);
         if (groups.Count == 0) weight = 0;
 
-        msg.I16(groups.Count).I16(weight).I16(value < 0 ? 0x4000 : 0).I16(scale);
+        msg.I16(groups.Count).I16(weight).I16(negative ? 0x4000 : 0).I16(scale);
         foreach (var group in groups) msg.I16(group);
     }
 

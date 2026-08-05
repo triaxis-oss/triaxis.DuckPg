@@ -328,13 +328,15 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             columns[i] = TdsTypes.Describe(reader.GetDataTypeName(i));
             // DuckDB reports a DECIMAL column as plain `Decimal`; its precision and scale are only
-            // in the schema, and TDS has to declare both up front.
+            // in the schema, and TDS has to declare both up front. A HUGEINT is sent as a decimal
+            // too and has neither, so the shape it was described with stands.
             if (columns[i].Token == TdsTypes.DecimalN)
             {
                 schema ??= reader.GetSchemaTable();
-                columns[i] = TdsTypes.Decimal(
-                    Convert.ToInt32(schema!.Rows[i]["NumericPrecision"]),
-                    Convert.ToInt32(schema!.Rows[i]["NumericScale"]));
+                if (schema!.Rows[i]["NumericPrecision"] is not DBNull)
+                    columns[i] = TdsTypes.Decimal(
+                        Convert.ToInt32(schema.Rows[i]["NumericPrecision"]),
+                        Convert.ToInt32(schema.Rows[i]["NumericScale"]));
             }
             msg.I32(0).U16(0x0001); // no user type; nullable
             TdsTypes.WriteTypeInfo(msg, columns[i]);

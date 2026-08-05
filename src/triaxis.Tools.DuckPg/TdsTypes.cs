@@ -29,6 +29,8 @@ static class TdsTypes
     /// one makes SqlClient treat the column as having no encoding at all.
     public static readonly byte[] Collation = [0x09, 0x04, 0x00, 0x00, 0x00];
 
+    /// The names are the reader's own -- `UnsignedBigInt`, `TimestampMs` -- not the SQL spellings,
+    /// and a name that matches nothing here goes out as text.
     public static TdsColumn Describe(string duckType)
     {
         var bare = duckType.ToLowerInvariant();
@@ -38,17 +40,19 @@ static class TdsTypes
         return bare switch
         {
             "boolean" => new TdsColumn(BitN, 1),
-            "tinyint" or "utinyint" or "smallint" => new TdsColumn(IntN, 2),
-            "integer" or "usmallint" => new TdsColumn(IntN, 4),
-            "bigint" or "uinteger" => new TdsColumn(IntN, 8),
+            "tinyint" or "unsignedtinyint" or "smallint" => new TdsColumn(IntN, 2),
+            "integer" or "unsignedsmallint" => new TdsColumn(IntN, 4),
+            "bigint" or "unsignedinteger" => new TdsColumn(IntN, 8),
             "float" => new TdsColumn(FloatN, 4),
             "double" => new TdsColumn(FloatN, 8),
             "decimal" => Decimal(duckType),
-            // Wider than DECIMAL(38,0) can hold, so they travel as text rather than overflow.
-            "hugeint" or "uhugeint" or "ubigint" => new TdsColumn(NVarChar, Max),
+            // What summing anything integral gives, and what no SQL Server type is wide enough for.
+            // A DECIMAL(38,0) carries sixteen bytes of magnitude, which is a HUGEINT exactly; a
+            // client whose own decimal is narrower is the one that has to say so.
+            "hugeint" or "unsignedhugeint" or "unsignedbigint" => Decimal(38, 0),
             "date" => new TdsColumn(Date),
             "time" or "timetz" => new TdsColumn(Time, Scale: FractionScale),
-            "timestamp" or "timestamp_s" or "timestamp_ms" or "timestamp_ns" => new TdsColumn(DateTime2, Scale: FractionScale),
+            "timestamp" or "timestamps" or "timestampms" or "timestampns" => new TdsColumn(DateTime2, Scale: FractionScale),
             "timestamptz" => new TdsColumn(DateTimeOffset, Scale: FractionScale),
             "uuid" => new TdsColumn(Guid, 16),
             "blob" or "bit" => new TdsColumn(VarBinary, Max),
@@ -148,7 +152,7 @@ static class TdsTypes
                 return;
 
             case DecimalN or NumericN:
-                WriteDecimal(msg, column, Convert.ToDecimal(value, CultureInfo.InvariantCulture));
+                WriteDecimal(msg, column, value);
                 return;
 
             case Guid:
@@ -190,17 +194,23 @@ static class TdsTypes
 
     /// PG's numeric is base-10000; TDS's is a sign byte and a little-endian magnitude, scaled by
     /// the precision the column declared -- so the value has to be shifted, not just copied.
-    static void WriteDecimal(TdsMsg msg, TdsColumn column, decimal value)
+    /// A HUGEINT arrives as a BigInteger and can be wider than a decimal, so it goes out as the
+    /// integer it already is rather than through one it would not fit in.
+    static void WriteDecimal(TdsMsg msg, TdsColumn column, object value)
     {
-        var scaled = value;
-        for (var i = 0; i < column.Scale; i++) scaled *= 10;
-        var integer = new BigInteger(decimal.Truncate(scaled));
+        var integer = value as BigInteger? ?? Scaled(Convert.ToDecimal(value, CultureInfo.InvariantCulture), column.Scale);
 
         var magnitude = BigInteger.Abs(integer).ToByteArray(isUnsigned: true, isBigEndian: false);
         var payload = new byte[column.Length - 1];
         magnitude.AsSpan(0, Math.Min(magnitude.Length, payload.Length)).CopyTo(payload);
 
         msg.U8(column.Length).U8(integer.Sign < 0 ? 0 : 1).Raw(payload);
+    }
+
+    static BigInteger Scaled(decimal value, int scale)
+    {
+        for (var i = 0; i < scale; i++) value *= 10;
+        return new BigInteger(decimal.Truncate(value));
     }
 
     static void WriteTime(TdsMsg msg, TimeSpan time)
