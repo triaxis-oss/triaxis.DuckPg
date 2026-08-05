@@ -14,8 +14,8 @@
     <Company>triaxis s.r.o.</Company>
     <Copyright>Copyright © triaxis s.r.o.</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/triaxis-oss/triaxis.Tools.DuckPg</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/triaxis-oss/triaxis.Tools.DuckPg</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/triaxis-oss/triaxis.DuckPg</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/triaxis-oss/triaxis.DuckPg</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>

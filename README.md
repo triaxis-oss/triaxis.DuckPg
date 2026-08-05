@@ -20,7 +20,7 @@ and what a client writes is an ordinary layer file another instance can read.
 ## Install
 
 ```shell
-dotnet tool install -g triaxis.Tools.DuckPg
+dotnet tool install -g triaxis.DuckPg.Cli
 ```
 
 The tool links against the DuckDB installed on the machine rather than bundling one:
@@ -61,7 +61,7 @@ duckpg ./common ./tenant --write ./local --key id
 psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
-Positional arguments are the layer directories, lowest first. `--listen`, `--write`,
+Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
 `--write-format`, `--writable`, `--schema`, `--key` (repeatable), `--dacpac`, `--cache` and
 `--config` each override the file when both are given; argument paths are relative to the working
 directory, file paths to the file. A file named explicitly with `--config` must exist, so a typo is
@@ -73,6 +73,89 @@ wire messages in both directions. Ctrl+C and SIGTERM shut down cooperatively.
 
 See [`example/`](example) for a lake with all three formats, a `db=…` partitioned layer, a write
 layer, virtual columns and per-user row filtering — `cd example && duckpg`.
+
+## Embedding it
+
+The tool is a thin shell over a library, so a test can have the same lake in-process — a real
+PostgreSQL and a real TDS front door, served over loopback, against files it wrote a moment ago.
+The point is not to fake a database: it is to hold your *client* stack — SqlClient, EF Core,
+whatever you actually ship — to the same wire it will meet in production.
+
+| Package | What it is |
+|---|---|
+| `triaxis.DuckPg` | the lake and both front doors |
+| `triaxis.DuckPg.Cli` | the `duckpg` command, which carries its own copy |
+
+Everything is registered through `Microsoft.Extensions.DependencyInjection`, and the lake is an
+`IHostedService`, so a host owns it:
+
+```csharp
+services.AddDuckPg(config =>
+{
+    config.Layers = ["./common", "./tenant"];
+    config.Write = "./local";
+    config.Tds = "127.0.0.1:0";     // port 0: the OS picks, and the lake says which
+});
+
+// after host.StartAsync
+var lake = host.Services.GetRequiredService<Lake>();
+using var connection = new SqlConnection(lake.SqlConnectionString());
+```
+
+`AddDuckPg` also takes an `IConfiguration` to bind, or a `Config` already built. The listeners bind
+during `StartAsync` rather than when serving begins, which is what makes port 0 useful: by the time
+the host is up, `lake.Endpoint` is the port to connect to.
+
+**Both doors are opt-in.** `listen` opens the PostgreSQL one, `tds` opens SQL Server's, and a lake
+needs at least one. A consumer speaking only TDS sets `Listen = null` and opens no listener it never
+uses.
+
+For more than one lake — one per tenant, one per exported database, each with different layers —
+register a factory instead. Each lake it hands back owns everything it was built from, so there is
+one thing to dispose and nothing to dispose in order:
+
+```csharp
+services.AddDuckPgFactory();
+
+var factory = provider.GetRequiredService<IDuckPgLakeFactory>();
+await using var lake = await factory.StartAsync(new Config
+{
+    Layers = [seed, exportDirectory],
+    Dacpac = dacpac,
+    Writable = true,              // writes live in memory; no directory needed
+    Tds = "127.0.0.1:0",
+    Listen = null,
+}, cancellation);
+
+// lake.SqlConnectionString()
+```
+
+Lakes from a factory are independent, so starting several concurrently is ordinary. A factory-built
+lake registers no hosted service, because the caller starts it; `AddDuckPg` is the one a host owns.
+
+**What cannot work is said before anything opens.** A layer directory or dacpac that is not there,
+a cache inside a layer, or no front door at all throws `DuckPgConfigurationException` naming the
+part that is wrong — rather than a lake that starts empty and a binder error much later.
+
+**Bring a native DuckDB.** Neither package carries one, because every platform's library together is
+420 MB and that is not a dependency's decision to make. Three ways, in the order they are looked for:
+
+- the machine already has one — `brew install duckdb`, `apt install libduckdb-dev`, or
+  `DUCKDB_LIBRARY` pointing at it;
+- add `DuckDB.NET.Data.Full` to your project, which brings the native for every RID;
+- `installDuckDb: true` in the configuration, which fetches the matching version into the local
+  application data directory the first time a lake finds none, and reuses it forever after. One
+  download per machine, not per run. `IDuckDbInstaller` is the same fetch on demand, for a caller
+  that would rather provision than discover.
+
+Without one, the error says where it looked and what the ways out are, rather than a
+`DllNotFoundException` naming a library nobody asked for.
+
+**Embedding is not free.** Measured by a consumer replaying a parquet export through EF Core and a
+legacy ORM: 37–38 s in-process against 30–32 s out-of-process for the same work, on a four-core box
+under load. The lake stops being a separate process and starts sharing a heap, a garbage collector
+and a thread pool with everything else the host is doing. What you buy is no executable on `PATH`,
+no port to coordinate, and a lake that lives and dies with the test — not speed.
 
 ## Layers
 
@@ -391,7 +474,7 @@ variables and the tool's usual override files layer over it for free.
 
 | Key | Argument | Meaning |
 |---|---|---|
-| `listen` | `--listen`, `-l` | PostgreSQL listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
+| `listen` | `--pgwire`, `-l` | PostgreSQL listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
 | `tds` | `--tds` | TDS listen address, e.g. `127.0.0.1:1433`. Off unless set. |
 | `schema` | `--schema` | Schema the published views live in. Default `lake`. |
 | `layers` | positional | Layer directories, lowest first. |
@@ -401,6 +484,7 @@ variables and the tool's usual override files layer over it for free.
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
 | `cache` | `--cache` | Directory for merged copies of multi-layer tables, as ZSTD parquet. |
+| `installDuckDb` | — | Fetch the native DuckDB when the machine has none, rather than failing. |
 | `sessionVariables` | — | DuckDB variable → startup parameter name. |
 | `columns` | — | Virtual columns added to every table lacking them. |
 | `tables.<name>.key` | — | What identifies a row in this table. |

@@ -6,9 +6,20 @@ someone changing the code needs.
 
 ## Where things are
 
+Two projects, and a package each: `src/triaxis.DuckPg` is the lake, and `src/triaxis.DuckPg.Cli` is
+the `duckpg` command and nothing else. The tool packs its whole publish output, so it carries the
+library rather than depending on it.
+
+`TestLake` stays in the test project. What a fixture owes a caller is a directory of layers and a
+connection string, and a caller embedding a lake writes its own layers anyway -- shipping one would
+publish a temp-directory convention as API.
+
 | File | What it owns |
 |---|---|
 | `ServeCommand.cs` | The CLI: arguments, the config file, argument-over-file precedence. |
+| `DuckPgServiceCollectionExtensions.cs` | `AddDuckPg` and `AddDuckPgFactory`: what a lake is made of, as registrations. |
+| `DuckPgLakeFactory.cs` | Lakes on demand, each owning the container it came out of. |
+| `DuckDbInstaller.cs` | `IDuckDbInstaller`: fetching DuckDB, for a lake starting and for `--install-duckdb` alike. |
 | `Config.cs` | The bound configuration. Every property here is part of the contract. |
 | `Lake.cs` | The composition root: DuckDB connection, schema, catalog, gateway, listeners. Tests use it too. |
 | `Layer.cs` | Scanning a layer directory, reading a source, writing one back. YAML ↔ JSON. |
@@ -80,6 +91,20 @@ someone changing the code needs.
   is most of what a small query costs. Hence: no cast to the type a layer already has, no merge
   wrapper around a table only one layer carries, and `--cache` writing a merged table out once as
   parquet. A plan cache above DuckDB would cache an object that re-plans anyway.
+- **A lake owns what it was built from, or nothing at all.** A factory-built lake holds its own
+  container and releases it on disposal, which is what lets a caller hold one object instead of two
+  with an ordering constraint; one resolved from someone else's container owns nothing of theirs.
+  `DisposeAsync` waits for the listeners, `Dispose` only cancels them -- a synchronous dispose that
+  blocked on a serving loop is the sync-over-async this exists to avoid.
+- **Both front doors are opt-in, and a lake needs one.** `PgServer.Enabled` and `TdsServer.Enabled`
+  read the same way, so a consumer speaking one protocol opens one listener. `Config.Validate` is
+  what makes "neither" an error rather than a lake nothing can reach.
+- **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckDbInstaller, LayerFormat,
+  DuckPgConfigurationException and DuckDbLibrary -- nothing else.**
+  The catalog, the gateway, the two protocols and `TSql/` are internal, which is why `Lake`'s
+  constructor is internal and `AddDuckPg` assembles it by hand: a public constructor would have to
+  take public parameters, and that would make every part of a lake an API. `InternalsVisibleTo`
+  covers the tool and the suite.
 - **AOT-clean**: no reflection-based serialization, no `JsonSerializer.Serialize<object>`. The
   project ships portable but the analysers stay on, so a regression shows up as a build warning
   (and warnings are errors here).
