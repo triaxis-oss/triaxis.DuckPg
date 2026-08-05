@@ -235,8 +235,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
     static IEnumerable<string> Quoted(IEnumerable<Column> columns) => columns.Select(c => SqlText.Quote(c.Name));
 
+    /// A sequence counts in BIGINT whatever the column is declared as, and the answer is read off
+    /// the rows rather than off the table -- so the declared type has to be put back here, or a
+    /// caller reading its own `int` key gets a long.
     static IEnumerable<string> NextValues(Table table, IEnumerable<Column> columns) =>
-        columns.Select(c => $"nextval({SqlText.Literal(Catalog.Sequence(table, c))})");
+        columns.Select(c => $"CAST(nextval({SqlText.Literal(Catalog.Sequence(table, c))}) AS {c.Type})");
 
     /// The columns an OUTPUT clause reads, which is the first name of each item it lists.
     static IEnumerable<string> Answered(string clause) =>

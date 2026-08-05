@@ -204,7 +204,9 @@ publish a temp-directory convention as API.
   highest value the merged view holds when the table grows its write branch -- at build for a table
   that already carries rows, in the promotion otherwise, which is the only moment the count is both
   needed and cheap. `Gateway.Generated` fills it for any insert that leaves it out, so the plain
-  statement and the answered one decide it the same way. It is per process, so two serving the same
+  statement and the answered one decide it the same way -- cast back to the declared type, since a
+  sequence counts in BIGINT whatever the column is and the answer is read off the rows rather than
+  off the table, which is how an `int` key reached SqlClient as a long. It is per process, so two serving the same
   write directory would collide; and an OUTPUT naming anything else a lake does not generate is
   refused, since the alternative is answering with a null the caller would store.
 - **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**

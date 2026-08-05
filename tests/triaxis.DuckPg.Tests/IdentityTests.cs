@@ -7,8 +7,8 @@ namespace triaxis.DuckPg.Tests;
 /// the answering are held to the same client that does it.
 public class IdentityTests
 {
-    static readonly Dacpac.TableModel Orders = new("orders",
-        [("id", "bigint"), ("amount", "decimal")], ["id"], Identity: ["id"]);
+    static Dacpac.TableModel Orders(string type) => new("orders",
+        [("id", type), ("amount", "decimal")], ["id"], Identity: ["id"]);
 
     static TestLake Lake() => new TestLake(nameof(IdentityTests))
         .Json("base", "orders", """[{"id": 41, "amount": 5}]""")
@@ -16,9 +16,9 @@ public class IdentityTests
         .WriteTo("local")
         .WithTds();
 
-    static TestLake Started(TestLake lake)
+    static TestLake Started(TestLake lake, string type = "bigint")
     {
-        Dacpac.Write(lake.At("schema", "test.dacpac"), Orders);
+        Dacpac.Write(lake.At("schema", "test.dacpac"), Orders(type));
         lake.Config.Dacpac = lake.At("schema", "test.dacpac");
         return lake.Start();
     }
@@ -81,6 +81,27 @@ public class IdentityTests
                 .ExecuteNonQuery());
 
         Assert.Contains("cannot be answered", refused.Message);
+    }
+
+    /// A sequence counts in BIGINT whatever the column was declared as, and the key is read back
+    /// off the rows that were written rather than off the table -- so an application casting its own
+    /// `int` key gets one, as it would from the database this stands in for.
+    [Theory]
+    [InlineData("int", typeof(int))]
+    [InlineData("bigint", typeof(long))]
+    public void TheKeyComesBackAsTheTypeItWasDeclared(string type, Type expected)
+    {
+        using var lake = Started(Lake(), type);
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(
+            "INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[id] VALUES (1)", connection);
+        using var reader = command.ExecuteReader();
+
+        Assert.True(reader.Read());
+        Assert.Equal(expected, reader.GetFieldType(0));
+        Assert.Equal(42L, Convert.ToInt64(reader.GetValue(0)));
     }
 
     /// The PostgreSQL side writes the same statement in DuckDB's own words, and is answered the
