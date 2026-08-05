@@ -333,8 +333,8 @@ fails differently. psql works too, but it is not what the shims are maintained f
 
 ```shell
 dotnet build
-dotnet test          # 139 tests: layers, the write layer, dacpac schemas, the T-SQL parser,
-                     #             and Npgsql + SqlClient conformance
+dotnet test          # layers, the write layer, dacpac schemas, the T-SQL parser,
+                     # and Npgsql + SqlClient conformance
 ```
 
 The tests carry their own DuckDB — the native library is pulled out of `DuckDB.NET.Bindings.Full`
