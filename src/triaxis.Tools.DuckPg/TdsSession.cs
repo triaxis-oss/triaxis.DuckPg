@@ -18,6 +18,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     readonly Dictionary<string, string> login = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<int, Prepared> prepared = [];
     readonly HashSet<string> pendingWrites = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> pendingPromotions = new(StringComparer.OrdinalIgnoreCase);
 
     /// What SqlClient believes the version of this server is. It gates features on it, and a
     /// version it does not know is a version it will not talk to.
@@ -302,6 +303,14 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// which is the same rule the PostgreSQL session follows.
     void Persist(Plan plan)
     {
+        // A promotion is part of the write that caused it: it survives exactly as long, and a
+        // rolled-back one is simply made again by the next write rather than assumed to be there.
+        if (plan.Promoted is { } promoted)
+        {
+            if (transactions > 0) pendingPromotions.Add(promoted);
+            else gateway.Promoted(promoted);
+        }
+
         if (plan.Dirty is { } dirty)
         {
             if (transactions > 0) pendingWrites.Add(dirty);
@@ -309,11 +318,14 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
         else if (plan.Tag == "COMMIT")
         {
+            foreach (var table in pendingPromotions) gateway.Promoted(table);
             foreach (var table in pendingWrites) gateway.Persist(table);
+            pendingPromotions.Clear();
             pendingWrites.Clear();
         }
         else if (plan.Tag == "ROLLBACK")
         {
+            pendingPromotions.Clear();
             pendingWrites.Clear();
         }
     }

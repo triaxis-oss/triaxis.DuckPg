@@ -31,6 +31,15 @@ someone changing the code needs.
 - **Layer sequence numbers decide everything.** Read layers are 0..n-1 in configured order, the
   write layer is n. `QUALIFY … ORDER BY _seq DESC` is what makes a higher layer shadow a lower one,
   and a tombstone only hides rows with `_seq < writeSeq`.
+- **A write branch is earned, not assumed.** A writable table with no file in the write directory
+  is published as though it were read-only; `Gateway.Promoting` prepends `Catalog.Promotion` to the
+  first write's plan, so the branch appears on the writing session's connection inside its
+  transaction. `Catalog.promoted` is only set once that write commits -- a rolled-back promotion is
+  made again rather than assumed, which is why the DDL is `IF NOT EXISTS` and the view rewrite is
+  `CREATE OR REPLACE`. A table whose directory already holds rows or tombstones is prepared at
+  build, because those rows have to be loaded. A `--cache` copy survives the promotion:
+  `Catalog.Underlay` puts it below the write branch, since the copy is the read layers and a write
+  does not touch those.
 - **The write layer holds effective state, not a log.** A deleted row leaves the write table and
   gains a tombstone; a re-inserted one comes back with no tombstone bookkeeping. There is no
   per-row sequence number, and adding one back means re-deriving what shadows what.

@@ -44,6 +44,15 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
 {
     public Dictionary<string, Table> Tables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// Which writable tables actually carry a write branch. A view is bound on every execution, so
+    /// the branch and the tombstone check are paid for by every read of a table nobody has written
+    /// to -- which, on a lake serving mostly reads, is most of them.
+    readonly HashSet<string> promoted = new(StringComparer.OrdinalIgnoreCase);
+
+    /// Where each cached table's copy landed. A write does not invalidate it -- the copy is the read
+    /// layers, which no write touches -- so it stays underneath the write branch.
+    readonly Dictionary<string, string> copies = new(StringComparer.OrdinalIgnoreCase);
+
     /// Schema holding the materialised YAML and JSON layers.
     const string LayerSchema = "layer";
 
@@ -72,10 +81,13 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                                   KeyFor(name, settings, columns, partitions),
                                   writable, writeSource, settings.Filter);
 
-            if (table.Writable) write.Prepare(conn, table);
-            Exec(conn, Cached(conn, table) is { } file
-                ? $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Over(table, file)}"
-                : ViewDefinition(table));
+            // A writable table the directory holds nothing for is published as though it were not
+            // writable, and grows its write branch when something first writes to it.
+            var carries = table.Writable && write.Carries(table);
+            if (carries) { write.Prepare(conn, table); promoted.Add(name); }
+
+            if (!carries && Cached(conn, table) is { } file) copies[name] = file;
+            Exec(conn, ViewDefinition(table, carries));
             Tables[name] = table;
         }
 
@@ -85,6 +97,8 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     public void Rebuild(DuckDBConnection conn)
     {
         Tables.Clear();
+        promoted.Clear();
+        copies.Clear();
         Build(conn);
     }
 
@@ -340,9 +354,9 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     /// does not qualify.
     string? Cached(DuckDBConnection conn, Table table)
     {
-        if (config.Cache is not { Length: > 0 } cache || table.Writable || table.Layers.Count < 2) return null;
+        if (config.Cache is not { Length: > 0 } cache || table.Layers.Count < 2) return null;
 
-        var merged = Merged(table, defaults: !Deferrable(table));
+        var merged = Merged(table, writable: false, defaults: !Deferrable(table));
         Directory.CreateDirectory(cache);
         var file = Path.Combine(cache, $"{table.Name}-{Fingerprint(Signature(table), table.Layers)}.parquet").Replace('\\', '/');
 
@@ -428,11 +442,42 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                   + $" AS {SqlText.Quote(c.Name)}")) + $" FROM {Scan(file)}"
             : $"SELECT * FROM {Scan(file)}";
 
-    string ViewDefinition(Table table) =>
-        $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table)}";
+    string ViewDefinition(Table table, bool writable) =>
+        $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table, writable)}";
 
-    string Merged(Table table, bool defaults = true)
+    /// The copy standing in for the read layers it was made from. A write adds a branch above it
+    /// rather than replacing it: the copy *is* the read layers, and a write does not touch those.
+    /// Only a copy of a plain merge can serve -- one made under a filter or a virtual column has
+    /// those baked into it, and the wrapper would apply them twice.
+    string? Underlay(Table table) =>
+        Deferrable(table) && copies.TryGetValue(table.Name, out var file) ? file : null;
+
+    /// What a first write to a table costs: the tables the write layer keeps for it, and the view
+    /// rewritten to read them. Repeatable on purpose -- a statement that rolled back leaves the
+    /// catalog as it was, and the next write says the same thing again.
+    public string[] Promotion(Table table) =>
+        [.. write.Definition(table, ifNotExists: true), ViewDefinition(table, writable: true)];
+
+    public bool Promoted(Table table) => promoted.Contains(table.Name);
+
+    /// Recorded only once a write has actually committed, so a rolled-back promotion is simply said
+    /// again rather than assumed.
+    public void Promote(string name) => promoted.Add(name);
+
+    string Merged(Table table, bool writable, bool defaults = true)
     {
+        // Everything the read layers say, already merged and written down once. Below the write
+        // branch, so a tombstone hides it and a written row shadows it, exactly as a layer would.
+        if (Underlay(table) is { } copy)
+            return Wrap(table, writable, [
+                "SELECT " + string.Join(", ", table.Columns.Select(c =>
+                     (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
+                     + $" AS {SqlText.Quote(c.Name)}")) +
+                 $", NULL::VARCHAR AS \"_file\", 0::BIGINT AS \"_seq\" FROM {Scan(copy)}",
+                .. writable
+                    ? (string[])[Branch(table, table.Columns, table.WriteName, write.Seq, named: false, defaults: false)]
+                    : []]);
+
         // One layer and nothing to merge it with: the table *is* that layer, and everything the
         // merge needs around it -- the union, the sequence numbers, the row numbering that picks a
         // winner, the projection renaming each column to itself -- is an expression DuckDB binds
@@ -441,25 +486,12 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         //
         // A filter or a virtual column reads the merged row rather than the file's, so those keep
         // the wrapper they are written against.
-        if (!table.Writable && table.Layers is [var only] && table.Virtuals.Count == 0 && table.Filter is null)
+        if (!writable && table.Layers is [var only] && table.Virtuals.Count == 0 && table.Filter is null)
             return "SELECT " +
                    string.Join(", ", table.Columns.Select(c =>
                        (Value(c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)
                         ?? $"CAST(NULL AS {c.Type})") + $" AS {SqlText.Quote(c.Name)}")) +
                    $" FROM {only.Scan}";
-
-        var projection = string.Join(", ", table.Columns.Select(Source)
-            .Concat(table.Virtuals.Select(v => $"({v.Expr}) AS {SqlText.Quote(v.Name)}")));
-
-        // A column nothing below produces -- one the schema declares that no layer carries, or a
-        // virtual one's base -- still has to be projected, as a typed NULL. The write layer always
-        // has every column, and a read layer produces a defaulted one whether it carries it or not.
-        string Source(Column column) =>
-            (table.Writable
-             || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
-             || (defaults && column.Default is not null && table.Layers.Count > 0)
-                ? $"r.{SqlText.Quote(column.Name)}"
-                : $"CAST(NULL AS {column.Type})") + $" AS {SqlText.Quote(column.Name)}";
 
         // Each branch names its own columns and casts them to the published type; UNION ALL BY NAME
         // fills a layer's gaps with NULL. Only a read layer fills its gaps with the declared default
@@ -467,13 +499,31 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         // was not.
         var layers = table.Layers.Select(layer => Branch(table, layer.Columns, layer.Scan, layer.Source.Seq,
                                                          layer.Source.HasFileName, defaults)).ToList();
-        if (table.Writable)
+        if (writable)
             layers.Add(Branch(table, table.Columns, table.WriteName, write.Seq, named: false, defaults: false));
         if (layers.Count == 0)
             layers.Add("SELECT NULL::VARCHAR AS \"_file\", 0::BIGINT AS \"_seq\" WHERE false");
 
+        // A column nothing below produces -- one the schema declares that no layer carries, or a
+        // virtual one's base -- still has to be projected, as a typed NULL. The write layer always
+        // has every column, and a read layer produces a defaulted one whether it carries it or not.
+        return Wrap(table, writable, layers, column =>
+            writable
+            || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
+            || (defaults && column.Default is not null && table.Layers.Count > 0));
+    }
+
+    /// The merge around a set of branches: what it publishes, what a tombstone hides, and which row
+    /// wins where several carry the same key.
+    string Wrap(Table table, bool writable, List<string> layers, Func<Column, bool>? produced = null)
+    {
+        var projection = string.Join(", ", table.Columns
+            .Select(c => (produced?.Invoke(c) ?? true ? $"r.{SqlText.Quote(c.Name)}" : $"CAST(NULL AS {c.Type})")
+                         + $" AS {SqlText.Quote(c.Name)}")
+            .Concat(table.Virtuals.Select(v => $"({v.Expr}) AS {SqlText.Quote(v.Name)}")));
+
         var where = new List<string>();
-        if (table.Writable && table.Key.Length > 0)
+        if (writable && table.Key.Length > 0)
         {
             var match = string.Join(" AND ", table.Key.Select(k =>
                 $"d.{SqlText.Quote(k)} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"));
