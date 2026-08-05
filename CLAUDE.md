@@ -21,6 +21,7 @@ someone changing the code needs.
 | `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
 | `SqlText.cs` | Enough SQL scanning to find top-level keywords without a parser. |
 | `DuckDbLibrary.cs` | Finding the machine's DuckDB, and the AOT dependencies DuckDB.NET needs. |
+| `DuckDbDownload.cs` | Fetching that library from DuckDB's releases, when asked and only then. |
 
 ## Invariants worth not breaking
 
@@ -80,6 +81,13 @@ someone changing the code needs.
   plain scalars. The conversion walks the node model and writes through `Utf8JsonWriter`.
 - JSON type inference reads every integer as `BIGINT`; that is why a parquet layer's type wins, and
   why a dacpac is worth having.
+- Loading a half-written native library aborts the process with SIGBUS rather than failing, so
+  nothing is left to report it -- which is why `DuckDbLibrary` checks a candidate's size before
+  trying it, and why a download is unpacked into a staging directory beside its target and renamed
+  onto it -- beside it, so the rename stays on one filesystem and cannot half happen.
+- A `CommandErrorException` whose template has more holes than arguments is logged as nothing at
+  all -- the exit code arrives, the message does not. Count them, or build the text and pass it as
+  one argument.
 
 ## What TDS demanded, and does not say out loud
 
