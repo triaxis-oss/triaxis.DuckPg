@@ -172,16 +172,44 @@ public class TSqlTests
         """UPDATE "lake"."orders" AS "o" SET "amount" = "s"."amount" FROM "lake"."staging" AS "s" WHERE "o"."id" = "s"."id" """)]
     public void RendersWrites(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// What EF Core sends a batch of rows as: the rows are the USING clause, `ON 1=0` says the
+    /// matched branch is unreachable, and the insert branch takes every one of them.
+    [Fact]
+    public void MergeOverAConditionThatCannotMatchIsAnInsert()
+    {
+        Assert.Equal(
+            """INSERT INTO "lake"."orders" ("order_id", "amount") SELECT "i"."order_id", "i"."amount" """ +
+            """FROM (VALUES ($p0, $p1, 0), ($p2, $p3, 1)) AS "i" ("order_id", "amount", "_Position")""",
+            Translate("""
+                MERGE [orders] USING (
+                VALUES (@p0, @p1, 0), (@p2, @p3, 1)) AS i ([order_id], [amount], _Position)
+                ON 1=0
+                WHEN NOT MATCHED THEN
+                INSERT ([order_id], [amount]) VALUES (i.[order_id], i.[amount]);
+                """, "p0", "p1", "p2", "p3"));
+    }
+
     [Theory]
     // Anything that changes which rows exist is the layer machinery's business, not one statement's.
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE")]
-    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "WHEN MATCHED THEN UPDATE")]
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)",
+        "a condition that cannot match")]
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED AND f.x > 1 THEN UPDATE SET a.x = f.x",
         "WHEN MATCHED AND")]
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x " +
-        "WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "WHEN MATCHED THEN UPDATE")]
+        "WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "only one MERGE branch")]
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x OUTPUT inserted.x",
         "OUTPUT")]
+    // An insert branch over a condition that can match is an insert of what is not already there,
+    // and what "already there" means when the row is in a layer below is not one statement's call.
+    [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON t.id = i.id WHEN NOT MATCHED THEN INSERT (id) VALUES (i.id)",
+        "a condition that cannot match")]
+    [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        "NOT MATCHED BY SOURCE")]
+    // The key EF Core asks for back is the one thing a lake cannot make up.
+    [InlineData("MERGE t USING (VALUES (1, 0)) AS i (id, _Position) ON 1=0 WHEN NOT MATCHED THEN " +
+        "INSERT (id) VALUES (i.id) OUTPUT INSERTED.id, i._Position",
+        "has no value to read back")]
     public void RefusesTheMergeBranchesItDoesNotDo(string tsql, string expected) =>
         Assert.Contains(expected, Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
 

@@ -189,6 +189,13 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **`MERGE` is whichever statement its branch means.** `WHEN MATCHED THEN UPDATE` is an update
+  joined to its source. `WHEN NOT MATCHED THEN INSERT` over a condition that cannot match --
+  `TSqlParser.Never`, which is EF Core's `ON 1=0` -- is a multi-row insert, and that is how a batch
+  of rows arrives. A condition that *can* match is refused: what "already there" means when the row
+  it would shadow is in a layer below is the layer machinery's, not one statement's. `OUTPUT` is
+  refused with it -- a lake stores the row it is given, so a column the statement does not insert
+  has nothing to read back, which is exactly the store-generated key EF asks for.
 - **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**
   `SAVE TRANSACTION` renders to nothing -- marking a point costs nothing -- but
   `ROLLBACK TRANSACTION <name>` throws instead of rendering a plain `ROLLBACK` or nothing at all:
