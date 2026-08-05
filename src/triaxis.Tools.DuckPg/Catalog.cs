@@ -175,7 +175,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                         throw new InvalidOperationException($"a view is one query, not {translated.Count}");
 
                     Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} " +
-                               $"AS {translated[0]}");
+                                  $"AS {translated[0]}");
                     pending.Remove(name);
                     published++;
                 }
@@ -220,7 +220,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             using var command = conn.CreateCommand();
             command.CommandText = $"SELECT CAST({expr} AS {type})::VARCHAR";
             declared = command.ExecuteScalar() is string value
-                ? new ColumnDefault(expr, $"CAST({SqlText.Literal(value)} AS {type})")
+                ? new ColumnDefault(expr, Literal(conn, value, type))
                 : null;
             logger.LogDebug("default {Expression} is {Expr}, worth {Value}",
                 expression, expr, declared?.Value ?? "NULL");
@@ -233,6 +233,28 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
 
         evaluated[(expression, type)] = declared;
         return declared;
+    }
+
+    /// A default is written into every read layer's branch, so it is worth one expression rather
+    /// than two -- but only where the bare literal already is the column's type. DuckDB is asked
+    /// rather than guessed at: a literal of any other type would let the `COALESCE` around it widen
+    /// the branch past what the catalog publishes, and `1.0` is a `DECIMAL` where the column is a
+    /// `DOUBLE`.
+    static string Literal(DuckDBConnection conn, string value, string type)
+    {
+        foreach (var candidate in (string[])[value, SqlText.Literal(value)])
+            try
+            {
+                using var command = conn.CreateCommand();
+                command.CommandText = $"SELECT typeof({candidate})";
+                if (command.ExecuteScalar() is string actual && Same(actual, type)) return candidate;
+            }
+            catch (DuckDBException)
+            {
+                // Not an expression at all -- an unquoted string, say. The cast covers it.
+            }
+
+        return $"CAST({SqlText.Literal(value)} AS {type})";
     }
 
     // ---- the published shape ---------------------------------------------------------------------
@@ -361,9 +383,13 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     {
         // A layer that carries the column still has rows leaving it empty, so the default goes over
         // the value rather than only where the column is missing from the file altogether.
-        string? Value(Column column, bool present)
+        string? Value(Column column, Column? source)
         {
-            var value = present ? $"CAST({SqlText.Quote(column.Name)} AS {column.Type})" : null;
+            // A cast to the type the layer already has is an expression DuckDB binds on every
+            // statement and nothing else -- and a view is bound per execution, not per lake.
+            var value = source is null ? null
+                : Same(source.Type, column.Type) ? SqlText.Quote(column.Name)
+                : $"CAST({SqlText.Quote(column.Name)} AS {column.Type})";
             var fill = defaults ? column.Default?.Value : null;
             return (value, fill) switch
             {
@@ -375,7 +401,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         }
 
         var columns = string.Join(", ", table.Columns
-            .Select(c => (Column: c, Value: Value(c, available.Any(a => Same(a.Name, c.Name)))))
+            .Select(c => (Column: c, Value: Value(c, available.FirstOrDefault(a => Same(a.Name, c.Name)))))
             .Where(c => c.Value is not null)
             .Select(c => $"{c.Value} AS {SqlText.Quote(c.Column.Name)}"));
 
