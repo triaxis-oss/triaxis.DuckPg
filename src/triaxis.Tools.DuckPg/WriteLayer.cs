@@ -47,7 +47,11 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
     /// One that does has to be loaded when the lake is built; one that does not has nothing to say
     /// until something writes to it.
     public bool Carries(Table table) =>
-        Directory is not null && (table.WriteSource is not null || Tombstones(table) is not null);
+        Directory is not null && (table.WriteSource is not null || HasTombstones(table));
+
+    /// Whether anything has ever been hidden below. Until something has, the view's tombstone check
+    /// is a subquery over an empty table that every read of it binds and no read of it needs.
+    public bool HasTombstones(Table table) => Directory is not null && Tombstones(table) is not null;
 
     /// The tables the write layer keeps for one lake table, as statements. `IF NOT EXISTS` makes the
     /// on-demand path safe to repeat: a statement that rolled back leaves nothing behind, and one

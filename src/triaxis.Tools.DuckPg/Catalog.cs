@@ -49,6 +49,11 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     /// to -- which, on a lake serving mostly reads, is most of them.
     readonly HashSet<string> promoted = new(StringComparer.OrdinalIgnoreCase);
 
+    /// Which of those have ever hidden a row below. The tombstone check costs the same whatever the
+    /// table looks like -- one subquery over one key column -- so it is worth not binding until a
+    /// row has actually been hidden.
+    readonly HashSet<string> tombstoned = new(StringComparer.OrdinalIgnoreCase);
+
     /// Where each cached table's copy landed. A write does not invalidate it -- the copy is the read
     /// layers, which no write touches -- so it stays underneath the write branch.
     readonly Dictionary<string, string> copies = new(StringComparer.OrdinalIgnoreCase);
@@ -85,9 +90,10 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             // writable, and grows its write branch when something first writes to it.
             var carries = table.Writable && write.Carries(table);
             if (carries) { write.Prepare(conn, table); promoted.Add(name); }
+            if (carries && write.HasTombstones(table)) tombstoned.Add(name);
 
             if (!carries && Cached(conn, table) is { } file) copies[name] = file;
-            Exec(conn, ViewDefinition(table, carries));
+            Exec(conn, ViewDefinition(table, carries, tombstoned.Contains(name)));
             Tables[name] = table;
         }
 
@@ -98,6 +104,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     {
         Tables.Clear();
         promoted.Clear();
+        tombstoned.Clear();
         copies.Clear();
         Build(conn);
     }
@@ -356,7 +363,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     {
         if (config.Cache is not { Length: > 0 } cache || table.Layers.Count < 2) return null;
 
-        var merged = Merged(table, writable: false, defaults: !Deferrable(table));
+        var merged = Merged(table, writable: false, tombstones: false, defaults: !Deferrable(table));
         Directory.CreateDirectory(cache);
         var file = Path.Combine(cache, $"{table.Name}-{Fingerprint(Signature(table), table.Layers)}.parquet").Replace('\\', '/');
 
@@ -442,8 +449,8 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                   + $" AS {SqlText.Quote(c.Name)}")) + $" FROM {Scan(file)}"
             : $"SELECT * FROM {Scan(file)}";
 
-    string ViewDefinition(Table table, bool writable) =>
-        $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table, writable)}";
+    string ViewDefinition(Table table, bool writable, bool tombstones) =>
+        $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table, writable, tombstones)}";
 
     /// The copy standing in for the read layers it was made from. A write adds a branch above it
     /// rather than replacing it: the copy *is* the read layers, and a write does not touch those.
@@ -455,21 +462,26 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
     /// What a first write to a table costs: the tables the write layer keeps for it, and the view
     /// rewritten to read them. Repeatable on purpose -- a statement that rolled back leaves the
     /// catalog as it was, and the next write says the same thing again.
-    public string[] Promotion(Table table) =>
-        [.. write.Definition(table, ifNotExists: true), ViewDefinition(table, writable: true)];
+    public string[] Promotion(Table table, bool tombstones) =>
+        [.. write.Definition(table, ifNotExists: true),
+         ViewDefinition(table, writable: true, tombstones || Tombstoned(table))];
 
     public bool Promoted(Table table) => promoted.Contains(table.Name);
+
+    public bool Tombstoned(Table table) => tombstoned.Contains(table.Name);
 
     /// Recorded only once a write has actually committed, so a rolled-back promotion is simply said
     /// again rather than assumed.
     public void Promote(string name) => promoted.Add(name);
 
-    string Merged(Table table, bool writable, bool defaults = true)
+    public void Tombstone(string name) => tombstoned.Add(name);
+
+    string Merged(Table table, bool writable, bool tombstones, bool defaults = true)
     {
         // Everything the read layers say, already merged and written down once. Below the write
         // branch, so a tombstone hides it and a written row shadows it, exactly as a layer would.
         if (Underlay(table) is { } copy)
-            return Wrap(table, writable, [
+            return Wrap(table, writable, tombstones, [
                 "SELECT " + string.Join(", ", table.Columns.Select(c =>
                      (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
                      + $" AS {SqlText.Quote(c.Name)}")) +
@@ -507,7 +519,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
         // A column nothing below produces -- one the schema declares that no layer carries, or a
         // virtual one's base -- still has to be projected, as a typed NULL. The write layer always
         // has every column, and a read layer produces a defaulted one whether it carries it or not.
-        return Wrap(table, writable, layers, column =>
+        return Wrap(table, writable, tombstones, layers, column =>
             writable
             || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column.Name)))
             || (defaults && column.Default is not null && table.Layers.Count > 0));
@@ -515,7 +527,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
 
     /// The merge around a set of branches: what it publishes, what a tombstone hides, and which row
     /// wins where several carry the same key.
-    string Wrap(Table table, bool writable, List<string> layers, Func<Column, bool>? produced = null)
+    string Wrap(Table table, bool writable, bool tombstones, List<string> layers, Func<Column, bool>? produced = null)
     {
         var projection = string.Join(", ", table.Columns
             .Select(c => (produced?.Invoke(c) ?? true ? $"r.{SqlText.Quote(c.Name)}" : $"CAST(NULL AS {c.Type})")
@@ -523,7 +535,7 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             .Concat(table.Virtuals.Select(v => $"({v.Expr}) AS {SqlText.Quote(v.Name)}")));
 
         var where = new List<string>();
-        if (writable && table.Key.Length > 0)
+        if (tombstones && table.Key.Length > 0)
         {
             var match = string.Join(" AND ", table.Key.Select(k =>
                 $"d.{SqlText.Quote(k)} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"));

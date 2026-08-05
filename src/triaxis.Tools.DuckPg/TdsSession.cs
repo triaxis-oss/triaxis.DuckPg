@@ -19,6 +19,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     readonly Dictionary<int, Prepared> prepared = [];
     readonly HashSet<string> pendingWrites = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> pendingPromotions = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> pendingTombstones = new(StringComparer.OrdinalIgnoreCase);
 
     /// What SqlClient believes the version of this server is. It gates features on it, and a
     /// version it does not know is a version it will not talk to.
@@ -311,6 +312,12 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             else gateway.Promoted(promoted);
         }
 
+        if (plan.Tombstoned is { } tombstoned)
+        {
+            if (transactions > 0) pendingTombstones.Add(tombstoned);
+            else gateway.Tombstoned(tombstoned);
+        }
+
         if (plan.Dirty is { } dirty)
         {
             if (transactions > 0) pendingWrites.Add(dirty);
@@ -319,13 +326,16 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         else if (plan.Tag == "COMMIT")
         {
             foreach (var table in pendingPromotions) gateway.Promoted(table);
+            foreach (var table in pendingTombstones) gateway.Tombstoned(table);
             foreach (var table in pendingWrites) gateway.Persist(table);
             pendingPromotions.Clear();
+            pendingTombstones.Clear();
             pendingWrites.Clear();
         }
         else if (plan.Tag == "ROLLBACK")
         {
             pendingPromotions.Clear();
+            pendingTombstones.Clear();
             pendingWrites.Clear();
         }
     }

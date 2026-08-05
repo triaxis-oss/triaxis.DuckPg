@@ -9,7 +9,7 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// the last one supplies the row count unless `Affected` names a query that knows better, which a
 /// rewritten DML statement does -- what it touches is not what its last step writes.
 sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string? Dirty = null,
-                   string? Promoted = null)
+                   string? Promoted = null, string? Tombstoned = null)
 {
     public static Plan Rows(string sql) => new(PlanKind.Rows, [sql], "SELECT");
     public static Plan Count(string tag, params string[] steps) => new(PlanKind.Count, steps, tag);
@@ -198,6 +198,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         RejectVirtual(table, assignments.Keys, "UPDATE");
 
+        // The rewritten row lands in the write layer under the key it already had, where it shadows
+        // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
+        // the old one behind with nothing above it, and that is what has to be hidden.
+        var moves = table.Key.Any(assignments.ContainsKey);
+
         // With a FROM clause the target's own columns are no longer the only ones in scope, so
         // everything the statement did not assign has to say which table it came from.
         var target = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
@@ -215,12 +220,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
         return Promoting(table, Plan.Count("UPDATE",
-            Keys(table, scan, qualifier, predicate),
+            [Keys(table, scan, qualifier, predicate),
             $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
-            Tombstone(table),
+            .. moves ? (string[])[Tombstone(table)] : [],
             Evict(table),
-            $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated")
-            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name });
+            $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"])
+            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name }, tombstones: moves);
     }
 
     Plan RewriteDelete(string sql)
@@ -237,7 +242,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             Keys(table, table.QualifiedName, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
             Evict(table))
-            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name });
+            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name }, tombstones: true);
     }
 
     /// The keys a statement touches, taken from the merged view before anything moves.
@@ -279,16 +284,30 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// A table nobody has written to carries no write branch, so the first write puts one there
     /// before the rest of the plan runs -- on the session's own connection and inside its own
     /// transaction, so a statement that rolls back takes the promotion with it.
-    Plan Promoting(Table table, Plan plan) =>
-        Catalog.Promoted(table)
-            ? plan
-            : plan with { Steps = [.. Catalog.Promotion(table), .. plan.Steps], Promoted = table.Name };
+    Plan Promoting(Table table, Plan plan, bool tombstones = false)
+    {
+        if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) return plan;
+
+        return plan with
+        {
+            Steps = [.. Catalog.Promotion(table, tombstones), .. plan.Steps],
+            Promoted = table.Name,
+            Tombstoned = tombstones ? table.Name : null,
+        };
+    }
 
     /// Remembered only once the write has committed: a promotion that rolled back is simply made
     /// again by the next write, which is why `Promotion` is repeatable.
     public void Promoted(string name)
     {
         lock (gate) Catalog.Promote(name);
+    }
+
+    /// The first row hidden below is what puts the tombstone check into the view -- until then it is
+    /// a subquery over an empty table that every read binds and no read needs.
+    public void Tombstoned(string name)
+    {
+        lock (gate) Catalog.Tombstone(name);
     }
 
     Table? Writable(string? schema, string name)
