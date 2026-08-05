@@ -286,9 +286,11 @@ public class SchemaTests
         }
     }
 
-    /// A writable table's rows change under any copy of them, so it keeps the merge.
+    /// A writable table nobody has written to is published like any other -- cached, with no write
+    /// branch to bind. The first write puts the branch there and the merge takes over, so the rows
+    /// are the merged ones from that point on.
     [Fact]
-    public void AWritableTableIsNotCached()
+    public void AWritableTableIsCachedUntilItIsWrittenTo()
     {
         var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
         try
@@ -302,17 +304,34 @@ public class SchemaTests
             lake.Config.Cache = cache;
             lake.Start();
 
+            string Definition() => lake.Query(
+                "SELECT sql FROM duckdb_views() WHERE schema_name = 'lake' AND view_name = 'orders'")[0];
+
+            // Nothing written: no write branch to bind, and the copy stands in for the merge.
+            Assert.Single(Directory.GetFiles(cache, "orders-*.parquet"));
+            Assert.Contains("read_parquet", Definition());
+            Assert.DoesNotContain("wr.", Definition());
+
             lake.Query("INSERT INTO lake.orders (order_id, amount) VALUES (3, 30.00)");
+
+            // Written: the branch is there, the tombstone check with it -- and the copy is still
+            // underneath it, because a write does not touch the read layers the copy was made from.
+            Assert.Contains("UNION ALL BY NAME", Definition());
+            Assert.Contains("read_parquet", Definition());
+            Assert.DoesNotContain("layer.", Definition());
             Assert.Equal(["1|10.00", "2|20.00", "3|30.00"],
                 lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
-            Assert.Empty(Directory.Exists(cache) ? Directory.GetFiles(cache, "orders-*.parquet") : []);
+
+            // And it survives the round trip to the files, which is what a write layer is for.
+            lake.Restart();
+            Assert.Equal(["1|10.00", "2|20.00", "3|30.00"],
+                lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
         }
         finally
         {
             if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
         }
     }
-
 
     /// The copy is keyed by what produced it, so a restart over unchanged files reuses it -- and a
     /// layer that did change lands on a different key rather than being answered with the old rows.
@@ -383,6 +402,82 @@ public class SchemaTests
             var second = lake.Query("SELECT token FROM lake.orders ORDER BY order_id");
             Assert.Equal(second[0], second[1]);
             Assert.NotEqual(first[0], second[0]);
+        }
+        finally
+        {
+            if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
+        }
+    }
+
+
+    /// A promotion is part of the write that caused it. Rolled back, it has to be gone from DuckDB
+    /// *and* from what the catalog believes, or the next write inserts into a table that is not
+    /// there any more.
+    [Fact]
+    public void APromotionRolledBackIsMadeAgainByTheNextWrite()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", "SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2))) t(order_id, amount)")
+            .Json("top", "orders", """[{"order_id": 2, "amount": 20}]""")
+            .Stack("base", "top")
+            .WriteTo("local");
+        lake.Config.DefaultKey = ["order_id"];
+        lake.Start();
+
+        using (var connection = lake.Connect())
+        {
+            void Run(string sql)
+            {
+                using var command = new Npgsql.NpgsqlCommand(sql, connection);
+                command.ExecuteNonQuery();
+            }
+            Run("BEGIN");
+            Run("INSERT INTO lake.orders (order_id, amount) VALUES (3, 30.00)");
+            Run("ROLLBACK");
+        }
+
+        Assert.Equal(["1|10.00", "2|20.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        // The second write has to promote again rather than assume the first one's tables.
+        lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (4, 40.00)");
+        Assert.Equal(["1|10.00", "2|20.00", "4|40.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+        lake.Restart();
+        Assert.Equal(["1|10.00", "2|20.00", "4|40.00"],
+            lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+    }
+
+
+    /// A written row shadows the copy, a deleted one is hidden by a tombstone over it, and both
+    /// survive a restart -- the copy standing in for the read layers has to behave as they would.
+    [Fact]
+    public void TheCopyStaysUnderTheWriteLayer()
+    {
+        var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
+        try
+        {
+            using var lake = new TestLake()
+                .Parquet("base", "orders", """
+                    SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2)), (2, 20.00::DECIMAL(10,2))) t(order_id, amount)
+                    """)
+                .Json("top", "orders", """[{"order_id": 3, "amount": 30}]""")
+                .Stack("base", "top")
+                .WriteTo("local");
+            lake.Config.DefaultKey = ["order_id"];
+            lake.Config.Cache = cache;
+            lake.Start();
+
+            lake.Execute("UPDATE lake.orders SET amount = 11.00 WHERE order_id = 1");   // shadows the copy
+            lake.Execute("DELETE FROM lake.orders WHERE order_id = 2");                 // tombstones it
+            lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (4, 40.00)");
+
+            var expected = new[] { "1|11.00", "3|30.00", "4|40.00" };
+            Assert.Equal(expected, lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+            lake.Restart();
+            Assert.Equal(expected, lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
         }
         finally
         {

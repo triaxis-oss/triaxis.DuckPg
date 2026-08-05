@@ -35,6 +35,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     readonly Dictionary<string, Portal> portals = new();
     readonly Dictionary<string, string> startup = new(StringComparer.OrdinalIgnoreCase);
     readonly HashSet<string> pendingWrites = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> pendingPromotions = new(StringComparer.OrdinalIgnoreCase);
 
     char transactionStatus = 'I';
     bool skipUntilSync;
@@ -395,6 +396,14 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     /// touched are remembered and written out at COMMIT -- and forgotten at ROLLBACK.
     void Persist(Plan plan)
     {
+        // A promotion is part of the write that caused it: it survives exactly as long, and a
+        // rolled-back one is simply made again by the next write rather than assumed to be there.
+        if (plan.Promoted is { } promoted)
+        {
+            if (transactionStatus == 'T') pendingPromotions.Add(promoted);
+            else gateway.Promoted(promoted);
+        }
+
         if (plan.Dirty is { } dirty)
         {
             if (transactionStatus == 'T') pendingWrites.Add(dirty);
@@ -402,11 +411,14 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         }
         else if (plan.Tag == "COMMIT")
         {
+            foreach (var table in pendingPromotions) gateway.Promoted(table);
             foreach (var table in pendingWrites) gateway.Persist(table);
+            pendingPromotions.Clear();
             pendingWrites.Clear();
         }
         else if (plan.Tag == "ROLLBACK")
         {
+            pendingPromotions.Clear();
             pendingWrites.Clear();
         }
     }

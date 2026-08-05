@@ -130,6 +130,13 @@ A write is persisted as soon as DuckDB commits it — immediately for a bare sta
 for one inside a transaction, and never for one that is rolled back. Restarting the gateway reads
 the same files back, so a written row survives without a database file anywhere.
 
+A writable table the directory holds nothing for costs nothing to read: it is published without its
+write branch or its tombstone check, and grows them when a write first arrives. Since a view is
+bound on every execution, that branch would otherwise be paid for by every read of a table nobody
+has written to — measurably, +22% on a table and +50% on a view over several. The promotion travels
+in the plan of the write that caused it, so a rolled-back write leaves nothing behind and the next
+one simply promotes again.
+
 ## Caching the merge
 
 A view is bound by DuckDB on **every execution** — a prepared statement re-plans exactly like a
@@ -159,6 +166,10 @@ shadows which, and a filter or a virtual column reads the merged row, defaults a
 materialised with the rows they affect. The hash ignores what a default evaluated to either way:
 keying on it would rebuild every stamped table on every restart, which in a real schema is most
 of them.
+
+A copy is the read layers, and a write does not touch those — so a table that is written to keeps
+its copy as the layer underneath the write branch, rather than going back to reading every layer
+again. A written row shadows it and a tombstone hides it, exactly as they would a real layer.
 
 The cache must live outside the layer directories, or the lake would read its own copies back as
 data — the tool refuses that rather than discovering it later.

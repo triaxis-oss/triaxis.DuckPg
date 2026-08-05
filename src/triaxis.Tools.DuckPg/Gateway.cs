@@ -8,7 +8,8 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// A client statement translated into what DuckDB should actually run. `Steps` execute in order;
 /// the last one supplies the row count unless `Affected` names a query that knows better, which a
 /// rewritten DML statement does -- what it touches is not what its last step writes.
-sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string? Dirty = null)
+sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string? Dirty = null,
+                   string? Promoted = null)
 {
     public static Plan Rows(string sql) => new(PlanKind.Rows, [sql], "SELECT");
     public static Plan Count(string tag, params string[] steps) => new(PlanKind.Count, steps, tag);
@@ -166,7 +167,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         else
             RejectVirtual(table, columnList, "INSERT");
 
-        return Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = table.Name };
+        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = table.Name });
     }
 
     /// The parenthesised group after the table name is a column list unless it opens a subquery.
@@ -213,13 +214,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
-        return Plan.Count("UPDATE",
+        return Promoting(table, Plan.Count("UPDATE",
             Keys(table, scan, qualifier, predicate),
             $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
             Tombstone(table),
             Evict(table),
             $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated")
-            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name };
+            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name });
     }
 
     Plan RewriteDelete(string sql)
@@ -232,11 +233,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         RequireKey(table, "DELETE");
 
         var where = SqlText.FindKeyword(sql, "WHERE", reference.End);
-        return Plan.Count("DELETE",
+        return Promoting(table, Plan.Count("DELETE",
             Keys(table, table.QualifiedName, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
             Evict(table))
-            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name };
+            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name });
     }
 
     /// The keys a statement touches, taken from the merged view before anything moves.
@@ -273,6 +274,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             assignments[part[..eq].Trim().Trim('"')] = part[(eq + 1)..].Trim();
         }
         return assignments;
+    }
+
+    /// A table nobody has written to carries no write branch, so the first write puts one there
+    /// before the rest of the plan runs -- on the session's own connection and inside its own
+    /// transaction, so a statement that rolls back takes the promotion with it.
+    Plan Promoting(Table table, Plan plan) =>
+        Catalog.Promoted(table)
+            ? plan
+            : plan with { Steps = [.. Catalog.Promotion(table), .. plan.Steps], Promoted = table.Name };
+
+    /// Remembered only once the write has committed: a promotion that rolled back is simply made
+    /// again by the next write, which is why `Promotion` is repeatable.
+    public void Promoted(string name)
+    {
+        lock (gate) Catalog.Promote(name);
     }
 
     Table? Writable(string? schema, string name)

@@ -32,6 +32,30 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
     /// rebuilt from the files, so a reload picks up an edit made outside the gateway.
     public void Prepare(DuckDBConnection conn, Table table)
     {
+        Exec(conn, $"DROP TABLE IF EXISTS {table.WriteName}");
+        Exec(conn, $"DROP TABLE IF EXISTS {table.TombstoneName}");
+        foreach (var statement in Definition(table)) Exec(conn, statement);
+
+        if (table.WriteSource is { } source)
+            Layer.Read(source, glob => Fill(conn, table.WriteName, table.Columns, source, glob));
+
+        if (table.Key.Length > 0 && Directory is not null && Tombstones(table) is { } tombstones)
+            Layer.Read(tombstones, glob => Fill(conn, table.TombstoneName, KeyColumns(table), tombstones, glob));
+    }
+
+    /// Whether the directory already holds something for this table -- rows, or keys it hides below.
+    /// One that does has to be loaded when the lake is built; one that does not has nothing to say
+    /// until something writes to it.
+    public bool Carries(Table table) =>
+        Directory is not null && (table.WriteSource is not null || Tombstones(table) is not null);
+
+    /// The tables the write layer keeps for one lake table, as statements. `IF NOT EXISTS` makes the
+    /// on-demand path safe to repeat: a statement that rolled back leaves nothing behind, and one
+    /// that did not is left alone rather than emptied.
+    public string[] Definition(Table table, bool ifNotExists = false)
+    {
+        var maybe = ifNotExists ? "IF NOT EXISTS " : "";
+
         // A declared default belongs on the table, where an INSERT that omits the column picks it up
         // as it is written -- the expression itself, not the value the view fills a file's gaps
         // with, because a row being written now can be stamped with now.
@@ -41,22 +65,19 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
             ? $", PRIMARY KEY ({string.Join(", ", table.Key.Select(SqlText.Quote))})"
             : "";
 
-        Exec(conn, $"DROP TABLE IF EXISTS {table.WriteName}");
-        Exec(conn, $"CREATE TABLE {table.WriteName} ({declared}{key})");
-        if (table.WriteSource is { } source)
-            Layer.Read(source, glob => Fill(conn, table.WriteName, table.Columns, source, glob));
+        if (table.Key.Length == 0)
+            return [$"CREATE TABLE {maybe}{table.WriteName} ({declared})"];
 
-        if (table.Key.Length == 0) return;
-
-        var keyColumns = table.Columns.Where(c => table.Key.Any(k => k.Equals(c.Name, StringComparison.OrdinalIgnoreCase))).ToList();
-        Exec(conn, $"DROP TABLE IF EXISTS {table.TombstoneName}");
-        Exec(conn, $"CREATE TABLE {table.TombstoneName} " +
-                   $"({string.Join(", ", keyColumns.Select(c => $"{SqlText.Quote(c.Name)} {c.Type}"))}, " +
-                   $"PRIMARY KEY ({string.Join(", ", table.Key.Select(SqlText.Quote))}))");
-
-        if (Directory is not null && Tombstones(table) is { } tombstones)
-            Layer.Read(tombstones, glob => Fill(conn, table.TombstoneName, keyColumns, tombstones, glob));
+        return [
+            $"CREATE TABLE {maybe}{table.WriteName} ({declared}{key})",
+            $"CREATE TABLE {maybe}{table.TombstoneName} " +
+            $"({string.Join(", ", KeyColumns(table).Select(c => $"{SqlText.Quote(c.Name)} {c.Type}"))}, " +
+            $"PRIMARY KEY ({string.Join(", ", table.Key.Select(SqlText.Quote))}))",
+        ];
     }
+
+    static List<Column> KeyColumns(Table table) =>
+        [.. table.Columns.Where(c => table.Key.Any(k => k.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))];
 
     /// Writes the table back to its file, and its tombstones to a sidecar the layer scan skips.
     /// An emptied table takes its file with it, so the directory says what the layer holds.
