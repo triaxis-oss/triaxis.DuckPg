@@ -553,6 +553,21 @@ public class TdsTests : IDisposable
             lake.Query("SELECT order_id, amount FROM lake.orders WHERE order_id >= 7010 ORDER BY order_id"));
     }
 
+    /// What EF Core's ExecuteDelete writes: the target is the alias, and the FROM clause is what
+    /// binds it to a table.
+    [Fact]
+    public void ADeleteCanNameItsTargetByAlias()
+    {
+        using var connection = Open();
+
+        Assert.Equal(2, new SqlCommand(
+            "DELETE FROM [s] FROM [orders] AS [s] WHERE [s].[order_id] < 3", connection).ExecuteNonQuery());
+        Assert.Equal(1, Count(connection));
+
+        lake.Restart();
+        Assert.Equal(["3"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
     /// The shape a tool takes a snapshot with: drop what a previous run left, select the rows into
     /// a scratch table, work against it. The temporary table belongs to the connection, so it also
     /// has to be gone from the next session to be handed this one.

@@ -189,6 +189,11 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **A DELETE's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
+  is what EF Core's `ExecuteDelete` writes, and taking `s` for a table name pushed the real one into
+  `USING` and left the delete against nothing. `TSqlParser.Aliased` resolves it where the clause
+  declaring it is in hand; the alias then has to survive into the gateway, since the predicate names
+  it too -- which is what `Gateway.DeleteAlias` keeps, and why the scan carries an `AS`.
 - **`MERGE` is whichever statement its branch means.** `WHEN MATCHED THEN UPDATE` is an update
   joined to its source. `WHEN NOT MATCHED THEN INSERT` over a condition that cannot match --
   `TSqlParser.Never`, which is EF Core's `ON 1=0` -- is a multi-row insert, and that is how a batch

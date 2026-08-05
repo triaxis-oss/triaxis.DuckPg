@@ -229,8 +229,7 @@ sealed class TSqlParser
 
             // Only the spelled-out alias: the word after an OUTPUT item is as likely to be the
             // `VALUES` the rows follow, and taking that for a name loses the rest of the statement.
-            var alias = Accept("as") ? Identifier() : null;
-            items.Add(new OutputItem(column, alias));
+            items.Add(new OutputItem(column, Accept("as") ? Identifier() : null));
         } while (AcceptOperator(","));
 
         if (Peek.Is("into"))
@@ -297,15 +296,36 @@ sealed class TSqlParser
         return assignments;
     }
 
+    /// `DELETE FROM [s] FROM [t] AS [s] WHERE …` -- the target names an alias that the FROM clause
+    /// binds, which is what EF Core's ExecuteDelete writes. It is resolved here, where the clause
+    /// declaring it is in hand; a name the FROM clause does not bind is an ordinary table.
     Statement Delete()
     {
         Expect("delete");
         Accept("from");
+        var at = Peek.Position;
         var target = TableName();
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
-        return new DeleteStatement(target, from, where);
+
+        if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
+            return new DeleteStatement(target, null, from, where);
+
+        // Joined to something else, the delete is against one side of a join and filtered by the
+        // other -- a different statement, and one whose rows a lake decides differently.
+        return ReferenceEquals(source, from)
+            ? new DeleteStatement(source.Name, source.Alias, null, where)
+            : throw new TSqlException("DELETE from an alias joined to another table is not supported", at);
     }
+
+    /// The source an alias names, or null when the FROM clause binds no such alias.
+    static NamedTableSource? Aliased(TableSource from, Name alias) => from switch
+    {
+        NamedTableSource named when named.Alias is { } bound &&
+            string.Equals(bound.Text, alias.Text, StringComparison.OrdinalIgnoreCase) => named,
+        JoinSource join => Aliased(join.Left, alias) ?? Aliased(join.Right, alias),
+        _ => null,
+    };
 
     /// `SET` here is only the session-option form; `SET @x = …` needs variables, which a lake has
     /// no place to keep.

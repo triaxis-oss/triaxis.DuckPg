@@ -316,9 +316,14 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("DELETE", sql);
         RequireKey(table, "DELETE");
 
+        // The target may be named by an alias the statement bound to it, and the predicate will
+        // then say so too -- so the scan carries the alias rather than dropping it.
+        var alias = DeleteAlias(sql, reference.End);
+        var scan = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
         var where = SqlText.FindKeyword(sql, "WHERE", reference.End);
+
         return Promoting(table, Plan.Count("DELETE",
-            Keys(table, table.QualifiedName, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
+            Keys(table, scan, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
             Evict(table))
             with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name }, tombstones: true);
@@ -328,6 +333,19 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     static string Keys(Table table, string scan, string qualifier, string predicate) =>
         $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS SELECT DISTINCT " +
         $"{string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)))} FROM {scan} WHERE {predicate}";
+
+    /// What a DELETE calls its target, spelled out or not -- and nothing at all when the word after
+    /// the table is the clause that follows it.
+    static readonly HashSet<string> DeleteClauses =
+        new(StringComparer.OrdinalIgnoreCase) { "WHERE", "USING", "RETURNING" };
+
+    static string? DeleteAlias(string sql, int from)
+    {
+        var word = SqlText.ReadTableRef(sql, from);
+        if (word.Name.Equals("AS", StringComparison.OrdinalIgnoreCase))
+            return SqlText.ReadTableRef(sql, word.End).Name;
+        return word.Name.Length == 0 || DeleteClauses.Contains(word.Name) ? null : word.Name;
+    }
 
     /// The name after the target, which is an alias unless it is the `SET` that follows a bare one.
     static string? ReadAlias(string sql, int from)

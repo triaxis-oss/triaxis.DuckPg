@@ -115,6 +115,7 @@ sealed class TSqlWriter(TSqlContext context)
             case DeleteStatement delete:
                 Put("DELETE FROM ");
                 Table(delete.Target);
+                if (delete.Alias is not null) Put(" AS ").Put(Quote(delete.Alias));
                 if (delete.From is not null) { Put(" USING "); Source(delete.From); }
                 if (delete.Where is not null) { Put(" WHERE "); Expression(delete.Where); }
                 return;

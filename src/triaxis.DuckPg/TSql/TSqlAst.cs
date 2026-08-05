@@ -25,9 +25,11 @@ sealed record OutputItem(Name Column, Name? Alias);
 
 /// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
 /// alias: the assignments and the join condition both name it.
-sealed record UpdateStatement(TableName Target, Name? Alias, List<Assignment> Assignments, TableSource? From, Expr? Where) : Statement;
+sealed record UpdateStatement(TableName Target, Name? Alias, List<Assignment> Assignments, TableSource? From,
+                              Expr? Where) : Statement;
 
-sealed record DeleteStatement(TableName Target, TableSource? From, Expr? Where) : Statement;
+/// `Alias` is the target's own, which `DELETE FROM [s] FROM [t] AS [s]` names instead of the table.
+sealed record DeleteStatement(TableName Target, Name? Alias, TableSource? From, Expr? Where) : Statement;
 
 /// `SET NOCOUNT ON`, `SET TRANSACTION ISOLATION LEVEL …` — session options a client sets and a
 /// lake has no opinion about.

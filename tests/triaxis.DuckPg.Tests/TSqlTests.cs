@@ -212,6 +212,17 @@ public class TSqlTests
             Translate("INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[order_id] VALUES (@p0)", "p0"));
     }
 
+    /// What EF Core's ExecuteDelete writes: the target names an alias the FROM clause binds, and the
+    /// predicate names it too.
+    [Theory]
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] WHERE [s].[amount] = 23",
+        """DELETE FROM "lake"."orders" AS "s" WHERE "s"."amount" = 23""")]
+    // A name the FROM clause does not bind is an ordinary table, and the FROM stays where it was.
+    [InlineData("DELETE FROM orders FROM staging WHERE staging.id = orders.id",
+        """DELETE FROM "lake"."orders" USING "lake"."staging" WHERE "staging"."id" = "orders"."id""" + "\"")]
+    public void RendersAnAliasedDeleteTarget(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
     [Theory]
     // Anything that changes which rows exist is the layer machinery's business, not one statement's.
     [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE")]
@@ -227,6 +238,10 @@ public class TSqlTests
         "a condition that cannot match")]
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED BY SOURCE THEN DELETE",
         "NOT MATCHED BY SOURCE")]
+    // One side of a join deleted and the other filtering it is a different statement, and one whose
+    // rows a lake decides differently.
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] JOIN [staging] AS [t] ON t.id = s.id WHERE t.x = 1",
+        "joined to another table")]
     // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
     // the answer than the answer.
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED THEN " +

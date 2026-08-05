@@ -338,6 +338,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
+| `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
