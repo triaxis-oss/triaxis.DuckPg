@@ -167,6 +167,44 @@ public class SchemaTests
         Assert.Equal(["1|"], lake.Query("SELECT order_id, status FROM lake.orders"));
     }
 
+    /// The views are listed the wrong way round on purpose: `big` reads `sent`, which the model
+    /// only declares afterwards, and nothing in the model says so.
+    [Fact]
+    public void DeclaredViewsArePublishedOverTheLayers()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """
+                [{"order_id": 1, "amount": 5, "status": "sent"},
+                 {"order_id": 2, "amount": 50, "status": "sent"},
+                 {"order_id": 3, "amount": 70, "status": "draft"}]
+                """)
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), [Stamped],
+            new Dacpac.ViewModel("big", "SELECT [order_id], [amount] FROM [dbo].[sent] WHERE [amount] > 10"),
+            new Dacpac.ViewModel("sent",
+                "SELECT [order_id], [amount], ISNULL([status], 'none') AS [state] FROM [dbo].[orders] WHERE [status] = 'sent'"));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Equal(["1|5|sent", "2|50|sent"], lake.Query("SELECT * FROM lake.sent ORDER BY order_id"));
+        Assert.Equal(["2|50"], lake.Query("SELECT * FROM lake.big"));
+    }
+
+    [Fact]
+    public void AViewTheParserCannotReadIsSkippedRatherThanFatal()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1, "amount": 5, "status": "sent"}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), [Stamped],
+            new Dacpac.ViewModel("broken", "SELECT * FROM [dbo].[orders] FOR XML PATH('o')"),
+            new Dacpac.ViewModel("fine", "SELECT [order_id] FROM [dbo].[orders]"));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Equal(["1"], lake.Query("SELECT * FROM lake.fine"));
+    }
+
     [Fact]
     public void ASingleDacpacInALayerIsFoundOnItsOwn()
     {

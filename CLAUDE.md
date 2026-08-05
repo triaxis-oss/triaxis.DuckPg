@@ -12,9 +12,9 @@ someone changing the code needs.
 | `Config.cs` | The bound configuration. Every property here is part of the contract. |
 | `Lake.cs` | The composition root: DuckDB connection, schema, catalog, gateway, listeners. Tests use it too. |
 | `Layer.cs` | Scanning a layer directory, reading a source, writing one back. YAML ↔ JSON. |
-| `Catalog.cs` | The published shape: which tables exist, their columns, keys, and the view SQL. |
+| `Catalog.cs` | The published shape: which tables exist, their columns, keys, the view SQL, and the dacpac's own views. |
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
-| `DacpacSchema.cs` | The declared schema as a service: finds the dacpac and reads `model.xml`: columns, keys and defaults. No DacFx. |
+| `DacpacSchema.cs` | The declared schema as a service: finds the dacpac, reads `model.xml` for columns, keys, defaults and views. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
 | `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
 | `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |

@@ -74,6 +74,8 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             Exec(conn, ViewDefinition(table));
             Tables[name] = table;
         }
+
+        Declared(conn);
     }
 
     public void Rebuild(DuckDBConnection conn)
@@ -140,6 +142,53 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
             if (columns.Count > 0) layers.Add(new TableLayer(source, materialised, columns));
         }
         return layers;
+    }
+
+    // ---- declared views --------------------------------------------------------------------------
+
+    /// The dacpac's own views, published beside the tables they read: the query is T-SQL, so it is
+    /// translated on the tree like any statement a client sends, and `dbo` lands on the lake.
+    ///
+    /// A view may select from another view the model happens to list later, and the model says
+    /// nothing about which. Rather than order them, each round creates what it can and the next
+    /// round tries the rest -- a round that adds nothing is one where what is left is broken rather
+    /// than merely early, and those are named and skipped instead of stopping the lake.
+    void Declared(DuckDBConnection conn)
+    {
+        var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                      new HashSet<string>(), Environment.UserName);
+        var pending = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var refused = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var (name, query) in schema.Views)
+            if (Tables.ContainsKey(name)) logger.LogWarning("{View} is declared as a view and carried as a table", name);
+            else pending[name] = query;
+
+        while (pending.Count > 0)
+        {
+            var published = 0;
+            foreach (var (name, query) in pending.ToList())
+                try
+                {
+                    var translated = TSqlTranslator.Translate(query, context);
+                    if (translated.Count != 1)
+                        throw new InvalidOperationException($"a view is one query, not {translated.Count}");
+
+                    Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} " +
+                               $"AS {translated[0]}");
+                    pending.Remove(name);
+                    published++;
+                }
+                catch (Exception e)
+                {
+                    refused[name] = e.Message.ReplaceLineEndings(" ");
+                }
+
+            if (published == 0) break;
+        }
+
+        foreach (var name in pending.Keys)
+            logger.LogWarning("view {View} skipped: {Reason}", name, refused.GetValueOrDefault(name, "unknown"));
     }
 
     // ---- declared defaults -----------------------------------------------------------------------

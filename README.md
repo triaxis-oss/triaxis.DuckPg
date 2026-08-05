@@ -276,6 +276,20 @@ is built. `USER_NAME()` and `ORIGINAL_LOGIN()` say the same thing.
 A default DuckDB cannot answer at all (`NEWSEQUENTIALID()` and friends) is dropped with a warning,
 on both sides, and the column keeps its `NULL`.
 
+### Views
+
+The dacpac's own views are published beside the tables they read, so a report a client already
+knows by name is there without being rewritten as a layer. The query is T-SQL and goes through the
+same translator as a statement a client sends: `[dbo]` lands on the lake's schema, so a view over
+`[dbo].[orders]` reads the stacked layers and everything a view of it could reasonably do —
+`ISNULL`, `TOP`, joins, a view of a view — comes with it.
+
+Order does not matter. A view that reads another is retried once the other is in, and a view that
+still fails when nothing else can be published is named in a warning and left out rather than
+stopping the lake. A view whose name a layer already carries as a table is left out too — the files
+win. Views are read-only: they are DuckDB views over the published ones, and a write to one is
+refused by DuckDB rather than rewritten onto a layer.
+
 **Autodetected when not given**: a single `.dacpac` sitting in a layer directory is used on its
 own. Several means none is assumed, and the tool says so — name one with `--dacpac`.
 
