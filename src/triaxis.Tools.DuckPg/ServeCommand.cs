@@ -41,6 +41,9 @@ public class ServeCommand : LoggingCommand
     [Option("--dacpac", Description = "A .dacpac to take column names, order, types and keys from.")]
     public string? Dacpac { get; set; }
 
+    [Option("--install-duckdb", Description = "Download the DuckDB library duckpg needs, and exit.")]
+    public bool InstallDuckDb { get; set; }
+
     [Inject] private readonly IConfiguration _configuration = null!;
     [Inject] private readonly ILoggerFactory _loggers = null!;
 
@@ -59,6 +62,12 @@ public class ServeCommand : LoggingCommand
 
     public async Task ExecuteAsync(CancellationToken cancellation)
     {
+        if (InstallDuckDb)
+        {
+            await DuckDbDownload.InstallAsync(Logger, cancellation);
+            return;
+        }
+
         var config = _configuration.Get<Config>() ?? new Config();
         // `layers:` may be written as a single directory; only the list form binds on its own.
         if (_configuration["layers"] is { Length: > 0 } single) config.Layers = [single];
@@ -75,7 +84,7 @@ public class ServeCommand : LoggingCommand
         if (Key.Length > 0) config.DefaultKey = Key;
         if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
 
-        using var lake = new Lake(config, _loggers);
+        using var lake = Open(config);
 
         foreach (var table in lake.Catalog.Tables.Values)
             Logger.LogInformation("{Schema}.{Table} <- {Layers}{Writable}{Virtual}",
@@ -85,5 +94,39 @@ public class ServeCommand : LoggingCommand
                 table.Virtuals.Count > 0 ? " +" + string.Join(",", table.Virtuals.Select(v => v.Name)) : "");
 
         await lake.ListenAsync(cancellation);
+    }
+
+    /// The tool links against the machine's own DuckDB, and the first native call is where a
+    /// missing one would otherwise surface: a DllNotFoundException out of the bindings, naming a
+    /// library the reader never asked for by that name. Say where it was looked for instead, and
+    /// what the ways out are.
+    Lake Open(Config config)
+    {
+        try
+        {
+            // The first native call, so a missing library surfaces here rather than mid-query.
+            if (DuckDbLibrary.LoadedVersion is { } loaded && loaded != DuckDbLibrary.Version)
+                Logger.LogWarning(
+                    "DuckDB {Loaded} loaded from {Path}, where these bindings speak {Expected}'s C " +
+                    "API -- `duckpg --install-duckdb` fetches a matching one",
+                    loaded,
+                    DuckDbLibrary.LoadedFrom ?? "the loader's own search path",
+                    DuckDbLibrary.Version);
+
+            return new Lake(config, _loggers);
+        }
+        catch (DllNotFoundException)
+        {
+            throw new CommandErrorException(
+                "DuckDB {Version} was not found. Looked in:" + Environment.NewLine + "{Searched}" +
+                Environment.NewLine +
+                "Install it (`brew install duckdb`, `apt install libduckdb-dev`), point " +
+                DuckDbLibrary.PathVariable + " at the library, or run `duckpg --install-duckdb` to " +
+                "fetch it into {Downloaded}.",
+                DuckDbLibrary.Version,
+                string.Join(Environment.NewLine, DuckDbLibrary.SearchPath.Select(path => "  " + path)),
+                DuckDbLibrary.Downloaded)
+            { ExitCode = 69 }; // EX_UNAVAILABLE: the tool is fine, what it needs is not here
+        }
     }
 }

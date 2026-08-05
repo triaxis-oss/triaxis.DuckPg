@@ -29,6 +29,27 @@ directly. Homebrew's prefixes (`$HOMEBREW_PREFIX`, `/opt/homebrew`, `/usr/local`
 the `opt/duckdb/lib` keg beneath each are probed on their own, because neither macOS nor Linux
 looks there by default.
 
+On a machine with no DuckDB and no package manager worth arguing with:
+
+```shell
+duckpg --install-duckdb
+```
+
+which downloads the library from DuckDB's own releases — the version these bindings were built
+against, nothing newer — and leaves it in the local application data directory. Running it again
+with the library already there does nothing; one that got half written is replaced. That copy is
+then preferred to whatever the machine has, since it is known to answer the C API this build speaks;
+only `DUCKDB_LIBRARY` outranks it.
+
+A DuckDB of another version usually still works, so it is a warning rather than a refusal:
+
+```
+DuckDB 1.4.1 loaded from /usr/lib/libduckdb.so, where these bindings speak 1.5.5's C API
+```
+
+Nothing is ever downloaded unless asked for: without it, a missing library is an error that says
+where it looked and what the ways out are, and exits 69.
+
 Requires .NET 10.
 
 ## Serving a lake
