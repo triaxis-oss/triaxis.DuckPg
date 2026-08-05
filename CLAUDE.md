@@ -199,6 +199,10 @@ publish a temp-directory convention as API.
   into the lake's schema. `SELECT … INTO` and `DROP TABLE` take nothing else -- a lake's tables are
   the files under it -- and `##name` is refused, because a global temporary table is one another
   connection can see. They also have to disappear when a pooled connection is handed out again.
+- **`TOP n PERCENT` is counted, not handed to DuckDB's `LIMIT n%`.** SQL Server rounds the share up
+  and always answers at least one row; `LIMIT n%` rounds down and answers none for a small enough
+  share. `TSqlWriter.Percent` limits by `CEIL(count(*) * n / 100)` over the body it just rendered --
+  reusing the text rather than rendering it twice, so a CTE the body reads is still in scope.
 - **A join's right operand is a join tree, not a table.** `a LEFT JOIN b JOIN c ON … ON …` nests, and
   the conditions close in reverse; parsing it left-deep leaves the last `ON` with nothing to attach
   to, which is what made a dacpac's view unpublishable. A join keyword arriving before this join's
