@@ -186,25 +186,36 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("UPDATE", sql);
         RequireKey(table, "UPDATE");
 
+        var alias = ReadAlias(sql, reference.End);
         var set = SqlText.FindKeyword(sql, "SET", reference.End);
         if (set < 0) throw new PgError("42601", "UPDATE without SET");
-        var where = SqlText.FindKeyword(sql, "WHERE", set);
-        var assignments = ParseAssignments(sql[(set + 3)..(where < 0 ? sql.Length : where)]);
+        var from = SqlText.FindKeyword(sql, "FROM", set + 3);
+        var where = SqlText.FindKeyword(sql, "WHERE", from < 0 ? set + 3 : from + 4);
+        var end = from < 0 ? where : from;
+        var assignments = ParseAssignments(sql[(set + 3)..(end < 0 ? sql.Length : end)]);
         var predicate = where < 0 ? "TRUE" : sql[(where + 5)..];
 
         RejectVirtual(table, assignments.Keys, "UPDATE");
 
+        // With a FROM clause the target's own columns are no longer the only ones in scope, so
+        // everything the statement did not assign has to say which table it came from.
+        var target = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
+        var scan = from < 0
+            ? target
+            : $"{target}, {sql[(from + 4)..(where < 0 ? sql.Length : where)]}";
+        var qualifier = from < 0 ? "" : SqlText.Quote(alias ?? table.Name) + ".";
+
         var projection = string.Join(", ", table.Columns.Select(c =>
             assignments.TryGetValue(c.Name, out var assigned)
                 ? $"({assigned}) AS {SqlText.Quote(c.Name)}"
-                : SqlText.Quote(c.Name)));
+                : qualifier + SqlText.Quote(c.Name)));
         var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
         return Plan.Count("UPDATE",
-            Keys(table, predicate),
-            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {table.QualifiedName} WHERE {predicate}",
+            Keys(table, scan, qualifier, predicate),
+            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
             Tombstone(table),
             Evict(table),
             $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated")
@@ -222,16 +233,26 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         var where = SqlText.FindKeyword(sql, "WHERE", reference.End);
         return Plan.Count("DELETE",
-            Keys(table, where < 0 ? "TRUE" : sql[(where + 5)..]),
+            Keys(table, table.QualifiedName, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
             Evict(table))
             with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name };
     }
 
     /// The keys a statement touches, taken from the merged view before anything moves.
-    static string Keys(Table table, string predicate) =>
+    static string Keys(Table table, string scan, string qualifier, string predicate) =>
         $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS SELECT DISTINCT " +
-        $"{string.Join(", ", table.Key.Select(SqlText.Quote))} FROM {table.QualifiedName} WHERE {predicate}";
+        $"{string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)))} FROM {scan} WHERE {predicate}";
+
+    /// The name after the target, which is an alias unless it is the `SET` that follows a bare one.
+    static string? ReadAlias(string sql, int from)
+    {
+        var word = SqlText.ReadTableRef(sql, from);
+        if (word.Name.Length == 0 || word.Name.Equals("SET", StringComparison.OrdinalIgnoreCase)) return null;
+        return word.Name.Equals("AS", StringComparison.OrdinalIgnoreCase)
+            ? SqlText.ReadTableRef(sql, word.End).Name
+            : word.Name;
+    }
 
     /// A tombstone hides the row in every layer below; the same key deleted twice is one tombstone.
     static string Tombstone(Table table) =>

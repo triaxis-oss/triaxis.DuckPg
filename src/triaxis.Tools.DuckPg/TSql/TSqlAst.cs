@@ -10,7 +10,9 @@ sealed record SelectStatement(Query Query) : Statement;
 
 sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source) : Statement;
 
-sealed record UpdateStatement(TableName Target, List<Assignment> Assignments, TableSource? From, Expr? Where) : Statement;
+/// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
+/// alias: the assignments and the join condition both name it.
+sealed record UpdateStatement(TableName Target, Name? Alias, List<Assignment> Assignments, TableSource? From, Expr? Where) : Statement;
 
 sealed record DeleteStatement(TableName Target, TableSource? From, Expr? Where) : Statement;
 
