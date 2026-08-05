@@ -466,6 +466,30 @@ public class TdsTests : IDisposable
             lake.Query("SELECT order_id, note FROM lake.orders ORDER BY order_id"));
     }
 
+    /// What EF Core sends to update many rows at once: the rows travel as one JSON array and MERGE
+    /// joins them to the target on the key, so the rewriting has to carry both the target's alias
+    /// and the source into the statements that replace the rows.
+    [Fact]
+    public void MergesWhatAnOrmSendsForABulkUpdate()
+    {
+        using (var connection = Open())
+        {
+            using var merge = new SqlCommand(
+                """
+                MERGE INTO [orders] o
+                USING OPENJSON(@rows) WITH (order_id INT '$[0]', amount DECIMAL(10,2) '$[1]', note NVARCHAR(50) '$[2]') f
+                ON o.order_id = f.order_id
+                WHEN MATCHED THEN UPDATE SET o.amount = f.amount, o.note = f.note
+                """, connection);
+            merge.Parameters.AddWithValue("@rows", """[[1,1.25,"merged one"],[3,3.75,"merged three"]]""");
+            Assert.Equal(2, merge.ExecuteNonQuery());
+        }
+
+        lake.Restart();
+        Assert.Equal(["1|1.25|merged one", "2|20.00|second", "3|3.75|merged three"],
+            lake.Query("SELECT order_id, amount, note FROM lake.orders ORDER BY order_id"));
+    }
+
     [Fact]
     public void TransactionsCommitAndRollBack()
     {

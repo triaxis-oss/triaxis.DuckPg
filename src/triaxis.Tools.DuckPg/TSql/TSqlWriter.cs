@@ -87,6 +87,7 @@ sealed class TSqlWriter(TSqlContext context)
             case UpdateStatement update:
                 Put("UPDATE ");
                 Table(update.Target);
+                if (update.Alias is not null) Put(" AS ").Put(Quote(update.Alias));
                 Put(" SET ");
                 Join(update.Assignments, a => { Put(Quote(a.Column)); Put(" = "); Expression(a.Value); });
                 if (update.From is not null) { Put(" FROM "); Source(update.From); }

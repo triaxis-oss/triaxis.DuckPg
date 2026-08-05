@@ -183,6 +183,16 @@ public class ClientTests : IDisposable
         using var wide = db.CreateCommand("UPDATE lake.orders SET amount = amount WHERE order_id < 3");
         Assert.Equal(2, wide.ExecuteNonQuery());
 
+        // A joined UPDATE takes its new values from somewhere the target's key also exists, so the
+        // rows being rewritten have to say which side they came from.
+        using var joined = db.CreateCommand(
+            "UPDATE lake.orders AS o SET amount = s.amount " +
+            "FROM (VALUES (1, 99.00::DECIMAL(10,2))) AS s(order_id, amount) WHERE o.order_id = s.order_id");
+        Assert.Equal(1, joined.ExecuteNonQuery());
+
+        using var check = db.CreateCommand("SELECT amount FROM lake.orders WHERE order_id = 1");
+        Assert.Equal(99.00m, check.ExecuteScalar());
+
         using var delete = db.CreateCommand("DELETE FROM lake.orders WHERE order_id = 7003");
         Assert.Equal(1, delete.ExecuteNonQuery());
     }

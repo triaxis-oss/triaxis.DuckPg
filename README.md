@@ -102,7 +102,8 @@ that accepts writes:
 - `DELETE` removes the row from the write layer and records its key in `local/.deleted/<table>`,
   which hides that row in every layer below.
 - `UPDATE` is the two together: the new rows are computed first, then the old keys tombstoned, then
-  the new rows appended.
+  the new rows appended. A `FROM` clause joins the target to somewhere else for its new values,
+  which is also what a matched-only `MERGE` becomes.
 
 A write is persisted as soon as DuckDB commits it — immediately for a bare statement, at `COMMIT`
 for one inside a transaction, and never for one that is rolled back. Restarting the gateway reads
@@ -158,6 +159,7 @@ What SqlClient does, and what answers it:
 | Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
 | `SET NOCOUNT ON` and its relatives | accepted and ignored |
 | `OPENJSON(@p) WITH (…)` — EF Core's list parameter | a derived table over the JSON, one row per element |
+| `MERGE … WHEN MATCHED THEN UPDATE` — its bulk update | a joined `UPDATE`; the other branches are refused by name |
 | `COUNT`, `COUNT_BIG` | an `int` and a `bigint`, as on SQL Server — DuckDB counts in BIGINT either way |
 | `SUM` of an integer column, `UBIGINT`, `HUGEINT` | `DECIMAL(38,0)` — a number, since no SQL Server integer is that wide |
 
@@ -185,6 +187,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `CONVERT(INT, x)` | `CAST(x AS INTEGER)` |
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
+| `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
 
@@ -363,8 +366,8 @@ fails differently. psql works too, but it is not what the shims are maintained f
   SqlClient needs `Encrypt=False`. Bind to localhost.
 - Statement description runs the query `LIMIT 0` to learn its shape, so describing is not free and
   a statement that cannot be wrapped in a subquery falls back to `NoData`.
-- DML rewriting is textual — it handles `UPDATE t SET a = …, b = … WHERE …` and `DELETE FROM t
-  WHERE …` on a single table, not `FROM`/`USING` clauses, CTEs or subqueries in the target.
+- DML rewriting is textual — it handles `UPDATE t [AS a] SET a = …, b = … [FROM …] WHERE …` and
+  `DELETE FROM t WHERE …`, not CTEs, `DELETE … USING`, or subqueries in the target.
 - Statements are re-planned per execution; no plan cache.
 - The `COPY` protocol (`\copy`, `NpgsqlBinaryImporter`) is not implemented.
 - The catalog is built from the filesystem at startup and on `CALL duckpg_reload()`; no watcher.

@@ -163,9 +163,27 @@ public class TSqlTests
         """UPDATE "lake"."orders" SET "amount" = 1, "note" = 'x' WHERE "id" = 2""")]
     [InlineData("UPDATE o SET o.amount = 1 WHERE o.id = 2",
         """UPDATE "lake"."o" SET "amount" = 1 WHERE "o"."id" = 2""")]
+    [InlineData("UPDATE o SET o.amount = s.amount FROM staging s WHERE o.id = s.id",
+        """UPDATE "lake"."o" SET "amount" = "s"."amount" FROM "lake"."staging" AS "s" WHERE "o"."id" = "s"."id" """)]
     [InlineData("DELETE FROM orders WHERE id = 1", """DELETE FROM "lake"."orders" WHERE "id" = 1""")]
     [InlineData("DELETE orders WHERE id = 1", """DELETE FROM "lake"."orders" WHERE "id" = 1""")]
+    // A matched-only MERGE is an update joined to its source, and renders as one.
+    [InlineData("MERGE INTO [orders] o USING [staging] s ON o.id = s.id WHEN MATCHED THEN UPDATE SET o.amount = s.amount",
+        """UPDATE "lake"."orders" AS "o" SET "amount" = "s"."amount" FROM "lake"."staging" AS "s" WHERE "o"."id" = "s"."id" """)]
     public void RendersWrites(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
+
+    [Theory]
+    // Anything that changes which rows exist is the layer machinery's business, not one statement's.
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN DELETE", "WHEN MATCHED THEN UPDATE")]
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "WHEN MATCHED THEN UPDATE")]
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED AND f.x > 1 THEN UPDATE SET a.x = f.x",
+        "WHEN MATCHED AND")]
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x " +
+        "WHEN NOT MATCHED THEN INSERT (id) VALUES (f.id)", "WHEN MATCHED THEN UPDATE")]
+    [InlineData("MERGE INTO t a USING s f ON a.id = f.id WHEN MATCHED THEN UPDATE SET a.x = f.x OUTPUT inserted.x",
+        "OUTPUT")]
+    public void RefusesTheMergeBranchesItDoesNotDo(string tsql, string expected) =>
+        Assert.Contains(expected, Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
 
     [Fact]
     public void ParametersBecomeDuckDbPlaceholders()

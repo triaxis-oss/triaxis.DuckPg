@@ -89,6 +89,7 @@ sealed class TSqlParser
         if (Peek.Is("insert")) return Insert();
         if (Peek.Is("update")) return Update();
         if (Peek.Is("delete")) return Delete();
+        if (Peek.Is("merge")) return Merge();
         if (Peek.Is("set")) return SetOption();
         if (Peek.Is("begin") || Peek.Is("commit") || Peek.Is("rollback") || Peek.Is("save")) return Transaction();
 
@@ -132,6 +133,45 @@ sealed class TSqlParser
         var target = TableName();
         Expect("set");
 
+        var assignments = Assignments();
+        var from = Accept("from") ? TableSource() : null;
+        var where = Accept("where") ? Expression() : null;
+        return new UpdateStatement(target, null, assignments, from, where);
+    }
+
+    /// `MERGE` is an update by another spelling: the target joined to a source on a condition. Only
+    /// the matched-update branch is covered -- the rest changes how many rows a table has, which is
+    /// the layer machinery's business and not one statement's.
+    Statement Merge()
+    {
+        Expect("merge");
+        Accept("into");
+        var target = TableName();
+        var (alias, _) = SourceAlias();
+
+        Expect("using");
+        var source = PrimaryTableSource();
+        Expect("on");
+        var on = Expression();
+
+        Expect("when");
+        if (!Peek.Is("matched")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
+        Expect("matched");
+        if (Peek.Is("and")) throw Unexpected("MERGE WHEN MATCHED AND is not supported");
+        Expect("then");
+        if (!Peek.Is("update")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
+        Expect("update");
+        Expect("set");
+        var assignments = Assignments();
+
+        if (Peek.Is("when")) throw Unexpected("only MERGE ... WHEN MATCHED THEN UPDATE is supported");
+        if (Peek.Is("output")) throw Unexpected("MERGE ... OUTPUT is not supported");
+
+        return new UpdateStatement(target, alias, assignments, source, on);
+    }
+
+    List<Assignment> Assignments()
+    {
         var assignments = new List<Assignment>();
         do
         {
@@ -141,10 +181,7 @@ sealed class TSqlParser
             ExpectOperator("=");
             assignments.Add(new Assignment(column, Expression()));
         } while (AcceptOperator(","));
-
-        var from = Accept("from") ? TableSource() : null;
-        var where = Accept("where") ? Expression() : null;
-        return new UpdateStatement(target, assignments, from, where);
+        return assignments;
     }
 
     Statement Delete()
@@ -470,7 +507,7 @@ sealed class TSqlParser
     static readonly HashSet<string> SourceEnders = new(StringComparer.OrdinalIgnoreCase)
     {
         "where", "group", "having", "order", "union", "except", "intersect", "inner", "left", "right", "full",
-        "cross", "join", "on", "offset", "for", "option", "set", "values", "with", "outer", "into",
+        "cross", "join", "on", "offset", "for", "option", "set", "values", "with", "outer", "into", "using",
     };
 
     static bool EndsTableSource(Token token) => token.Kind == TokenKind.Word && SourceEnders.Contains(token.Text);

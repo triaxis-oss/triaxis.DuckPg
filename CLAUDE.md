@@ -127,6 +127,13 @@ someone changing the code needs.
   clause declares are projected in the subquery `TSqlWriter.OpenJson` renders. Resolving them where
   they are *used* instead would mean rewriting column references against an alias, which is the
   thing the tree is meant to avoid.
+- **`MERGE ... WHEN MATCHED THEN UPDATE` is an update joined to its source**, and the parser
+  desugars it to exactly that -- target, alias, `USING` as `From`, `ON` as `Where`. That is why
+  `UpdateStatement` carries an alias at all, and why `Gateway.RewriteUpdate` had to learn the
+  `FROM` clause it used to fold into the assignment list: with another table in scope, the columns
+  the statement did not assign have to say which side they came from, in the projection and in
+  `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
+  means is the layer machinery's, not one statement's.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column
