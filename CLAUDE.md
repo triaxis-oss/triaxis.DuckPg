@@ -112,6 +112,10 @@ someone changing the code needs.
   so it is deterministic, and `PacketsEndWhereRowsDo` checks the framing itself rather than the
   client's tolerance of it -- SqlClient survives some violations and not others, which is how the
   first version of this fix passed while leaving wide rows broken.
+- **The legacy LOB parameter types are still in use.** LLBLGen on the old `System.Data.SqlClient`
+  types a string parameter as `NTEXT`, so `TdsTypes.ReadValue` has to know `TEXT`/`NTEXT`/`IMAGE`:
+  four bytes of declared maximum instead of two, a collation on the text ones, and a four-byte
+  value length where -1 is null. Nothing here ever sends them back.
 - `SELECT COUNT(*)` gives a `long`, because DuckDB counts in BIGINT. An application that casts to
   `int` will need `Convert.ToInt32`.
 

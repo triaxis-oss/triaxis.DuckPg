@@ -354,6 +354,24 @@ static class TdsTypes
                 return ReadVariable(ref reader, declared);
             }
 
+            // The legacy LOB types, which an old client still sends: their declared maximum is four
+            // bytes rather than two, and the value's own length is four bytes with -1 for null.
+            case Text or NText or Image:
+            {
+                reader.I32();
+                if (token is Text or NText) reader.Skip(5); // collation
+                var length = reader.I32();
+                if (length < 0) return null;
+
+                var bytes = reader.Bytes(length);
+                return token switch
+                {
+                    NText => Encoding.Unicode.GetString(bytes),
+                    Text => Encoding.UTF8.GetString(bytes),
+                    _ => bytes,
+                };
+            }
+
             case 0x1F: // NULLTYPE, which is what an untyped null parameter arrives as
                 return null;
 
