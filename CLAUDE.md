@@ -93,8 +93,8 @@ someone changing the code needs.
 
 ## Tests
 
-`dotnet test`. The suite is the specification — 139 tests across layer stacking, partitioned
-layouts, the write layer, dacpac schemas, the T-SQL parser, and Npgsql + SqlClient conformance.
+`dotnet test`. The suite is the specification — layer stacking, partitioned layouts, the write
+layer, dacpac schemas, the T-SQL parser, and Npgsql + SqlClient conformance.
 `TSqlTests` is the cheap one to iterate on: it needs no server and no DuckDB. `TestLake` builds a
 lake in a temp directory from strings, and `Restart()` throws away everything in memory, which is
 how persistence is told from luck.
