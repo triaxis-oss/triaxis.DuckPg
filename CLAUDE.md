@@ -119,8 +119,13 @@ someone changing the code needs.
 - **`COUNT` is an `int` in SQL Server and a BIGINT in DuckDB**, and an application casting the
   scalar to `int` throws on the difference. `TSqlWriter.Function` casts a `COUNT` back, around the
   window clause as well, and renders `COUNT_BIG` as the plain count -- which is how a caller asks
-  for the wide one on the database this stands in for. `SUM` has the same shape of problem and is
-  not fixed: SQL Server's answer depends on the argument's type, which is not on the tree.
+  for the wide one on the database this stands in for. `SUM` is not narrowed the same way: what
+  SQL Server returns depends on the argument's type, which is not on the tree. It does arrive as a
+  number rather than as text, which is a different bug -- see the type names below.
+- **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
+  spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
+  name that matches nothing is published as text, silently. That is how summing an integer column
+  reached SqlClient as a string: DuckDB sums into a HUGEINT, which was mapped nowhere.
 
 ## Tests
 

@@ -86,6 +86,26 @@ public class ClientTests : IDisposable
             reader.GetColumnSchema().Select(c => $"{c.DataTypeName}:{c.DataType?.Name}"));
     }
 
+    /// The reader names its types its own way -- `UnsignedBigInt`, `TimestampMs` -- and a name this
+    /// side does not know goes out as text. A summed column is a HUGEINT, and arrived as one.
+    [Fact]
+    public void TheWiderNumbersAndTheSubSecondStampsAreThemselves()
+    {
+        using var command = db.CreateCommand(
+            "SELECT SUM(order_id) AS s, CAST(9223372036854775810 AS UBIGINT) AS u, " +
+            "CAST(4294967295 AS UINTEGER) AS i, CAST('2026-08-04 10:11:12' AS TIMESTAMP_MS) AS t " +
+            "FROM lake.orders");
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read());
+
+        Assert.Equal(["numeric", "numeric", "bigint", "timestamp without time zone"],
+            reader.GetColumnSchema().Select(c => c.DataTypeName));
+        Assert.Equal(6m, reader.GetDecimal(0));
+        Assert.Equal(9223372036854775810m, reader.GetDecimal(1));
+        Assert.Equal(4294967295L, reader.GetInt64(2));
+        Assert.Equal(new DateTime(2026, 8, 4, 10, 11, 12), reader.GetDateTime(3));
+    }
+
     [Fact]
     public void ParametersRoundTripInEveryTypeNpgsqlSends()
     {

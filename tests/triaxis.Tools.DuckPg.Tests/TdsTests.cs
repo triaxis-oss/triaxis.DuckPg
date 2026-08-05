@@ -252,6 +252,27 @@ public class TdsTests : IDisposable
         Assert.Equal(3L, Assert.IsType<long>(wide.ExecuteScalar()));
     }
 
+    /// DuckDB sums anything integral into a HUGEINT, which is wider than every SQL Server integer --
+    /// so it goes out as the widest thing that is still a number. It used to go out as text, which
+    /// is a number to nobody.
+    [Fact]
+    public void SumsAndWideIntegersAreNumbers()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "SELECT SUM(order_id) AS s, SUM(amount) AS a, CAST(9223372036854775810 AS UBIGINT) AS u, " +
+            "CAST(4294967295 AS UINTEGER) AS i, CAST('2026-08-04 10:11:12' AS TIMESTAMP_MS) AS t FROM orders",
+            connection);
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read());
+
+        Assert.Equal(6m, Assert.IsType<decimal>(reader.GetValue(0)));
+        Assert.Equal(60.50m, Assert.IsType<decimal>(reader.GetValue(1)));
+        Assert.Equal(9223372036854775810m, Assert.IsType<decimal>(reader.GetValue(2)));
+        Assert.Equal(4294967295L, Assert.IsType<long>(reader.GetValue(3)));
+        Assert.Equal(new DateTime(2026, 8, 4, 10, 11, 12), Assert.IsType<DateTime>(reader.GetValue(4)));
+    }
+
     /// The login name, since that is the only user a lake of files has.
     [Fact]
     public void SaysWhoIsAsking()
