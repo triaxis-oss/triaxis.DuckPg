@@ -332,6 +332,21 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
 
     string ViewDefinition(Table table)
     {
+        // One layer and nothing to merge it with: the table *is* that layer, and everything the
+        // merge needs around it -- the union, the sequence numbers, the row numbering that picks a
+        // winner, the projection renaming each column to itself -- is an expression DuckDB binds
+        // for every statement and answers the same way every time. A view is bound per execution,
+        // not per lake, so that is the whole cost of a query on a small table.
+        //
+        // A filter or a virtual column reads the merged row rather than the file's, so those keep
+        // the wrapper they are written against.
+        if (!table.Writable && table.Layers is [var only] && table.Virtuals.Count == 0 && table.Filter is null)
+            return $"CREATE OR REPLACE VIEW {table.QualifiedName} AS SELECT " +
+                   string.Join(", ", table.Columns.Select(c =>
+                       (Value(c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults: true)
+                        ?? $"CAST(NULL AS {c.Type})") + $" AS {SqlText.Quote(c.Name)}")) +
+                   $" FROM {only.Scan}";
+
         var projection = string.Join(", ", table.Columns.Select(Source)
             .Concat(table.Virtuals.Select(v => $"({v.Expr}) AS {SqlText.Quote(v.Name)}")));
 
@@ -379,29 +394,33 @@ sealed class Catalog(Config config, WriteLayer write, DacpacSchema schema, ILogg
                (where.Count > 0 ? " WHERE " + string.Join(" AND ", where) : "") + shadowing;
     }
 
+    /// What one layer offers for a column: its own value, cast to the published type only where it
+    /// is not already that type, with a declared default over the top. Null where the layer has
+    /// neither -- a gap for `UNION ALL BY NAME` to fill.
+    ///
+    /// A layer that carries the column still has rows leaving it empty, so the default goes over
+    /// the value rather than only where the column is missing from the file altogether.
+    static string? Value(Column column, Column? source, bool defaults)
+    {
+        // A cast to the type the layer already has is an expression DuckDB binds on every
+        // statement and nothing else -- and a view is bound per execution, not per lake.
+        var value = source is null ? null
+            : Same(source.Type, column.Type) ? SqlText.Quote(column.Name)
+            : $"CAST({SqlText.Quote(column.Name)} AS {column.Type})";
+        var fill = defaults ? column.Default?.Value : null;
+        return (value, fill) switch
+        {
+            (null, null) => null,
+            (null, _) => fill,
+            (_, null) => value,
+            _ => $"COALESCE({value}, {fill})",
+        };
+    }
+
     string Branch(Table table, List<Column> available, string scan, int seq, bool named, bool defaults)
     {
-        // A layer that carries the column still has rows leaving it empty, so the default goes over
-        // the value rather than only where the column is missing from the file altogether.
-        string? Value(Column column, Column? source)
-        {
-            // A cast to the type the layer already has is an expression DuckDB binds on every
-            // statement and nothing else -- and a view is bound per execution, not per lake.
-            var value = source is null ? null
-                : Same(source.Type, column.Type) ? SqlText.Quote(column.Name)
-                : $"CAST({SqlText.Quote(column.Name)} AS {column.Type})";
-            var fill = defaults ? column.Default?.Value : null;
-            return (value, fill) switch
-            {
-                (null, null) => null,
-                (null, _) => fill,
-                (_, null) => value,
-                _ => $"COALESCE({value}, {fill})",
-            };
-        }
-
         var columns = string.Join(", ", table.Columns
-            .Select(c => (Column: c, Value: Value(c, available.FirstOrDefault(a => Same(a.Name, c.Name)))))
+            .Select(c => (Column: c, Value: Value(c, available.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)))
             .Where(c => c.Value is not null)
             .Select(c => $"{c.Value} AS {SqlText.Quote(c.Column.Name)}"));
 
