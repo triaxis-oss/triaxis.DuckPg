@@ -248,4 +248,146 @@ public class SchemaTests
         Assert.Equal(["history_id:bigint", "what:text"], lake.Columns("lake.history"));
         Assert.Equal(["7|seeded"], lake.Query("SELECT history_id, what FROM lake.history"));
     }
+
+    /// A table more than one layer carries is merged once into a parquet the view then scans,
+    /// rather than merged again for every statement. The rows have to be the ones the merge would
+    /// have produced -- shadowing, declared defaults and all -- or the copy is a different table.
+    [Fact]
+    public void AMergedTableIsCachedAsParquetAndStillMergesTheSameRows()
+    {
+        var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
+        try
+        {
+            using var lake = new TestLake()
+                .Parquet("base", "orders", """
+                    SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2)), (2, 20.00::DECIMAL(10,2))) t(order_id, amount)
+                    """)
+                .Json("top", "orders", """[{"order_id": 2, "amount": 99.5}, {"order_id": 3, "amount": 30}]""")
+                .Stack("base", "top");
+            lake.Config.DefaultKey = ["order_id"];
+            lake.Config.Cache = cache;
+            lake.Start();
+
+            // The top layer shadows row 2 and adds row 3 -- what the merge says, not what one layer does.
+            Assert.Equal(["1|10.00", "2|99.50", "3|30.00"],
+                lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+
+            Assert.Single(Directory.GetFiles(cache, "orders-*.parquet"));
+
+            // And the view is that file rather than the merge, which is the whole point.
+            Assert.Contains("read_parquet", lake.Query(
+                "SELECT sql FROM duckdb_views() WHERE schema_name = 'lake' AND view_name = 'orders'")[0]);
+            Assert.DoesNotContain("UNION ALL BY NAME", lake.Query(
+                "SELECT sql FROM duckdb_views() WHERE schema_name = 'lake' AND view_name = 'orders'")[0]);
+        }
+        finally
+        {
+            if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
+        }
+    }
+
+    /// A writable table's rows change under any copy of them, so it keeps the merge.
+    [Fact]
+    public void AWritableTableIsNotCached()
+    {
+        var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
+        try
+        {
+            using var lake = new TestLake()
+                .Parquet("base", "orders", "SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2))) t(order_id, amount)")
+                .Json("top", "orders", """[{"order_id": 2, "amount": 20}]""")
+                .Stack("base", "top")
+                .WriteTo("local");
+            lake.Config.DefaultKey = ["order_id"];
+            lake.Config.Cache = cache;
+            lake.Start();
+
+            lake.Query("INSERT INTO lake.orders (order_id, amount) VALUES (3, 30.00)");
+            Assert.Equal(["1|10.00", "2|20.00", "3|30.00"],
+                lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+            Assert.Empty(Directory.Exists(cache) ? Directory.GetFiles(cache, "orders-*.parquet") : []);
+        }
+        finally
+        {
+            if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
+        }
+    }
+
+
+    /// The copy is keyed by what produced it, so a restart over unchanged files reuses it -- and a
+    /// layer that did change lands on a different key rather than being answered with the old rows.
+    [Fact]
+    public void ACachedTableIsReusedUntilItsFilesChange()
+    {
+        var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
+        try
+        {
+            using var lake = new TestLake()
+                .Parquet("base", "orders", "SELECT * FROM (VALUES (1, 10.00::DECIMAL(10,2))) t(order_id, amount)")
+                .Json("top", "orders", """[{"order_id": 2, "amount": 20}]""")
+                .Stack("base", "top");
+            lake.Config.DefaultKey = ["order_id"];
+            lake.Config.Cache = cache;
+            lake.Start();
+
+            var first = Directory.GetFiles(cache, "orders-*.parquet").Single();
+            var written = File.GetLastWriteTimeUtc(first);
+
+            // Nothing changed: the same key, and the file is not rewritten.
+            lake.Restart();
+            Assert.Equal([first], Directory.GetFiles(cache, "orders-*.parquet"));
+            Assert.Equal(written, File.GetLastWriteTimeUtc(first));
+
+            // A layer that changed has to produce a different key, and the stale copy goes.
+            lake.Json("top", "orders", """[{"order_id": 2, "amount": 22}]""");
+            lake.Restart();
+            var second = Directory.GetFiles(cache, "orders-*.parquet").Single();
+            Assert.NotEqual(first, second);
+            Assert.Equal(["1|10.00", "2|22.00"],
+                lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
+        }
+        finally
+        {
+            if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
+        }
+    }
+
+
+    /// A default that answers differently each run stays with the view rather than being written
+    /// into the copy, so a reused copy is still stamped by whoever reads it -- which is what the
+    /// stamp meant before there was a copy at all.
+    [Fact]
+    public void ADeferredDefaultIsStampedByTheReaderNotByTheCopy()
+    {
+        var cache = Path.Combine(Path.GetTempPath(), $"duckpg-cache-{Guid.NewGuid():N}");
+        try
+        {
+            using var lake = new TestLake()
+                .Parquet("base", "orders", "SELECT * FROM (VALUES (1)) t(order_id)")
+                .Json("top", "orders", """[{"order_id": 2}]""")
+                .Stack("base", "top");
+            Dacpac.Write(lake.At("schema", "test.dacpac"), new Dacpac.TableModel("orders",
+                [("order_id", "int"), ("token", "uniqueidentifier")], ["order_id"], [("token", "(newid())")]));
+            lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+            lake.Config.DefaultKey = ["order_id"];
+            lake.Config.Cache = cache;
+            lake.Start();
+
+            var first = lake.Query("SELECT token FROM lake.orders ORDER BY order_id");
+            var copy = Directory.GetFiles(cache, "orders-*.parquet").Single();
+            Assert.Equal(first[0], first[1]);           // one stamp for the whole lake, as before
+
+            // The copy carries no stamp of its own, so it survives while the stamp moves on.
+            lake.Restart();
+            Assert.Equal([copy], Directory.GetFiles(cache, "orders-*.parquet"));
+            var second = lake.Query("SELECT token FROM lake.orders ORDER BY order_id");
+            Assert.Equal(second[0], second[1]);
+            Assert.NotEqual(first[0], second[0]);
+        }
+        finally
+        {
+            if (Directory.Exists(cache)) Directory.Delete(cache, recursive: true);
+        }
+    }
+
 }

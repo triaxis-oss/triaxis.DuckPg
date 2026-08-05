@@ -41,6 +41,9 @@ public class ServeCommand : LoggingCommand
     [Option("--dacpac", Description = "A .dacpac to take column names, order, types and keys from.")]
     public string? Dacpac { get; set; }
 
+    [Option("--cache", Description = "Directory to write merged copies of multi-layer tables into, as ZSTD parquet. Trades build time and disk for read speed.")]
+    public string? Cache { get; set; }
+
     [Option("--install-duckdb", Description = "Download the DuckDB library duckpg needs, and exit.")]
     public bool InstallDuckDb { get; set; }
 
@@ -83,6 +86,16 @@ public class ServeCommand : LoggingCommand
         if (Schema is not null) config.Schema = Schema;
         if (Key.Length > 0) config.DefaultKey = Key;
         if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
+        if (Cache is not null) config.Cache = Path.GetFullPath(Cache);
+
+        // A cache inside a layer would be read back as part of the lake on the next build -- every
+        // materialised table arriving a second time, as a layer of its own.
+        if (config.Cache is { } cache)
+            foreach (var directory in (string?[])[.. config.Layers, config.Write])
+                if (directory is not null && Under(cache, directory))
+                    throw new CommandErrorException($"--cache {cache} is inside the layer {directory}, " +
+                                                    "where the lake would read its own copies back")
+                    { ExitCode = 64 };
 
         using var lake = Open(config);
 
@@ -129,4 +142,13 @@ public class ServeCommand : LoggingCommand
             { ExitCode = 69 }; // EX_UNAVAILABLE: the tool is fine, what it needs is not here
         }
     }
+
+    /// Whether one path lies inside another, compared as directories rather than as text so
+    /// `/lake-cache` is not mistaken for a child of `/lake`.
+    static bool Under(string path, string directory)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)) + Path.DirectorySeparatorChar;
+        return Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+    }
+
 }

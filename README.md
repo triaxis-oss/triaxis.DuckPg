@@ -62,9 +62,9 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first. `--listen`, `--write`,
-`--write-format`, `--writable`, `--schema`, `--key` (repeatable), `--dacpac` and `--config` each
-override the file when both are given; argument paths are relative to the working directory, file
-paths to the file. A file named explicitly with `--config` must exist, so a typo is an error rather
+`--write-format`, `--writable`, `--schema`, `--key` (repeatable), `--dacpac`, `--cache` and
+`--config` each override the file when both are given; argument paths are relative to the working
+directory, file paths to the file. A file named explicitly with `--config` must exist, so a typo is an error rather
 than a silent fallback to defaults.
 
 `-v` traces each translated statement with its DuckDB execution time and row count (execution and
@@ -129,6 +129,39 @@ that accepts writes:
 A write is persisted as soon as DuckDB commits it — immediately for a bare statement, at `COMMIT`
 for one inside a transaction, and never for one that is rolled back. Restarting the gateway reads
 the same files back, so a written row survives without a database file anywhere.
+
+## Caching the merge
+
+A view is bound by DuckDB on **every execution** — a prepared statement re-plans exactly like a
+fresh one — so everything a view definition says is paid for by every query that touches it. On a
+wide table stacked over several layers that is most of the cost of reading it: the union, the row
+numbering that picks a winner, and a cast per column per layer.
+
+`--cache ./cache` writes the merged rows of every table more than one layer carries out once, as a
+ZSTD parquet, and publishes the view as a scan of that file. On a 300-table lake this materialises
+the 38 tables that actually merge, costs nothing measurable at startup, and cuts planning about
+threefold. ZSTD rather than snappy or none: a third smaller for the same read, and a compressed
+scan beats an uncompressed one outright, because there is less to move.
+
+What it does **not** cover is a table with a write layer — its rows change under any copy of them,
+so it keeps the merge. A table only one layer carries is already a single scan and needs no copy.
+Each copy is named for a hash of what produced it — the table's published shape, its key, its
+filter, and the bytes of every file it reads — so a restart over unchanged files reuses the copy
+instead of deriving it again, and a layer that *did* change lands on a different name rather than
+being answered with the old rows. Stale copies of a table are removed as it is rewritten. The cache
+is otherwise only revisited on startup and on `CALL duckpg_reload()`, which is what makes it
+correct: nothing else can change the files underneath while the lake is up.
+
+A declared default is not written into the copy: it stays with the view, so a `(getdate())` column
+is stamped by whoever reads it rather than frozen into a file that outlives the process. The
+exceptions are the defaults the merge itself depends on — one on a key column decides which row
+shadows which, and a filter or a virtual column reads the merged row, defaults and all — which are
+materialised with the rows they affect. The hash ignores what a default evaluated to either way:
+keying on it would rebuild every stamped table on every restart, which in a real schema is most
+of them.
+
+The cache must live outside the layer directories, or the lake would read its own copies back as
+data — the tool refuses that rather than discovering it later.
 
 A table is persisted in the format it already has a file in, so a hand-written `notes.yaml` stays
 YAML rather than turning into parquet the first time someone writes to it. `--write-format` decides
@@ -354,6 +387,7 @@ variables and the tool's usual override files layer over it for free.
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
+| `cache` | `--cache` | Directory for merged copies of multi-layer tables, as ZSTD parquet. |
 | `sessionVariables` | — | DuckDB variable → startup parameter name. |
 | `columns` | — | Virtual columns added to every table lacking them. |
 | `tables.<name>.key` | — | What identifies a row in this table. |
