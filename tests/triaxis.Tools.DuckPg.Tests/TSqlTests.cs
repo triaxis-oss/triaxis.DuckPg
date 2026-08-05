@@ -119,6 +119,41 @@ public class TSqlTests
         """SELECT * FROM "lake"."t" WHERE EXISTS (SELECT 1 FROM "lake"."u" WHERE "u"."id" = "t"."id")""")]
     public void RendersQueries(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// OPENJSON is how a collection reaches the server as one parameter -- EF Core's translation of
+    /// `WHERE x IN (list)`. It is a derived table here, projecting the columns the WITH clause
+    /// declares, so a reference to them needs no rewriting where it is used.
+    [Theory]
+    [InlineData("SELECT [f].[value] FROM OPENJSON(@p) WITH ([value] int '$') AS [f]",
+        """SELECT "f"."value" FROM (SELECT CAST("__element" ->> '$' AS INTEGER) AS "value" """ +
+        """FROM (SELECT unnest(from_json(CAST($p AS JSON), '["JSON"]')) AS "__element")) AS "f" """)]
+    // A column with no path of its own means `$.` and its own name, as it does on SQL Server.
+    [InlineData("SELECT * FROM OPENJSON(@p) WITH (id int, name nvarchar(50)) f",
+        """SELECT * FROM (SELECT CAST("__element" ->> '$.id' AS INTEGER) AS "id", """ +
+        """CAST("__element" ->> '$.name' AS VARCHAR) AS "name" """ +
+        """FROM (SELECT unnest(from_json(CAST($p AS JSON), '["JSON"]')) AS "__element")) AS "f" """)]
+    // A second argument names the part of the document the rows come from.
+    [InlineData("SELECT * FROM OPENJSON(@p, '$.items') WITH (id int '$.id') AS j",
+        """SELECT * FROM (SELECT CAST("__element" ->> '$.id' AS INTEGER) AS "id" """ +
+        """FROM (SELECT unnest(from_json(CAST($p AS JSON) -> '$.items', '["JSON"]')) AS "__element")) AS "j" """)]
+    // Without a WITH clause it is SQL Server's own shape: the index, the element, and a type code.
+    [InlineData("SELECT [key], [value] FROM OPENJSON(@p)",
+        """SELECT "key", "value" FROM (SELECT "key", "value", CASE "type" WHEN 'NULL' THEN 0 """ +
+        """WHEN 'VARCHAR' THEN 1 WHEN 'BOOLEAN' THEN 3 WHEN 'ARRAY' THEN 4 WHEN 'OBJECT' THEN 5 """ +
+        """ELSE 2 END AS "type" FROM json_each(CAST($p AS JSON)))""")]
+    public void RendersOpenJson(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql, "p"));
+
+    /// `AS JSON` keeps the element as a document, which is a shape this does not publish -- and a
+    /// refusal names it rather than rendering something that would quietly differ.
+    [Fact]
+    public void OpenJsonAsJsonIsRefused()
+    {
+        var refused = Assert.Throws<TSqlException>(() =>
+            Translate("SELECT * FROM OPENJSON(@p) WITH (x nvarchar(max) '$.x' AS JSON) AS j", "p"));
+
+        Assert.Contains("AS JSON is not supported", refused.Message);
+    }
+
     [Theory]
     [InlineData("INSERT INTO orders (id, amount) VALUES (1, 2)",
         """INSERT INTO "lake"."orders" ("id", "amount") VALUES (1, 2)""")]

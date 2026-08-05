@@ -273,6 +273,36 @@ public class TdsTests : IDisposable
         Assert.Equal(new DateTime(2026, 8, 4, 10, 11, 12), Assert.IsType<DateTime>(reader.GetValue(4)));
     }
 
+    /// What EF Core sends for `WHERE x IN (list)`: the list travels as one JSON parameter and is
+    /// turned back into rows by OPENJSON, inside the derived table its own translation wraps
+    /// everything in.
+    [Fact]
+    public void RunsWhatEfCoreSendsForAListParameter()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            """
+            SELECT [s0].[order_id]
+            FROM (
+                SELECT DISTINCT [s].[order_id], [s].[amount]
+                FROM [orders] AS [s]
+                WHERE [s].[order_id] IN (
+                    SELECT [f].[value]
+                    FROM OPENJSON(@ids) WITH ([value] int '$') AS [f]
+                ) AND [s].[amount] > @min
+            ) AS [s0]
+            ORDER BY [s0].[order_id]
+            """, connection);
+        command.Parameters.AddWithValue("@ids", "[1,3]");
+        command.Parameters.AddWithValue("@min", 5m);
+
+        using var reader = command.ExecuteReader();
+        var rows = new List<int>();
+        while (reader.Read()) rows.Add(reader.GetInt32(0));
+
+        Assert.Equal([1, 3], rows);
+    }
+
     /// The login name, since that is the only user a lake of files has.
     [Fact]
     public void SaysWhoIsAsking()

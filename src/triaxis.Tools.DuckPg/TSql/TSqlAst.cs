@@ -83,6 +83,15 @@ sealed record FunctionTableSource(FunctionCall Call, Name? Alias, List<Name> Col
 
 sealed record JoinSource(JoinKind Kind, TableSource Left, TableSource Right, Expr? On) : TableSource;
 
+/// `OPENJSON(json [, path]) WITH (col type '$.path', ...)`, which is how a collection reaches the
+/// server as one parameter -- what EF Core sends for `WHERE x IN (list)`. Without the WITH it is
+/// SQL Server's own key/value/type shape.
+sealed record OpenJsonSource(Expr Json, Expr? Path, List<OpenJsonColumn> Schema, Name? Alias) : TableSource;
+
+/// A column the WITH clause declares. `Path` is null when it was left out, which means `$.` and the
+/// column's own name.
+sealed record OpenJsonColumn(Name Name, TypeRef Type, string? Path);
+
 enum JoinKind { Inner, Left, Right, Full, Cross }
 
 // ---- expressions ---------------------------------------------------------------------------------

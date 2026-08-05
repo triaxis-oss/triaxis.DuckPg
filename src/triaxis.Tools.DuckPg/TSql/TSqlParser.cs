@@ -403,6 +403,10 @@ sealed class TSqlParser
         // A table-valued function: `read_parquet('…')` stands exactly where a table does.
         if (Peek.Is(TokenKind.Operator, "("))
         {
+            if (name.Parts is [{ Quoted: false, Text: var function }] &&
+                function.Equals("openjson", StringComparison.OrdinalIgnoreCase))
+                return OpenJson();
+
             var call = new FunctionCall(name.Parts, ParenthesisedList(), false, null);
             var (fnAlias, fnColumns) = SourceAlias();
             return new FunctionTableSource(call, fnAlias, fnColumns);
@@ -411,6 +415,39 @@ sealed class TSqlParser
         var (tableAlias, _) = SourceAlias();
         SkipHints();
         return new NamedTableSource(name, tableAlias);
+    }
+
+    /// `OPENJSON(json [, path]) [WITH (name type ['$.path'] [, ...])] [AS] alias`.
+    TableSource OpenJson()
+    {
+        ExpectOperator("(");
+        var json = Expression();
+        var path = AcceptOperator(",") ? Expression() : null;
+        ExpectOperator(")");
+
+        var schema = new List<OpenJsonColumn>();
+        if (Peek.Is("with") && Ahead(1).Is(TokenKind.Operator, "("))
+        {
+            Expect("with");
+            ExpectOperator("(");
+            do
+            {
+                var column = Identifier();
+                var type = Type();
+                var columnPath = Peek.Kind == TokenKind.String ? Take().Text : null;
+
+                // `AS JSON` keeps the element as a document rather than a value, which is a shape
+                // this does not publish.
+                if (Peek.Is("as")) throw Unexpected("OPENJSON ... AS JSON is not supported");
+
+                schema.Add(new OpenJsonColumn(column, type, columnPath));
+            }
+            while (AcceptOperator(","));
+            ExpectOperator(")");
+        }
+
+        var (alias, _) = SourceAlias();
+        return new OpenJsonSource(json, path, schema, alias);
     }
 
     (Name? Alias, List<Name> Columns) SourceAlias()

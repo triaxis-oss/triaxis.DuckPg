@@ -219,6 +219,10 @@ sealed class TSqlWriter(TSqlContext context)
                 if (derived.Columns.Count > 0) { Put(" ("); Join(derived.Columns, c => Put(Quote(c))); Put(")"); }
                 return;
 
+            case OpenJsonSource openJson:
+                OpenJson(openJson);
+                return;
+
             case FunctionTableSource function:
                 Expression(function.Call);
                 if (function.Alias is not null) Put(" AS ").Put(Quote(function.Alias));
@@ -278,6 +282,53 @@ sealed class TSqlWriter(TSqlContext context)
             : schema.Text;
 
         Put(SqlText.Quote(resolved)).Put(".").Put(Quote(name.Table));
+    }
+
+    /// OPENJSON is a derived table here, and its columns are projected rather than resolved: a
+    /// reference to `f.value` is then an ordinary column of a subquery, with nothing left to
+    /// rewrite where it is used. Each element of the array comes out of `unnest`, and each declared
+    /// column is the path it names, cast to the type it declares -- `$` being the element itself,
+    /// and a column with no path meaning its own name.
+    void OpenJson(OpenJsonSource source)
+    {
+        Put("(SELECT ");
+
+        if (source.Schema.Count == 0)
+        {
+            // SQL Server's own shape: the index, the element as text, and a code for what it is.
+            Put("\"key\", \"value\", CASE \"type\" WHEN 'NULL' THEN 0 WHEN 'VARCHAR' THEN 1 " +
+                "WHEN 'BOOLEAN' THEN 3 WHEN 'ARRAY' THEN 4 WHEN 'OBJECT' THEN 5 ELSE 2 END AS \"type\" " +
+                "FROM json_each(");
+            Document(source);
+            Put(")");
+        }
+        else
+        {
+            Join(source.Schema, column =>
+            {
+                Put("CAST(\"__element\" ->> ").Put(SqlText.Literal(column.Path ?? "$." + column.Name.Text));
+                Put(" AS ").Put(TypeName(column.Type)).Put(") AS ").Put(Quote(column.Name));
+            });
+
+            Put(" FROM (SELECT unnest(from_json(");
+            Document(source);
+            Put(", '[\"JSON\"]')) AS \"__element\")");
+        }
+
+        Put(")");
+        if (source.Alias is not null) Put(" AS ").Put(Quote(source.Alias));
+    }
+
+    /// The document itself, or the part of it a second argument points at.
+    void Document(OpenJsonSource source)
+    {
+        Put("CAST(");
+        Expression(source.Json);
+        Put(" AS JSON)");
+
+        if (source.Path is null) return;
+        Put(" -> ");
+        Expression(source.Path);
     }
 
     // ---- expressions -----------------------------------------------------------------------------
