@@ -211,7 +211,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         {
             if (columns.Contains(name, StringComparer.OrdinalIgnoreCase)) continue;
             if (generated.Any(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) continue;
-            if (table.Has(name))
+
+            // A declared default is a value the lake knows, so a column the statement leaves to it
+            // is answerable -- stamped into the rows being written, which is where the answer comes
+            // from, so what is stored and what is read back cannot drift apart.
+            if (table.Columns.FirstOrDefault(c => c.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                is { Default: not null } defaulted) generated.Add(defaulted);
+            else if (table.Has(name))
                 throw new PgError("0A000", $"OUTPUT of `{name}` cannot be answered: a lake stores the row it is " +
                                            "given, and nothing here generates one the caller did not send");
             else carried.Add(name);
@@ -240,7 +246,9 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// the rows rather than off the table -- so the declared type has to be put back here, or a
     /// caller reading its own `int` key gets a long.
     static IEnumerable<string> NextValues(Table table, IEnumerable<Column> columns) =>
-        columns.Select(c => $"CAST(nextval({SqlText.Literal(Catalog.Sequence(table, c))}) AS {c.Type})");
+        columns.Select(c => c.Identity
+            ? $"CAST(nextval({SqlText.Literal(Catalog.Sequence(table, c))}) AS {c.Type})"
+            : $"CAST({c.Default!.Expr} AS {c.Type})");
 
     /// The columns an OUTPUT clause reads, which is the first name of each item it lists.
     static IEnumerable<string> Answered(string clause) =>

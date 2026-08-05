@@ -374,6 +374,13 @@ is answered: the rows are materialised, written from there, and read back from t
 each key comes back beside the position of the row that got it. A column the rows do not carry and
 nothing generates is refused by name rather than answered with a null.
 
+**A declared default is answered for too.** EF Core treats every column with a database default as
+store-generated: it leaves the column out of the INSERT and reads the server's value back through
+`OUTPUT`. A lake knows that value — the dacpac declared it — so the default is stamped into the rows
+being written and the answer comes off those same rows, which is what keeps a `getdate()` default
+from being one thing in the file and another in the caller's hand. A column with no declared default
+that the caller did not send is still refused by name.
+
 **A store-generated key needs a dacpac that declares one.** A column the model marks `IsIdentity`
 draws from a sequence in the write layer, seeded past the highest value the files already hold when
 the table first grows a write branch — so keys carry on from the lake's own state, and a restart

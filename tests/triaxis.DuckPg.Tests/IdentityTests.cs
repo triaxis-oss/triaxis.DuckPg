@@ -2,13 +2,14 @@ using Microsoft.Data.SqlClient;
 
 namespace triaxis.DuckPg.Tests;
 
-/// A key the store fills in is the one value a lake makes up, and only where the declared schema
-/// says so. It is what EF Core asks for back on every insert into such a table, so the asking and
-/// the answering are held to the same client that does it.
+/// What the store fills in rather than the caller: a declared identity, and a declared default. EF
+/// Core treats both as store-generated -- it leaves the column out of the INSERT and reads the value
+/// back through OUTPUT -- so the asking and the answering are held to the client that does it.
 public class IdentityTests
 {
     static Dacpac.TableModel Orders(string type) => new("orders",
-        [("id", type), ("amount", "decimal")], ["id"], Identity: ["id"]);
+        [("id", type), ("amount", "decimal"), ("flag", "bit"), ("created", "datetime")], ["id"],
+        Defaults: [("flag", "((1))"), ("created", "(getdate())")], Identity: ["id"]);
 
     static TestLake Lake() => new TestLake(nameof(IdentityTests))
         .Json("base", "orders", """[{"id": 41, "amount": 5}]""")
@@ -65,6 +66,46 @@ public class IdentityTests
 
         Assert.Equal(42L, command.ExecuteScalar());
         Assert.Equal(["41|5", "42|9"], lake.Query("SELECT id, amount FROM lake.orders ORDER BY id"));
+    }
+
+    /// A declared default is a value the lake knows, so a column left to it can be read back. EF
+    /// Core omits every defaulted column from the INSERT and expects the server's value.
+    [Fact]
+    public void ADeclaredDefaultIsAnsweredFor()
+    {
+        using var lake = Started(Lake());
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(
+            "INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[id], INSERTED.[flag] VALUES (23)", connection);
+        using (var reader = command.ExecuteReader())
+        {
+            Assert.True(reader.Read());
+            Assert.Equal(42L, Convert.ToInt64(reader.GetValue(0)));
+            Assert.True(reader.GetBoolean(1));
+        }
+
+        // What was answered is what was stored: the default is stamped into the row being written
+        // rather than worked out again afterwards.
+        Assert.Equal(["42|23|True"], lake.Query("SELECT id, amount, flag FROM lake.orders WHERE id = 42"));
+    }
+
+    /// A default that is not a constant has to be the same value in both places, or the row a caller
+    /// holds is not the row the lake wrote.
+    [Fact]
+    public void AStampedDefaultIsAnsweredWithWhatWasStored()
+    {
+        using var lake = Started(Lake());
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(
+            "INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[created] VALUES (1)", connection);
+        var answered = (DateTime)command.ExecuteScalar()!;
+
+        Assert.Equal([answered.ToString("yyyy-MM-dd HH:mm:ss.fff")],
+            lake.Query("SELECT strftime(created, '%Y-%m-%d %H:%M:%S.%g') FROM lake.orders WHERE id = 42"));
     }
 
     /// Nothing else is made up. A column the rows do not carry and the schema does not generate is

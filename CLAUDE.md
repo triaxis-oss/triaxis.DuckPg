@@ -214,7 +214,11 @@ publish a temp-directory convention as API.
   marked `IsIdentity` gets a sequence in the write layer (`Catalog.Sequence`), seeded past the
   highest value the merged view holds when the table grows its write branch -- at build for a table
   that already carries rows, in the promotion otherwise, which is the only moment the count is both
-  needed and cheap. `Gateway.Generated` fills it for any insert that leaves it out, so the plain
+  needed and cheap. A declared default is the other value a lake can answer for, and by the same
+  move: `Gateway.RewriteReturning` stamps `ColumnDefault.Expr` into the rows being written and reads
+  the answer off them, so a `getdate()` default cannot be one thing in the file and another in the
+  caller's hand -- which evaluating it twice would make it. `Gateway.Generated` fills a key for any
+  insert that leaves it out, so the plain
   statement and the answered one decide it the same way -- cast back to the declared type, since a
   sequence counts in BIGINT whatever the column is and the answer is read off the rows rather than
   off the table, which is how an `int` key reached SqlClient as a long. It is per process, so two serving the same
