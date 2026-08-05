@@ -226,6 +226,22 @@ public class TSqlTests
     [InlineData("INSERT INTO #staged (id) VALUES (1)", """INSERT INTO "#staged" ("id") VALUES (1)""")]
     public void RendersTemporaryTables(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// Nested joins defer their conditions, closing in reverse: the ON belonging to the inner join
+    /// arrives first. Read left-deep instead, the last ON has nothing left to attach to.
+    [Theory]
+    [InlineData("SELECT * FROM a LEFT JOIN b INNER JOIN c ON c.id = b.cid ON b.id = a.bid",
+        """SELECT * FROM "lake"."a" LEFT JOIN ("lake"."b" INNER JOIN "lake"."c" ON "c"."id" = "b"."cid") """ +
+        """ON "b"."id" = "a"."bid" """)]
+    // The ordinary chain is still a chain: an ON right after the operand ends it.
+    [InlineData("SELECT * FROM a JOIN b ON b.id = a.bid JOIN c ON c.id = b.cid",
+        """SELECT * FROM "lake"."a" INNER JOIN "lake"."b" ON "b"."id" = "a"."bid" """ +
+        """INNER JOIN "lake"."c" ON "c"."id" = "b"."cid" """)]
+    // What a dacpac view is written with, and what SSDT emits: parentheses saying the same thing.
+    [InlineData("SELECT * FROM a LEFT JOIN (b INNER JOIN c ON c.id = b.cid) ON b.id = a.bid",
+        """SELECT * FROM "lake"."a" LEFT JOIN ("lake"."b" INNER JOIN "lake"."c" ON "c"."id" = "b"."cid") """ +
+        """ON "b"."id" = "a"."bid" """)]
+    public void RendersNestedJoins(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
+
     /// A savepoint is a promise to undo part of a transaction, and DuckDB has nothing to undo it
     /// with. Marking one costs nothing; returning to one is refused rather than quietly not done,
     /// which would keep the writes the caller asked to discard.
