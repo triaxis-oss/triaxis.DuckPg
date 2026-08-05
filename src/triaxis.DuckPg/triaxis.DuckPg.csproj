@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>triaxis.DuckPg</AssemblyName>
+    <RootNamespace>triaxis.DuckPg</RootNamespace>
+
+    <PackageId>triaxis.DuckPg</PackageId>
+    <PackageTags>duckdb;postgres;pgwire;tds;sqlserver;parquet;datalake</PackageTags>
+    <Description>A stack of YAML, JSON and parquet layers served over the PostgreSQL and TDS wire protocols, in your own process. Point Npgsql, SqlClient or EF Core at files you wrote a moment ago. Bring a native DuckDB: the machine's, DuckDB.NET.Data.Full, or set installDuckDb to fetch one.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The managed bindings only. The native DuckDB is the machine's, one this fetches on
+         request, or one a consumer brings with DuckDB.NET.Data.Full. 420 MB of every platform's
+         library is not something a dependency should decide on someone's behalf. -->
+    <PackageReference Include="DuckDB.NET.Data" Version="1.5.5" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Its own, because the repository's leads with `dotnet tool install`, which is the other
+         package. -->
+    <None Include="README.md" Pack="true" PackagePath="/" />
+    <InternalsVisibleTo Include="triaxis.DuckPg.Cli" />
+    <InternalsVisibleTo Include="triaxis.DuckPg.Tests" />
+  </ItemGroup>
+
+</Project>

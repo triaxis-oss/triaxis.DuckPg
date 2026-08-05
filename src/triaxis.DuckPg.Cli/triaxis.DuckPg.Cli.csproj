@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>triaxis.DuckPg.Cli</AssemblyName>
+    <RootNamespace>triaxis.DuckPg.Cli</RootNamespace>
+
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>duckpg</ToolCommandName>
+    <PackageId>triaxis.DuckPg.Cli</PackageId>
+    <PackageTags>duckdb;postgres;pgwire;parquet;datalake;dotnet-tool</PackageTags>
+    <Description>Serves a stack of YAML, JSON and parquet layers over the PostgreSQL wire protocol, backed by DuckDB.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <IsAotCompatible>true</IsAotCompatible>
+    <EnableConfigurationBindingGenerator>true</EnableConfigurationBindingGenerator>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../triaxis.DuckPg/triaxis.DuckPg.csproj" />
+    <PackageReference Include="triaxis.CommandLine.Tool" Version="2.5.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>

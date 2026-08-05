@@ -23,9 +23,9 @@ jobs:
       - name: pack
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            dotnet pack src/triaxis.Tools.DuckPg -c Release -o artifacts -p:Version="${GITHUB_REF_NAME#v}"
+            dotnet pack -c Release -o artifacts -p:Version="${GITHUB_REF_NAME#v}"
           else
-            dotnet pack src/triaxis.Tools.DuckPg -c Release -o artifacts
+            dotnet pack -c Release -o artifacts
           fi
 
       - uses: actions/upload-artifact@v4
