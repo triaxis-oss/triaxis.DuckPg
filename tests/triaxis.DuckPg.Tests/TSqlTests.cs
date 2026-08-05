@@ -242,6 +242,17 @@ public class TSqlTests
         """ON "b"."id" = "a"."bid" """)]
     public void RendersNestedJoins(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// `TOP n PERCENT` is a share of the rows rounded up, and at least one of them. DuckDB's own
+    /// `LIMIT n%` rounds down, so the count is worked out rather than handed over.
+    [Fact]
+    public void TopPercentCountsTheRows()
+    {
+        Assert.Equal(
+            """SELECT * FROM "lake"."orders" ORDER BY "id" LIMIT (SELECT CAST(CEIL(count(*) * 50 / 100.0) """ +
+            """AS BIGINT) FROM (SELECT * FROM "lake"."orders") AS "_percent")""",
+            Translate("SELECT TOP 50 PERCENT * FROM orders ORDER BY id"));
+    }
+
     /// A savepoint is a promise to undo part of a transaction, and DuckDB has nothing to undo it
     /// with. Marking one costs nothing; returning to one is refused rather than quietly not done,
     /// which would keep the writes the caller asked to discard.
@@ -265,7 +276,6 @@ public class TSqlTests
 
     [Theory]
     [InlineData("CREATE TABLE t (a INT)", "unsupported statement")]
-    [InlineData("SELECT TOP 5 PERCENT * FROM t", "TOP PERCENT")]
     [InlineData("EXEC sp_who", "sp_who is not supported")]
     [InlineData("EXEC ('SELECT 1')", "EXEC of a string")]
     [InlineData("EXEC @rc = sp_getapplock @Resource = 'r'", "EXEC into a variable")]

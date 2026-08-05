@@ -338,8 +338,9 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
-| `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
+| `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
+| `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
 | `SAVE TRANSACTION x` | nothing; `ROLLBACK TRANSACTION x` is refused rather than faked |
@@ -369,8 +370,8 @@ nothing — marking a point costs nothing — but DuckDB has no savepoints to re
 EF Core marks one whenever it saves inside a transaction the caller opened.
 
 A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, the `MERGE`
-branches that add or remove rows, `CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax
-error naming it, rather than passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
+branches that add or remove rows, `CONVERT` with a style — is refused with a syntax error naming it,
+rather than passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
 `[a-z]` ranges have no DuckDB equivalent.
 
 ## Columns the files do not contain

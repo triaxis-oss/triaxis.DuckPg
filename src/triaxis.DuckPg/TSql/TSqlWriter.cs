@@ -182,7 +182,9 @@ sealed class TSqlWriter(TSqlContext context)
             Put(" ");
         }
 
+        var start = sql.Length;
         Body(query.Body);
+        var body = sql.ToString(start, sql.Length - start);
 
         if (query.OrderBy.Count > 0)
         {
@@ -196,11 +198,24 @@ sealed class TSqlWriter(TSqlContext context)
             throw new TSqlException("TOP and FETCH cannot both limit one query", 0);
 
         if (query.Fetch is not null) { Put(" LIMIT "); Expression(query.Fetch); }
+        else if (top is not null && (query.Body as SelectBody)!.TopPercent) Percent(top, body);
         else if (top is not null) { Put(" LIMIT "); Expression(top is ParenExpr paren ? paren.Inner : top); }
 
         if (query.Offset is not null) { Put(" OFFSET "); Expression(query.Offset); }
 
         foreach (var name in scope) defined.Remove(name);
+    }
+
+    /// `TOP n PERCENT` is a count of rows, rounded up, so it takes counting them: 1 percent of a
+    /// hundred and one rows is two, and of anything at all it is at least one. DuckDB's own
+    /// `LIMIT n%` rounds the other way and answers nothing for a small enough share, which is a
+    /// different statement wearing the same words. The body is counted rather than re-rendered --
+    /// it is the text just written, so a CTE it reads is still in scope where it is read again.
+    void Percent(Expr percent, string body)
+    {
+        Put(" LIMIT (SELECT CAST(CEIL(count(*) * ");
+        Expression(percent is ParenExpr paren ? paren.Inner : percent);
+        Put(" / 100.0) AS BIGINT) FROM (").Put(body).Put(") AS \"_percent\")");
     }
 
     void Order(OrderTerm term)
@@ -214,7 +229,6 @@ sealed class TSqlWriter(TSqlContext context)
         switch (body)
         {
             case SelectBody select:
-                if (select.TopPercent) throw new TSqlException("TOP PERCENT is not supported", 0);
                 // Lifted off by the statement that owns it, so one here is an INTO in a subquery,
                 // a set operation or a CTE -- places that have nowhere to put a table.
                 if (select.Into is { } into)
