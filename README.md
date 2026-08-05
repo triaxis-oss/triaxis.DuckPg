@@ -157,6 +157,7 @@ What SqlClient does, and what answers it:
 | `CommandTimeout`, `cmd.Cancel()` | Attention → `duckdb_interrupt` → DONE with the attention bit |
 | Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
 | `SET NOCOUNT ON` and its relatives | accepted and ignored |
+| `COUNT`, `COUNT_BIG` | an `int` and a `bigint`, as on SQL Server — DuckDB counts in BIGINT either way |
 
 Not implemented: TLS and SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
 `SqlBulkCopy`, table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA`

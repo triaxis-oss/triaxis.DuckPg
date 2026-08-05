@@ -446,14 +446,29 @@ sealed class TSqlWriter(TSqlContext context)
     {
         if (call.Name.Count == 1 && Rewritten(call)) return;
 
+        // DuckDB has one count and it is a BIGINT. SQL Server has two: COUNT, which is an `int`,
+        // and COUNT_BIG, which is not -- so an application that casts what COUNT returns to `int`
+        // throws on a lake where it would not on a database. The cast goes around the window
+        // clause too, since a counted window is just as much an `int`.
+        var counting = call.Name is [{ Quoted: false } only] ? only.Text.ToLowerInvariant() : "";
+        var narrow = counting == "count";
+
+        if (narrow) Put("CAST(");
+
         // A function name is not an identifier to be quoted: `"COUNT"` is a column called COUNT.
-        Join(call.Name, part => Put(part.Quoted ? Quote(part) : part.Text), ".");
+        if (counting == "count_big") Put("count");
+        else Join(call.Name, part => Put(part.Quoted ? Quote(part) : part.Text), ".");
+
         Put("(");
         if (call.Distinct) Put("DISTINCT ");
         Join(call.Arguments, Expression);
         Put(")");
 
-        if (call.Over is null) return;
+        if (call.Over is null)
+        {
+            if (narrow) Put(" AS INTEGER)");
+            return;
+        }
 
         Put(" OVER (");
         if (call.Over.PartitionBy.Count > 0)
@@ -468,6 +483,8 @@ sealed class TSqlWriter(TSqlContext context)
             Join(call.Over.OrderBy, Order);
         }
         Put(")");
+
+        if (narrow) Put(" AS INTEGER)");
     }
 
     /// The functions whose DuckDB equivalent is spelled differently, takes its arguments in another

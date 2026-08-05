@@ -100,9 +100,14 @@ public class TSqlTests
     [InlineData("SELECT o.id FROM orders AS o WITH (NOLOCK) WHERE o.id > 0",
         """SELECT "o"."id" FROM "lake"."orders" AS "o" WHERE "o"."id" > 0""")]
     [InlineData("SELECT name = c.name FROM customers c", """SELECT "c"."name" AS "name" FROM "lake"."customers" AS "c" """)]
-    // A function name keeps the case it was written in; DuckDB matches it either way.
-    [InlineData("SELECT COUNT(*) FROM t", """SELECT COUNT(*) FROM "lake"."t" """)]
-    [InlineData("SELECT COUNT(DISTINCT a) FROM t", """SELECT COUNT(DISTINCT "a") FROM "lake"."t" """)]
+    // A function name keeps the case it was written in; DuckDB matches it either way. COUNT is an
+    // `int` in SQL Server and a BIGINT here, so it is cast back to what the caller expects.
+    [InlineData("SELECT COUNT(*) FROM t", """SELECT CAST(COUNT(*) AS INTEGER) FROM "lake"."t" """)]
+    [InlineData("SELECT COUNT(DISTINCT a) FROM t", """SELECT CAST(COUNT(DISTINCT "a") AS INTEGER) FROM "lake"."t" """)]
+    [InlineData("SELECT COUNT_BIG(*) FROM t", """SELECT count(*) FROM "lake"."t" """)]
+    // The cast goes around the window clause, not inside it.
+    [InlineData("SELECT COUNT(*) OVER (PARTITION BY a) FROM t",
+        """SELECT CAST(COUNT(*) OVER (PARTITION BY "a") AS INTEGER) FROM "lake"."t" """)]
     [InlineData("SELECT row_number() OVER (PARTITION BY a ORDER BY b DESC) FROM t",
         """SELECT row_number() OVER (PARTITION BY "a" ORDER BY "b" DESC) FROM "lake"."t" """)]
     [InlineData("WITH c AS (SELECT 1 AS x) SELECT * FROM c",
