@@ -341,6 +341,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
+| `SAVE TRANSACTION x` | nothing; `ROLLBACK TRANSACTION x` is refused rather than faked |
 | `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted; every other `EXEC` is refused by name |
 
 `+` becomes `||` only where one side is provably text — a string literal, a `CAST` to a character
@@ -360,6 +361,11 @@ A `#table` is a temporary table, and DuckDB's belong to a connection exactly as 
 to a session — including going away when a pooled connection is handed out again. `##global` ones
 are refused: another connection cannot see them here. `SELECT … INTO` and `DROP TABLE` accept
 nothing else, since a lake's tables are the files under it.
+
+A savepoint is the one thing that is refused rather than approximated. `SAVE TRANSACTION` renders to
+nothing — marking a point costs nothing — but DuckDB has no savepoints to return to, so
+`ROLLBACK TRANSACTION x` fails loudly instead of quietly keeping the writes it was asked to discard.
+EF Core marks one whenever it saves inside a transaction the caller opened.
 
 A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, the `MERGE`
 branches that add or remove rows, `CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax

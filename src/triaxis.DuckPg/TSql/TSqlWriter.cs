@@ -139,8 +139,21 @@ sealed class TSqlWriter(TSqlContext context)
                 {
                     TransactionAction.Begin => "BEGIN TRANSACTION",
                     TransactionAction.Commit => "COMMIT",
+
+                    // Rolling back to a savepoint keeps what the transaction did before it and
+                    // discards the rest. DuckDB has no savepoints, and half a transaction cannot be
+                    // made out of the two things it does have -- so the caller is told, rather than
+                    // silently handed the half it did not ask for.
+                    TransactionAction.Rollback when transaction.Name is not null =>
+                        throw new TSqlException(
+                            $"ROLLBACK TRANSACTION {transaction.Name} cannot be honoured: there is no savepoint to " +
+                            "roll back to, and keeping the rest of the transaction would keep writes meant to go", 0),
+
                     TransactionAction.Rollback => "ROLLBACK",
-                    _ => throw new TSqlException("savepoints are not supported", 0),
+
+                    // Marking a point to return to costs nothing while returning to it is refused:
+                    // a transaction that reaches its COMMIT passed the savepoint without needing it.
+                    _ => "",
                 });
                 return;
 

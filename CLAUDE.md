@@ -189,6 +189,11 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**
+  `SAVE TRANSACTION` renders to nothing -- marking a point costs nothing -- but
+  `ROLLBACK TRANSACTION <name>` throws instead of rendering a plain `ROLLBACK` or nothing at all:
+  one discards more than was asked, the other keeps writes that were asked to go, and EF Core marks
+  a savepoint on every `SaveChangesAsync` inside a caller's transaction. The refusal is the feature.
 - **A `#name` is a temporary table, and nothing else is one.** DuckDB's belong to a connection, which
   is what SQL Server means by a session, so `TSqlWriter.Table` renders them unqualified and never
   into the lake's schema. `SELECT … INTO` and `DROP TABLE` take nothing else -- a lake's tables are
