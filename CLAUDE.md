@@ -189,6 +189,11 @@ publish a temp-directory convention as API.
   the statement did not assign have to say which side they came from, in the projection and in
   `Keys` alike. The branches that add or remove rows are refused by name -- what a row's existence
   means is the layer machinery's, not one statement's.
+- **A `#name` is a temporary table, and nothing else is one.** DuckDB's belong to a connection, which
+  is what SQL Server means by a session, so `TSqlWriter.Table` renders them unqualified and never
+  into the lake's schema. `SELECT … INTO` and `DROP TABLE` take nothing else -- a lake's tables are
+  the files under it -- and `##name` is refused, because a global temporary table is one another
+  connection can see. They also have to disappear when a pooled connection is handed out again.
 - **An application lock is granted by doing nothing.** `EXEC sp_getapplock` asks to be serialised
   against the other connections of a shared database; a lake serves the application that owns its
   files, so the exclusion is already there and `TSqlWriter` renders the statement as nothing --
@@ -196,6 +201,11 @@ publish a temp-directory convention as API.
   more than a lake can keep, since the files under it may be served by another process. `EXEC` of
   anything else is refused by name: the parser covers the call so an ORM reaching for a procedure
   is told which one is missing, not that `EXEC` is unparseable.
+- **A pooled connection announces itself in the packet header.** SqlClient sets the RESETCONNECTION
+  bit on the first message it sends over a connection it took back out of the pool; only an older
+  client calls `sp_reset_connection`, so a server that answers just the procedure never hears about
+  the reuse. `TdsWire.ReadMessage` surfaces the bit and `TdsSession.Reset` acts on it, which is what
+  keeps one session's `#table` out of the next one's.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column

@@ -306,7 +306,7 @@ What SqlClient does, and what answers it:
 | `INSERT` / `UPDATE` / `DELETE` | the same write layer the PostgreSQL side writes |
 | Errors an application can recover from | ERROR tokens with SQL Server's own numbers (208, 102, 245, …) |
 | `CommandTimeout`, `cmd.Cancel()` | Attention → `duckdb_interrupt` → DONE with the attention bit |
-| Connection pooling, `sp_reset_connection` | session state cleared, files untouched |
+| Connection pooling, the reset a reused connection carries | prepared handles and `#tables` dropped, files untouched |
 | `SET NOCOUNT ON` and its relatives | accepted and ignored |
 | `OPENJSON(@p) WITH (…)` — EF Core's list parameter | a derived table over the JSON, one row per element |
 | `MERGE … WHEN MATCHED THEN UPDATE` — its bulk update | a joined `UPDATE`; the other branches are refused by name |
@@ -338,6 +338,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
+| `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
 | `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted; every other `EXEC` is refused by name |
@@ -355,9 +356,14 @@ other connections of a shared database, and a lake is not one — it serves the 
 its files, so the exclusion is already there. `EXEC` of anything else is refused by name, which is
 the answer an ORM calling a stored procedure gets rather than a syntax error about `EXEC`.
 
-A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, `MERGE`,
-`CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax error naming it, rather than
-passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
+A `#table` is a temporary table, and DuckDB's belong to a connection exactly as SQL Server's belong
+to a session — including going away when a pooled connection is handed out again. `##global` ones
+are refused: another connection cannot see them here. `SELECT … INTO` and `DROP TABLE` accept
+nothing else, since a lake's tables are the files under it.
+
+A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, the `MERGE`
+branches that add or remove rows, `CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax
+error naming it, rather than passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
 `[a-z]` ranges have no DuckDB equivalent.
 
 ## Columns the files do not contain

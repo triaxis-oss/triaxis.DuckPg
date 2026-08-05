@@ -41,7 +41,11 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             var message = wire.ReadMessage();
             if (message is null) return;
-            var (type, payload) = message.Value;
+            var (type, payload, reset) = message.Value;
+
+            // A connection out of the pool is a session that never happened here: what the last one
+            // prepared, made or left open goes before its first statement is read.
+            if (reset) Reset();
 
             try
             {
@@ -558,6 +562,28 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         prepared.Clear();
         pendingWrites.Clear();
         transactions = 0;
+        DropTemporaryTables();
+    }
+
+    /// A connection given back to the pool comes out of it as a new session, and SQL Server drops
+    /// what the old one made. A `#table` left behind would be found by whoever gets this connection
+    /// next, which is worse than not having it: a client that makes one usually asks first.
+    void DropTemporaryTables()
+    {
+        var tables = new List<string>();
+        using (var command = duck.CreateCommand())
+        {
+            command.CommandText = "SELECT table_name FROM duckdb_tables() WHERE temporary";
+            using var reader = command.ExecuteReader();
+            while (reader.Read()) tables.Add(reader.GetString(0));
+        }
+
+        foreach (var table in tables)
+        {
+            using var command = duck.CreateCommand();
+            command.CommandText = $"DROP TABLE IF EXISTS temp.main.{SqlText.Quote(table)}";
+            command.ExecuteNonQuery();
+        }
     }
 
     static string Text(List<(string Name, object? Value)> arguments, int index) =>

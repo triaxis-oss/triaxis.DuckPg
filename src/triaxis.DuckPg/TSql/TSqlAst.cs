@@ -8,6 +8,12 @@ abstract record Statement;
 
 sealed record SelectStatement(Query Query) : Statement;
 
+/// `SELECT … INTO #t FROM …` — T-SQL's CTAS, and a statement rather than a query: what it returns
+/// is a table. Only a temporary one, since a lake's tables are its files.
+sealed record SelectIntoStatement(TableName Target, Query Query) : Statement;
+
+sealed record DropTableStatement(TableName Target, bool IfExists) : Statement;
+
 sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source) : Statement;
 
 /// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
@@ -60,6 +66,9 @@ sealed record SelectBody(
     Expr? Top,
     bool TopPercent,
     List<SelectItem> Items,
+    /// The `INTO #t` of a `SELECT … INTO`, lifted out of the body by the statement that owns it —
+    /// a query nested anywhere else has nowhere to put a table.
+    TableName? Into,
     TableSource? From,
     Expr? Where,
     List<Expr> GroupBy,
