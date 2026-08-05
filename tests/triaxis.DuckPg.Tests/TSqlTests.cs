@@ -213,8 +213,20 @@ public class TSqlTests
         Assert.Equal("COMMIT", Translate("COMMIT TRAN"));
     }
 
+    [Fact]
+    public void ApplicationLocksRenderToNothing()
+    {
+        Assert.Equal("", Translate("EXEC sp_getapplock @Resource = 'orders:reload', " +
+                                   "@LockMode = 'Exclusive', @LockOwner = 'Transaction'"));
+        Assert.Equal("", Translate("EXECUTE [dbo].[sp_releaseapplock] 'orders:reload', 'Transaction'"));
+    }
+
     [Theory]
     [InlineData("CREATE TABLE t (a INT)", "unsupported statement")]
+    [InlineData("EXEC sp_who", "sp_who is not supported")]
+    [InlineData("EXEC ('SELECT 1')", "EXEC of a string")]
+    [InlineData("EXEC @rc = sp_getapplock @Resource = 'r'", "EXEC into a variable")]
+    [InlineData("EXEC sp_getapplock @Resource = 'r', @Result = @out OUTPUT", "OUTPUT argument")]
     [InlineData("SELECT TOP 5 PERCENT * FROM t", "TOP PERCENT")]
     [InlineData("SELECT CONVERT(VARCHAR, d, 120) FROM t", "CONVERT with a style")]
     [InlineData("SELECT * FROM", "expected a name")]

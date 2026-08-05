@@ -340,6 +340,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
 | `WITH (NOLOCK)` and other table hints | dropped |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
+| `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted; every other `EXEC` is refused by name |
 
 `+` becomes `||` only where one side is provably text — a string literal, a `CAST` to a character
 type, or a function that returns one. Everywhere else it stays arithmetic, because guessing would
@@ -348,6 +349,11 @@ turn `1 + 2` into `'12'`.
 An ORM that qualifies everything it writes — LLBLGen Pro among them — is what this is for: table
 references, column references and `TOP(@p)` paging over a row-numbered derived table all land on
 the lake without the application knowing what it is talking to.
+
+An application lock is granted by doing nothing. `sp_getapplock` serialises a caller against the
+other connections of a shared database, and a lake is not one — it serves the application that owns
+its files, so the exclusion is already there. `EXEC` of anything else is refused by name, which is
+the answer an ORM calling a stored procedure gets rather than a syntax error about `EXEC`.
 
 A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, `MERGE`,
 `CONVERT` with a style, `TOP … PERCENT` — is refused with a syntax error naming it, rather than

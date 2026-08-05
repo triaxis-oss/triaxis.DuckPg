@@ -20,6 +20,13 @@ sealed record DeleteStatement(TableName Target, TableSource? From, Expr? Where) 
 /// lake has no opinion about.
 sealed record SetOptionStatement(string Option) : Statement;
 
+/// `EXEC procedure [@name = value, …]`. A lake has no procedures of its own, so which ones are
+/// answered is the writer's; this is only the shape a client calls one with.
+sealed record ExecuteStatement(TableName Procedure, List<ExecuteArgument> Arguments) : Statement;
+
+/// Named (`@Resource = 'x'`) or positional, as the call was written.
+sealed record ExecuteArgument(Name? Name, Expr Value);
+
 sealed record TransactionStatement(TransactionAction Action, string? Name) : Statement;
 
 enum TransactionAction { Begin, Commit, Rollback, Save }
