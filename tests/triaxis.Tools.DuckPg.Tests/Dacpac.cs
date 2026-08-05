@@ -11,8 +11,12 @@ static class Dacpac
     public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key,
                             (string Column, string Expression)[]? Defaults = null);
 
+    /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
+    public record ViewModel(string Name, string Query);
 
-    public static void Write(string path, params TableModel[] tables)
+    public static void Write(string path, params TableModel[] tables) => Write(path, tables, []);
+
+    public static void Write(string path, TableModel[] tables, params ViewModel[] views)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
@@ -20,7 +24,8 @@ static class Dacpac
             new XElement(Dac + "Model",
                 tables.Select(Element)
                       .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
-                      .Concat(tables.SelectMany(Defaults))));
+                      .Concat(tables.SelectMany(Defaults))
+                      .Concat(views.Select(View))));
 
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         using var entry = archive.CreateEntry("model.xml").Open();
@@ -32,6 +37,9 @@ static class Dacpac
             Rel("Columns", [.. table.Columns.Select(c =>
                 El("SqlSimpleColumn", $"[dbo].[{table.Name}].[{c.Column}]",
                     Rel("TypeSpecifier", El("SqlTypeSpecifier", null, Rel("Type", Ref($"[{c.Type}]"))))))]));
+
+    static XElement View(ViewModel view) =>
+        El("SqlView", $"[dbo].[{view.Name}]", Script("QueryScript", view.Query));
 
     /// A default is its own element, pointing back at the column it belongs to.
     static IEnumerable<XElement> Defaults(TableModel table) =>

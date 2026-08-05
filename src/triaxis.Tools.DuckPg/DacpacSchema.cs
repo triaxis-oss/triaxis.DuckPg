@@ -17,6 +17,7 @@ sealed class DacpacSchema
     readonly Dictionary<string, List<Column>> columns = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<string, string[]> keys = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<(string Table, string Column), string> defaults = new();
+    readonly Dictionary<string, string> views = new(StringComparer.OrdinalIgnoreCase);
 
     public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
     {
@@ -35,6 +36,9 @@ sealed class DacpacSchema
     /// The T-SQL a column defaults to, as the dacpac spells it -- `(getdate())`, `((0))`.
     public string? Default(string table, string column) => defaults.GetValueOrDefault((table, column));
 
+    /// Each declared view and the query it stands for, in the dialect it was written in.
+    public IReadOnlyDictionary<string, string> Views => views;
+
     void Read(string path, ILogger logger)
     {
         using var archive = ZipFile.OpenRead(path);
@@ -51,6 +55,7 @@ sealed class DacpacSchema
                 "SqlTable" => ReadTable(element),
                 "SqlPrimaryKeyConstraint" => ReadKey(element),
                 "SqlDefaultConstraint" => ReadDefault(element),
+                "SqlView" => ReadView(element),
                 // Every other element is something this tool does not claim to read.
                 _ => true,
             };
@@ -104,6 +109,16 @@ sealed class DacpacSchema
         if (key.Length == 0) return false;
 
         keys[name] = key;
+        return true;
+    }
+
+    /// A view is its query; the header it was declared with is not in the model to begin with.
+    bool ReadView(XElement view)
+    {
+        if (Unqualify(view.Attribute("Name")?.Value) is not { } name) return false;
+        if (Property(view, "QueryScript") is not { Length: > 0 } query) return false;
+
+        views[name] = query;
         return true;
     }
 
