@@ -57,6 +57,15 @@ public class TdsTests : IDisposable
         Assert.Equal(["1/10.50/2026-08-01/first", "2/20.00/2026-08-02/second", "3/30.00/2026-08-03/null"], rows);
     }
 
+    /// The login name, since that is the only user a lake of files has.
+    [Fact]
+    public void SaysWhoIsAsking()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT SUSER_SNAME()", connection);
+        Assert.Equal("sa", command.ExecuteScalar());
+    }
+
     [Fact]
     public void TranslatesTheDialectItIsSent()
     {

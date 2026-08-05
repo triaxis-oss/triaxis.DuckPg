@@ -14,7 +14,7 @@ someone changing the code needs.
 | `Layer.cs` | Scanning a layer directory, reading a source, writing one back. YAML ↔ JSON. |
 | `Catalog.cs` | The published shape: which tables exist, their columns, keys, and the view SQL. |
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
-| `DacpacSchema.cs` | The declared schema as a service: finds the dacpac and reads `model.xml`. No DacFx. |
+| `DacpacSchema.cs` | The declared schema as a service: finds the dacpac and reads `model.xml`: columns, keys and defaults. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
 | `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
 | `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |
@@ -42,6 +42,13 @@ someone changing the code needs.
 - **A partition column is part of the key.** `db=one/orders.parquet` and `db=two/orders.parquet`
   both have a row 1; without `db` in the key the `QUALIFY` would drop one of them. `KeyFor`
   appends partition columns to whatever key was found, and to nothing when no key was found.
+- **A declared default is a value in the read layers and an expression in the write layer.**
+  `Catalog.Evaluate` returns both: `ColumnDefault.Value`, answered once against DuckDB and kept for
+  the life of the process, fills the gaps in a read layer's branch — a table scanned twice has to
+  answer the same both times, and a row already in a file cannot say when it was written.
+  `ColumnDefault.Expr` is what the write table declares, so a row being inserted is stamped as it is
+  inserted. Filling the write branch in the view, or freezing the write table's default, each undoes
+  half of that.
 - **The type catalog describes the OIDs the gateway puts on the wire**, not DuckDB's own types.
   `Shims.Macros` replaces `pg_type` wholesale for that reason; DuckDB's has NULL oids and its own
   type names.

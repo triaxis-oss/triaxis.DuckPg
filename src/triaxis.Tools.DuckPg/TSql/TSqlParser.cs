@@ -22,6 +22,17 @@ sealed class TSqlParser
         }
     }
 
+    /// One expression standing on its own, as a dacpac's declared default is. Anything left over is
+    /// refused rather than ignored -- a default that only half parsed is not one to apply.
+    public static Expr ParseExpression(string sql)
+    {
+        var parser = new TSqlParser(new TSqlLexer(sql).Tokenise());
+        var expr = parser.Expression();
+        return parser.Peek.Kind == TokenKind.End
+            ? expr
+            : throw new TSqlException($"unexpected `{parser.Peek.Text}`", parser.Peek.Position);
+    }
+
     // ---- token plumbing --------------------------------------------------------------------------
 
     Token Peek => tokens[pos];
