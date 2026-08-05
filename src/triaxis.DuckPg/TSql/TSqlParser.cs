@@ -471,7 +471,11 @@ sealed class TSqlParser
             Accept("outer");
             Expect("join");
 
-            var right = PrimaryTableSource();
+            // The operand is a join tree of its own, not just a table: T-SQL lets a join nest inside
+            // another and defers the conditions -- `a JOIN b JOIN c ON … ON …`, closing in reverse.
+            // A join keyword arriving before this join's ON is the nested one; an ON ends the
+            // operand, which is what keeps the ordinary left-deep chain left-deep.
+            var right = TableSource();
             Expr? on = Accept("on") ? Expression() : null;
             left = new JoinSource(kind.Value, left, right, on);
         }

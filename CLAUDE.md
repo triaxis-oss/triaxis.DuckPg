@@ -199,6 +199,10 @@ publish a temp-directory convention as API.
   into the lake's schema. `SELECT … INTO` and `DROP TABLE` take nothing else -- a lake's tables are
   the files under it -- and `##name` is refused, because a global temporary table is one another
   connection can see. They also have to disappear when a pooled connection is handed out again.
+- **A join's right operand is a join tree, not a table.** `a LEFT JOIN b JOIN c ON … ON …` nests, and
+  the conditions close in reverse; parsing it left-deep leaves the last `ON` with nothing to attach
+  to, which is what made a dacpac's view unpublishable. A join keyword arriving before this join's
+  `ON` belongs to the operand, an `ON` ends it -- which is what keeps an ordinary chain a chain.
 - **An application lock is granted by doing nothing.** `EXEC sp_getapplock` asks to be serialised
   against the other connections of a shared database; a lake serves the application that owns its
   files, so the exclusion is already there and `TSqlWriter` renders the statement as nothing --

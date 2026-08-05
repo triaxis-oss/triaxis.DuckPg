@@ -284,7 +284,10 @@ sealed class TSqlWriter(TSqlContext context)
                     JoinKind.Full => " FULL JOIN ",
                     _ => " CROSS JOIN ",
                 });
-                Source(join.Right);
+                // A join under a join keeps its own ON with it, which parentheses say plainly --
+                // written flat, the conditions would close in an order the reader has to work out.
+                if (join.Right is JoinSource) { Put("("); Source(join.Right); Put(")"); }
+                else Source(join.Right);
                 if (join.On is not null) { Put(" ON "); Expression(join.On); }
                 return;
         }
