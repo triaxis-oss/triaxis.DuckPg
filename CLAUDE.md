@@ -68,7 +68,11 @@ publish a temp-directory convention as API.
   stack that already carried it comes out empty and takes the earlier run's writes with it -- and a
   tombstone, absent from a baseline that applied it, is not written again and the row returns on the
   run after. So the baseline is the read layers alone while the table is cut from the whole stack;
-  the two views differ, and a lake restarted twice is what tells them apart. `Config.Store` takes the
+  the two views differ, and a lake restarted twice is what tells them apart -- `DeltaTests` runs every
+  shape of write through three of them, in both modes, because two agreeing proves nothing. What a
+  reconstructed delta cannot say is *how many*: `EXCEPT` is a set difference, so on a keyless table a
+  row inserted identical to one the layers hold is not in it. A keyed table is safe, and a delete
+  without a key is refused before it can be lost. `Config.Store` takes the
   question away entirely: the tables are in a DuckDB file, so a start that finds one keeps it and
   never reads the layers for it again -- `Catalog.Stored` is what asks, and a shape that disagrees
   with what the catalog publishes is refused rather than rebuilt, since rebuilding is the one thing

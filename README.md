@@ -285,6 +285,12 @@ that would rather pay the merge once than on every query. The cost is memory —
 resident — and that a table cannot carry anything answered per session: a `filter:` or a
 `getvariable()` column is refused at startup rather than quietly stopping.
 
+One more thing that delta cannot say. It is a set difference, so it carries *which* rows a table now
+has and not *how many of each*: on a table with no key, a row inserted identical to one the layers
+already hold is not in the difference, and does not come back. A layered lake keeps it, because it
+kept the row it was given rather than working it out afterwards. With a key — which `UPDATE` and
+`DELETE` need anyway, and which a dacpac supplies — the two modes agree on everything.
+
 `--store lake.duckdb` gives that materialized lake a DuckDB database file to live in. The layers are
 collapsed into it once; every start after that opens what is already there, and the layers are only
 consulted for a table the file does not yet carry. A write survives by having been written rather
