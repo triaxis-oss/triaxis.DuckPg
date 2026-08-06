@@ -34,6 +34,14 @@ public sealed class Config
     /// directory gets on a clean shutdown.
     public bool Materialize { get; set; }
 
+    /// Where a materialized lake is kept, as a DuckDB database file. Without one the tables live in
+    /// memory and the layers are collapsed into them on every start; with one they are collapsed
+    /// once, into the file, and every start after that opens what is already there -- so a write
+    /// survives by being written, rather than by being worked out again at shutdown. The layers are
+    /// then only consulted for a table the file does not yet carry: the file is the state.
+    /// Only meaningful with `Materialize`, which is what makes the tables tables.
+    public string? Store { get; set; }
+
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
     /// after that is invisible to it for as long as it lives -- and it cannot create one itself
@@ -77,6 +85,7 @@ public sealed class Config
     {
         Layers = [.. Layers.Select(l => Path.GetFullPath(l, baseDirectory))];
         if (Write is not null) Write = Path.GetFullPath(Write, baseDirectory);
+        if (Store is not null) Store = Path.GetFullPath(Store, baseDirectory);
         if (Dacpac is not null) Dacpac = Path.GetFullPath(Dacpac, baseDirectory);
     }
 
@@ -97,6 +106,14 @@ public sealed class Config
 
         if (Dacpac is { Length: > 0 } dacpac && !File.Exists(dacpac))
             throw new DuckPgConfigurationException($"dacpac not found: {dacpac}");
+
+        // A store holds tables, and only a materialized lake has any: the views a layered one
+        // publishes would be kept beside write-layer tables that the layer files also still hold,
+        // and the next start would apply every write twice.
+        if (Store is { Length: > 0 } && !Materialize)
+            throw new DuckPgConfigurationException(
+                "`store` keeps a materialized lake, so it needs `materialize`: without it a lake " +
+                "publishes views over the layer files, and there is nothing in a database file to keep");
 
         // A filter and a `getvariable()` column are answered per session, and a table shared by
         // every session cannot carry either. Refused rather than dropped: a mode that silently

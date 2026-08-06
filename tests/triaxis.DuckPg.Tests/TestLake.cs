@@ -82,6 +82,14 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// Kept in a DuckDB database file under the lake's own directory, so a restart opens what the
+    /// run before it left rather than collapsing the layers again.
+    public TestLake StoredAt(string file = "store.duckdb")
+    {
+        Config.Store = At(file);
+        return this;
+    }
+
     public TestLake WithTds()
     {
         Config.Tds = "127.0.0.1:0";

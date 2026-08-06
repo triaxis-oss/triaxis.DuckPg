@@ -91,7 +91,12 @@ public static class DuckPgServiceCollectionExtensions
 
         // One DuckDB behind the whole lake: the catalog is built on it and every session borrows
         // from it, so it is the one thing that cannot be transient.
-        services.TryAddSingleton(_ => new DuckDBConnection("Data Source=:memory:"));
+        // A store makes it a database on disk rather than one in memory; everything else about it
+        // is the same, including that every session borrows a connection from this one.
+        services.TryAddSingleton(p => new DuckDBConnection(
+            p.GetRequiredService<Config>().Store is { Length: > 0 } store
+                ? $"Data Source={store}"
+                : "Data Source=:memory:"));
         services.TryAddSingleton<WriteLayer>();
         services.TryAddSingleton<DacpacSchema>();
         services.TryAddSingleton<Catalog>();

@@ -715,6 +715,24 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         var carries = table.Writable && write.Carries(stacked);
         if (carries) write.Prepare(conn, stacked);
 
+        // A store already carrying this table is the state, and the layers are not consulted for it
+        // again: rebuilding would throw away everything written since it was made. What the file
+        // holds has to be what the catalog says it publishes, though -- a store made before a column
+        // was declared would fail on every query naming that column, and nowhere near here.
+        if (config.Store is { Length: > 0 } && Stored(conn, table) is { Count: > 0 } stored)
+        {
+            var declared = table.Columns.Select(c => c.Name);
+            if (!stored.SequenceEqual(declared, StringComparer.OrdinalIgnoreCase))
+                throw new DuckPgConfigurationException(
+                    $"the store holds {table.Name} as ({string.Join(", ", stored)}), and this lake " +
+                    $"publishes it as ({string.Join(", ", declared)}) -- the store is of another " +
+                    "schema, and rebuilding it here would discard what has been written to it");
+
+            promoted.Add(table.Name);
+            foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
+            return;
+        }
+
         // The baseline is the read layers and nothing else. Measured against a stack that already
         // carried the last delta, the next one comes out empty -- and since the write layer is
         // rewritten whole, that empties it of everything the run before did. A row hidden by a
@@ -733,6 +751,25 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
     }
 
+    /// The columns a store already holds for a table, in order, or nothing when it holds no such
+    /// table. A view is not a table: a store written by a build that is no longer this one may carry
+    /// either, and only a table is state worth keeping.
+    static List<string> Stored(DuckDBConnection conn, Table table)
+    {
+        using var command = conn.CreateCommand();
+        command.CommandText =
+            "SELECT column_name FROM information_schema.columns c WHERE c.table_schema = ? AND c.table_name = ? " +
+            "AND EXISTS (SELECT 1 FROM information_schema.tables t WHERE t.table_schema = c.table_schema " +
+            "AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE') ORDER BY ordinal_position";
+        command.Parameters.Add(new DuckDBParameter(table.Schema));
+        command.Parameters.Add(new DuckDBParameter(table.Name));
+
+        using var reader = command.ExecuteReader();
+        var columns = new List<string>();
+        while (reader.Read()) columns.Add(reader.GetString(0));
+        return columns;
+    }
+
     /// What the layers said before anything was written to them, for the shutdown delta.
     static string Baseline(Table table) =>
         $"{SqlText.Quote(BaseSchema)}.{SqlText.Quote(table.Name)}";
@@ -745,7 +782,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     {
         // Once only: the baseline reads the very tables this replaces, so a second pass would
         // measure the delta against the delta.
-        if (!config.Materialize || write.Directory is null || flushed) return;
+        // A store keeps what it was given by keeping it, so there is nothing to work out at
+        // shutdown -- and a delta beside it would be a second answer to the same question.
+        if (!config.Materialize || write.Directory is null || config.Store is { Length: > 0 } || flushed) return;
         flushed = true;
 
         foreach (var table in Tables.Values.Where(t => t.Writable))

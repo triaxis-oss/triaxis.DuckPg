@@ -37,6 +37,9 @@ public class ServeCommand : LoggingCommand
     [Option("--materialize", Description = "Collapse the layers into real DuckDB tables and serve those; nothing is kept but a delta at shutdown.")]
     public bool Materialize { get; set; }
 
+    [Option("--store", Description = "Keep a materialized lake in this DuckDB database file, so it survives a restart.")]
+    public string? Store { get; set; }
+
     [Option("--serialize-transactions", Description = "Let one transaction run at a time, the next waiting for the one in front of it.")]
     public bool SerializeTransactions { get; set; }
 
@@ -99,6 +102,7 @@ public class ServeCommand : LoggingCommand
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;
         if (Materialize) config.Materialize = true;
+        if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
         if (Key.Length > 0) config.DefaultKey = Key;

@@ -68,7 +68,17 @@ publish a temp-directory convention as API.
   stack that already carried it comes out empty and takes the earlier run's writes with it -- and a
   tombstone, absent from a baseline that applied it, is not written again and the row returns on the
   run after. So the baseline is the read layers alone while the table is cut from the whole stack;
-  the two views differ, and a lake restarted twice is what tells them apart.
+  the two views differ, and a lake restarted twice is what tells them apart. `Config.Store` takes the
+  question away entirely: the tables are in a DuckDB file, so a start that finds one keeps it and
+  never reads the layers for it again -- `Catalog.Stored` is what asks, and a shape that disagrees
+  with what the catalog publishes is refused rather than rebuilt, since rebuilding is the one thing
+  a store exists to prevent. No delta is flushed beside one.
+- **DuckDB.NET duplicates an in-memory connection and no other.** `Duplicate()` throws
+  "Duplication of the connection is only supported for in-memory connections", which is why
+  `DuckDbSession.Of` opens the file again for a stored lake -- the driver holds one instance per
+  connection string, so both reach the same database. Nothing says this in a stack trace: the
+  sessions simply never get a connection, and every client times out in the pre-login handshake
+  while the listener sits there accepting.
 - **The write layer holds effective state, not a log.** A deleted row leaves the write table and
   gains a tombstone; a re-inserted one comes back with no tombstone bookkeeping. There is no
   per-row sequence number, and adding one back means re-deriving what shadows what.

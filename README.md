@@ -62,7 +62,7 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
-`--write-format`, `--writable`, `--materialize`, `--serialize-transactions`, `--schema`, `--key`
+`--write-format`, `--writable`, `--materialize`, `--store`, `--serialize-transactions`, `--schema`, `--key`
 (repeatable), `--dacpac`,
 `--cache` and `--config` each override the file when both are given; argument paths are relative to
 the working directory, file paths to the file. A file named explicitly with `--config` must exist,
@@ -284,6 +284,18 @@ It is for a test suite that wants a plain database rather than the layer machine
 that would rather pay the merge once than on every query. The cost is memory — every table is
 resident — and that a table cannot carry anything answered per session: a `filter:` or a
 `getvariable()` column is refused at startup rather than quietly stopping.
+
+`--store lake.duckdb` gives that materialized lake a DuckDB database file to live in. The layers are
+collapsed into it once; every start after that opens what is already there, and the layers are only
+consulted for a table the file does not yet carry. A write survives by having been written rather
+than by being worked out again at shutdown, so no delta is exported beside a store — the file is the
+state, and one answer to that question is enough. It also means a sequence keeps its place, so a
+declared `IDENTITY` carries on where it left off instead of being reseeded from the files.
+
+The trade is that the file *is* the state: editing a layer no longer changes a table the store
+already holds, and a store made against a different schema is refused at startup by name rather than
+rebuilt, since rebuilding would discard everything written to it. Delete it to start again. It needs
+`--materialize`; a layered lake keeps its write layer in files and would apply every write twice.
 
 `--serialize-transactions` lets one transaction run at a time. Two things go wrong without it, and
 neither is something an application written against SQL Server or PostgreSQL has reason to expect.
@@ -601,6 +613,7 @@ variables and the tool's usual override files layer over it for free.
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
 | `materialize` | `--materialize` | Collapse the layers into real tables; a delta goes out at shutdown. |
+| `store` | `--store` | DuckDB database file a materialized lake is kept in, so writes simply stay. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |

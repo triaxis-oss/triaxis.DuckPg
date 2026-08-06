@@ -76,7 +76,7 @@ sealed class PgServer(Config config, Gateway gateway, DuckDBConnection root, ILo
         client.NoDelay = true;
         try
         {
-            var connection = (DuckDBConnection)root.Duplicate();
+            var connection = DuckDbSession.Of(root);
             connection.Open();
             using var session = new PgSession(client, gateway, connection, this, loggers.CreateLogger<PgSession>());
             session.Run();
