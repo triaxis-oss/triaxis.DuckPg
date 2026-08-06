@@ -223,6 +223,17 @@ public class TSqlTests
     public void RendersAnAliasedDeleteTarget(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// What EF Core's ExecuteUpdate writes, and the shape a DELETE already resolved: the target
+    /// names an alias the FROM clause binds.
+    [Theory]
+    [InlineData("UPDATE [o] SET [amount] = 3 FROM [orders] AS [o] WHERE [o].[id] = 1",
+        """UPDATE "lake"."orders" AS "o" SET "amount" = 3 WHERE "o"."id" = 1""")]
+    // A name the FROM clause does not bind is the table it says it is, and the FROM stays put.
+    [InlineData("UPDATE orders SET amount = s.amount FROM staging s WHERE orders.id = s.id",
+        """UPDATE "lake"."orders" SET "amount" = "s"."amount" FROM "lake"."staging" AS "s" WHERE "orders"."id" = "s"."id" """)]
+    public void RendersAnAliasedUpdateTarget(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
     /// The OUTPUT clause sits between SET and WHERE, so a statement carrying one does not end at its
     /// assignments. `OUTPUT 1` is how EF Core counts the rows a statement touched.
     [Theory]
@@ -253,6 +264,8 @@ public class TSqlTests
     // One side of a join deleted and the other filtering it is a different statement, and one whose
     // rows a lake decides differently.
     [InlineData("DELETE FROM [s] FROM [orders] AS [s] JOIN [staging] AS [t] ON t.id = s.id WHERE t.x = 1",
+        "joined to another table")]
+    [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] JOIN [staging] AS [t] ON t.id = s.id WHERE t.x = 1",
         "joined to another table")]
     // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
     // the answer than the answer.

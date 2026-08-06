@@ -195,8 +195,9 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
-- **A DELETE's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
-  is what EF Core's `ExecuteDelete` writes, and taking `s` for a table name pushed the real one into
+- **A write's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
+  is what EF Core's `ExecuteDelete` writes, and `UPDATE [o] SET … FROM [t] AS [o]` is its
+  `ExecuteUpdate`; both resolve through `TSqlParser.Aliased`, and taking `s` for a table name pushed the real one into
   `USING` and left the delete against nothing. `TSqlParser.Aliased` resolves it where the clause
   declaring it is in hand; the alias then has to survive into the gateway, since the predicate names
   it too -- which is what `Gateway.DeleteAlias` keeps, and why the scan carries an `AS`.

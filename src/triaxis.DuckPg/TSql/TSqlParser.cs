@@ -157,9 +157,12 @@ sealed class TSqlParser
         return new InsertStatement(target, columns, new InsertQuery(Query()), output);
     }
 
+    /// `UPDATE [o] SET … FROM [t] AS [o] WHERE …` names its target the same way a DELETE can, and
+    /// for the same reason: it is what EF Core's ExecuteUpdate writes.
     Statement Update()
     {
         Expect("update");
+        var at = Peek.Position;
         var target = TableName();
         Expect("set");
 
@@ -169,7 +172,13 @@ sealed class TSqlParser
         var output = Output();
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
-        return new UpdateStatement(target, null, assignments, from, where, output);
+
+        if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
+            return new UpdateStatement(target, null, assignments, from, where, output);
+
+        return ReferenceEquals(source, from)
+            ? new UpdateStatement(source.Name, source.Alias, assignments, null, where, output)
+            : throw new TSqlException("UPDATE of an alias joined to another table is not supported", at);
     }
 
     /// `MERGE` is another statement by another spelling, and which one depends on the branch. An
@@ -330,7 +339,8 @@ sealed class TSqlParser
             : throw new TSqlException("DELETE from an alias joined to another table is not supported", at);
     }
 
-    /// The source an alias names, or null when the FROM clause binds no such alias.
+    /// The source an alias names, or null when the FROM clause binds no such alias. Both writes that
+    /// can name their target that way resolve it the same way.
     static NamedTableSource? Aliased(TableSource from, Name alias) => from switch
     {
         NamedTableSource named when named.Alias is { } bound &&

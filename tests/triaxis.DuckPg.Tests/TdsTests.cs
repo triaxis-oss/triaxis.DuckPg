@@ -568,6 +568,22 @@ public class TdsTests : IDisposable
         Assert.Equal(["3"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
     }
 
+    /// The other write that can name its target by an alias, which is what EF Core's ExecuteUpdate
+    /// writes.
+    [Fact]
+    public void AnUpdateCanNameItsTargetByAlias()
+    {
+        using var connection = Open();
+
+        Assert.Equal(2, new SqlCommand(
+            "UPDATE [o] SET [note] = 'aliased' FROM [orders] AS [o] WHERE [o].[order_id] < 3",
+            connection).ExecuteNonQuery());
+
+        lake.Restart();
+        Assert.Equal(["aliased", "aliased", ""],
+            lake.Query("SELECT coalesce(note, '') FROM lake.orders ORDER BY order_id"));
+    }
+
     /// `OUTPUT 1` counts the rows a statement touched, which is all EF Core reads it for -- so it is
     /// one row per row written, and the count SqlClient reports is that many.
     [Fact]

@@ -339,6 +339,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
 | `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
+| `UPDATE [o] SET … FROM [t] AS [o] WHERE …` — its `ExecuteUpdate` | the same, on the other write |
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
