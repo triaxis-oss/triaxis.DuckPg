@@ -239,6 +239,32 @@ public class TSqlTests
     public void RendersAnAliasedUpdateTarget(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// A join hint tells SQL Server's optimiser which algorithm to use and says nothing about which
+    /// rows come back, so it is read and dropped.
+    [Theory]
+    [InlineData("SELECT a.id FROM a INNER LOOP JOIN b ON b.id = a.id")]
+    [InlineData("SELECT a.id FROM a INNER HASH JOIN b ON b.id = a.id")]
+    [InlineData("SELECT a.id FROM a INNER MERGE JOIN b ON b.id = a.id")]
+    [InlineData("SELECT a.id FROM a LEFT OUTER LOOP JOIN b ON b.id = a.id")]
+    public void JoinHintsAreDropped(string tsql) =>
+        Assert.Equal(tsql.Contains("LEFT")
+            ? """SELECT "a"."id" FROM "lake"."a" LEFT JOIN "lake"."b" ON "b"."id" = "a"."id" """.Trim()
+            : """SELECT "a"."id" FROM "lake"."a" INNER JOIN "lake"."b" ON "b"."id" = "a"."id" """.Trim(),
+            Translate(tsql));
+
+    /// What EF Core writes for an update filtered through a navigation: the target is an alias, and
+    /// the join is what picks its rows. The other table becomes the write's own FROM and the join
+    /// condition joins the WHERE, which is the shape a lake already writes.
+    [Theory]
+    [InlineData("UPDATE [s] SET [note] = 'x' FROM [orders] AS [s] INNER JOIN [staging] AS [c] " +
+        "ON [c].[id] = [s].[id] WHERE [c].[name] = 'Admin'",
+        """UPDATE "lake"."orders" AS "s" SET "note" = 'x' FROM "lake"."staging" AS "c" """ +
+        """WHERE ("c"."name" = 'Admin') AND ("c"."id" = "s"."id")""")]
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] INNER JOIN [staging] AS [c] ON [c].[id] = [s].[id]",
+        """DELETE FROM "lake"."orders" AS "s" USING "lake"."staging" AS "c" WHERE "c"."id" = "s"."id" """)]
+    public void RendersAWriteJoinedToAnotherTable(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
     /// The OUTPUT clause sits between SET and WHERE, so a statement carrying one does not end at its
     /// assignments. `OUTPUT 1` is how EF Core counts the rows a statement touched.
     [Theory]
@@ -268,10 +294,12 @@ public class TSqlTests
         "NOT MATCHED BY SOURCE")]
     // One side of a join deleted and the other filtering it is a different statement, and one whose
     // rows a lake decides differently.
-    [InlineData("DELETE FROM [s] FROM [orders] AS [s] JOIN [staging] AS [t] ON t.id = s.id WHERE t.x = 1",
-        "joined to another table")]
-    [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] JOIN [staging] AS [t] ON t.id = s.id WHERE t.x = 1",
-        "joined to another table")]
+    // An outer join keeps the rows matching nothing, and those are rows the write would still
+    // touch -- which a condition cannot say once the join is gone.
+    [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+        "an outer join cannot pick")]
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+        "an outer join cannot pick")]
     // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
     // the answer than the answer.
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED THEN " +

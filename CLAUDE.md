@@ -217,10 +217,18 @@ publish a temp-directory convention as API.
   is what made an intermittent one look like the wire's fault rather than a statement's.
 - **A write's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
   is what EF Core's `ExecuteDelete` writes, and `UPDATE [o] SET … FROM [t] AS [o]` is its
-  `ExecuteUpdate`; both resolve through `TSqlParser.Aliased`, and taking `s` for a table name pushed the real one into
-  `USING` and left the delete against nothing. `TSqlParser.Aliased` resolves it where the clause
-  declaring it is in hand; the alias then has to survive into the gateway, since the predicate names
-  it too -- which is what `Gateway.DeleteAlias` keeps, and why the scan carries an `AS`.
+  `ExecuteUpdate`; both resolve through `TSqlParser.Aliased`, and taking `s` for a table name pushed
+  the real one into `USING` and left the write against nothing. The alias then has to survive into
+  the gateway, since the predicate names it too -- which is what `Gateway.DeleteAlias` keeps, and why
+  the scan carries an `AS`.
+- **A join around that target folds into the write's own clauses.** `TSqlParser.Selecting` makes the
+  other tables the write's `FROM` and their `ON` conditions part of its `WHERE`, which is the shape
+  `Gateway.RewriteUpdate` already ran for a `MERGE`. Only an inner join folds: an outer one keeps the
+  rows matching nothing, and those are rows the write would still touch, which a condition cannot say
+  once the join is gone. `Gateway.RewriteDelete` had to learn the same clause and to qualify the keys
+  it collects, since both tables may carry a column of that name. A join hint -- `INNER LOOP JOIN`,
+  `HASH`, `MERGE`, `REMOTE` -- is read and dropped: it steers an optimiser this does not have, and
+  says nothing about which rows come back.
 - **`MERGE` is whichever statement its branch means.** `WHEN MATCHED THEN UPDATE` is an update
   joined to its source. `WHEN NOT MATCHED THEN INSERT` over a condition that cannot match --
   `TSqlParser.Never`, which is EF Core's `ON 1=0` -- is a multi-row insert, and that is how a batch

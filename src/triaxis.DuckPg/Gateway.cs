@@ -344,11 +344,22 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // The target may be named by an alias the statement bound to it, and the predicate will
         // then say so too -- so the scan carries the alias rather than dropping it.
         var alias = DeleteAlias(sql, reference.End);
+        var joined = SqlText.FindKeyword(sql, "USING", reference.End);
+        var where = SqlText.FindKeyword(sql, "WHERE", joined < 0 ? reference.End : joined + 5);
+
         var scan = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
-        var where = SqlText.FindKeyword(sql, "WHERE", reference.End);
+        var qualifier = "";
+
+        // With another table in scope the key columns have to say which side they came from -- both
+        // may carry a column of that name, and the delete is against one of them.
+        if (joined >= 0)
+        {
+            scan += ", " + sql[(joined + 5)..(where < 0 ? sql.Length : where)];
+            qualifier = SqlText.Quote(alias ?? table.Name) + ".";
+        }
 
         string[] steps = [
-            Keys(table, scan, "", where < 0 ? "TRUE" : sql[(where + 5)..]),
+            Keys(table, scan, qualifier, where < 0 ? "TRUE" : sql[(where + 5)..]),
             Tombstone(table),
             Evict(table)];
 

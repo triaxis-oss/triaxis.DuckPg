@@ -584,6 +584,25 @@ public class TdsTests : IDisposable
             lake.Query("SELECT coalesce(note, '') FROM lake.orders ORDER BY order_id"));
     }
 
+    /// A write filtered through a join: the target is an alias, and the other table is what says
+    /// which of its rows to touch. Both tables carry an `order_id`, so the keys the plan collects
+    /// have to say which side they came from.
+    [Fact]
+    public void AWriteCanBeFilteredThroughAJoin()
+    {
+        using var connection = Open();
+        new SqlCommand("SELECT o.order_id, o.note INTO #tagged FROM orders o WHERE o.order_id = 2",
+                       connection).ExecuteNonQuery();
+
+        Assert.Equal(1, new SqlCommand(
+            "UPDATE [s] SET [note] = 'joined' FROM [orders] AS [s] " +
+            "INNER LOOP JOIN [#tagged] AS [t] ON [t].[order_id] = [s].[order_id]", connection).ExecuteNonQuery());
+
+        lake.Restart();
+        Assert.Equal(["first", "joined", ""],
+            lake.Query("SELECT coalesce(note, '') FROM lake.orders ORDER BY order_id"));
+    }
+
     /// `OUTPUT 1` counts the rows a statement touched, which is all EF Core reads it for -- so it is
     /// one row per row written, and the count SqlClient reports is that many.
     [Fact]

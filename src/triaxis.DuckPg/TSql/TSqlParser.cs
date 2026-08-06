@@ -176,9 +176,46 @@ sealed class TSqlParser
         if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
             return new UpdateStatement(target, null, assignments, from, where, output);
 
-        return ReferenceEquals(source, from)
-            ? new UpdateStatement(source.Name, source.Alias, assignments, null, where, output)
-            : throw new TSqlException("UPDATE of an alias joined to another table is not supported", at);
+        var (rest, filtered) = Selecting(from, source, where, at);
+        return new UpdateStatement(source.Name, source.Alias, assignments, rest, filtered, output);
+    }
+
+    /// A write whose FROM clause joins its target to something else: the join is what picks the rows,
+    /// so the other tables become the write's own FROM and the conditions holding them together join
+    /// the WHERE. Only an inner join says that -- an outer one keeps rows matching nothing, and those
+    /// are rows the write would still touch, which a condition cannot say afterwards.
+    (TableSource? From, Expr? Where) Selecting(TableSource from, NamedTableSource target, Expr? where, int at)
+    {
+        if (ReferenceEquals(from, target)) return (null, where);
+        if (!Inner(from))
+            throw new TSqlException("an outer join cannot pick the rows a write touches: it keeps the ones " +
+                                    "matching nothing, which is not something a condition says afterwards", at);
+
+        List<TableSource> sources = [];
+        List<Expr> conditions = [];
+        Flatten(from, sources, conditions);
+        sources.RemoveAll(source => ReferenceEquals(source, target));
+
+        foreach (var condition in conditions)
+            where = where is null ? condition : new BinaryExpr("AND", new ParenExpr(where), new ParenExpr(condition));
+
+        return (sources.Count == 0 ? null : sources.Aggregate((a, b) => new JoinSource(JoinKind.Cross, a, b, null)),
+                where);
+    }
+
+    /// Whether every join in the tree keeps only what matches, which is what makes its conditions
+    /// ordinary predicates.
+    static bool Inner(TableSource source) => source is not JoinSource join ||
+        (join.Kind is JoinKind.Inner or JoinKind.Cross && Inner(join.Left) && Inner(join.Right));
+
+    /// The tables a join tree stands on, and the conditions holding them together.
+    static void Flatten(TableSource source, List<TableSource> sources, List<Expr> conditions)
+    {
+        if (source is not JoinSource join) { sources.Add(source); return; }
+
+        Flatten(join.Left, sources, conditions);
+        Flatten(join.Right, sources, conditions);
+        if (join.On is not null) conditions.Add(join.On);
     }
 
     /// `MERGE` is another statement by another spelling, and which one depends on the branch. An
@@ -332,11 +369,8 @@ sealed class TSqlParser
         if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
             return new DeleteStatement(target, null, from, where, output);
 
-        // Joined to something else, the delete is against one side of a join and filtered by the
-        // other -- a different statement, and one whose rows a lake decides differently.
-        return ReferenceEquals(source, from)
-            ? new DeleteStatement(source.Name, source.Alias, null, where, output)
-            : throw new TSqlException("DELETE from an alias joined to another table is not supported", at);
+        var (rest, filtered) = Selecting(from, source, where, at);
+        return new DeleteStatement(source.Name, source.Alias, rest, filtered, output);
     }
 
     /// The source an alias names, or null when the FROM clause binds no such alias. Both writes that
@@ -598,6 +632,10 @@ sealed class TSqlParser
 
             if (!Peek.Is("join")) pos++;
             Accept("outer");
+            // `INNER LOOP JOIN`, `LEFT MERGE JOIN`: a hint telling SQL Server's optimiser which
+            // algorithm to use. It says nothing about which rows come back, and DuckDB picks its own
+            // way regardless, so it is read and dropped.
+            foreach (var hint in JoinHints) if (Accept(hint)) break;
             Expect("join");
 
             // The operand is a join tree of its own, not just a table: T-SQL lets a join nest inside
@@ -609,6 +647,8 @@ sealed class TSqlParser
             left = new JoinSource(kind.Value, left, right, on);
         }
     }
+
+    static readonly string[] JoinHints = ["loop", "hash", "merge", "remote"];
 
     TableSource PrimaryTableSource()
     {
