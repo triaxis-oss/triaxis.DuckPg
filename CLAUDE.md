@@ -301,6 +301,13 @@ publish a temp-directory convention as API.
   client calls `sp_reset_connection`, so a server that answers just the procedure never hears about
   the reuse. `TdsWire.ReadMessage` surfaces the bit and `TdsSession.Reset` acts on it, which is what
   keeps one session's `#table` out of the next one's.
+- **A COLMETADATA name is counted in one byte**, so a name of 256 characters announces itself as
+  empty and the client reads the bytes after it as the next token -- which surfaces as
+  "Internal connection fatal error" from the parser, with the server looking innocent. DuckDB names
+  an unaliased column after the text of the expression that produced it, and a
+  `CASE WHEN EXISTS (...)` passes 255 without trying. `TdsSession.Named` cuts at 128, which is where
+  SQL Server cuts (`sysname`); `TdsMsg.BVarchar` cuts at 255 as well, since a length prefix that
+  cannot say what it carries is a desynchronised stream whatever the field was.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column

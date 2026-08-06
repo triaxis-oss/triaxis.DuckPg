@@ -781,6 +781,27 @@ public class TdsTests : IDisposable
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(60), $"cancellation took {watch.Elapsed}");
     }
 
+    /// DuckDB names an unaliased column after the expression that produced it, and COLMETADATA
+    /// counts a name in a single byte: at 256 characters the length wraps to zero, the client reads
+    /// the bytes after it as the next token, and the connection dies rather than the query failing.
+    /// SQL Server caps an identifier at 128, which is where this cuts.
+    [Theory]
+    [InlineData(23)]    // a 252-character name: what already fitted
+    [InlineData(24)]    // 263, whose length wrapped to 7
+    [InlineData(60)]    // 659, and well past it
+    public void ALongColumnNameDoesNotDerailTheTokenStream(int terms)
+    {
+        using var connection = Open();
+        var expression = string.Join(" + ", Enumerable.Repeat("[order_id]", terms));
+        using var command = new SqlCommand($"SELECT {expression} FROM [orders] WHERE [order_id] = 1", connection);
+        using var reader = command.ExecuteReader();
+
+        Assert.True(reader.Read());
+        Assert.Equal(terms, reader.GetInt32(0));
+        Assert.InRange(reader.GetName(0).Length, 1, 128);
+        Assert.False(reader.Read());
+    }
+
     // DuckDB counts in BIGINT, so the value arrives as a long rather than SQL Server's int.
     static int Count(SqlConnection connection) =>
         Convert.ToInt32(new SqlCommand("SELECT COUNT(*) FROM orders", connection).ExecuteScalar());

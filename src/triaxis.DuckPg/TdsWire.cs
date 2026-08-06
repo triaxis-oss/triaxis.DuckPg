@@ -54,8 +54,15 @@ sealed class TdsMsg
         return this;
     }
 
-    /// Strings on the wire are UTF-16, counted in characters rather than bytes.
-    public TdsMsg BVarchar(string s) => U8(s.Length).Raw(Encoding.Unicode.GetBytes(s));
+    /// Strings on the wire are UTF-16, counted in characters rather than bytes. A single-byte
+    /// length cannot say more than 255, so a longer string is cut rather than allowed to wrap: a
+    /// 256-character name would announce itself as empty and the client would read every byte
+    /// after it as the next token.
+    public TdsMsg BVarchar(string s)
+    {
+        if (s.Length > 255) s = s[..255];
+        return U8(s.Length).Raw(Encoding.Unicode.GetBytes(s));
+    }
 
     public TdsMsg UsVarchar(string s) => U16(s.Length).Raw(Encoding.Unicode.GetBytes(s));
 

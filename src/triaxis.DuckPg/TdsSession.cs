@@ -372,6 +372,13 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
     }
 
+    /// SQL Server caps an identifier at `sysname`, which is 128 characters, and answers with no name
+    /// at all for a column no alias named. DuckDB instead names an unaliased column after the text
+    /// of the expression that produced it, which a `CASE WHEN EXISTS (...)` passes 255 without
+    /// trying -- and a name that long cannot go on the wire at all, since COLMETADATA counts it in
+    /// one byte. Cut where SQL Server cuts.
+    static string Named(string name) => name.Length <= 128 ? name : name[..128];
+
     long Rows(TdsMsg msg, DbDataReader reader)
     {
         var columns = new TdsColumn[reader.FieldCount];
@@ -394,7 +401,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             }
             msg.I32(0).U16(0x0001); // no user type; nullable
             TdsTypes.WriteTypeInfo(msg, columns[i]);
-            msg.BVarchar(reader.GetName(i));
+            msg.BVarchar(Named(reader.GetName(i)));
         }
 
         var rows = 0L;
