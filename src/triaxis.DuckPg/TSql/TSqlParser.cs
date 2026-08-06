@@ -11,7 +11,7 @@ sealed class TSqlParser
 
     public static List<Statement> Parse(string sql)
     {
-        var parser = new TSqlParser(new TSqlLexer(sql).Tokenise());
+        var parser = new TSqlParser(new TSqlLexer(sql).Tokenize());
         var statements = new List<Statement>();
 
         while (true)
@@ -26,7 +26,7 @@ sealed class TSqlParser
     /// refused rather than ignored -- a default that only half parsed is not one to apply.
     public static Expr ParseExpression(string sql)
     {
-        var parser = new TSqlParser(new TSqlLexer(sql).Tokenise());
+        var parser = new TSqlParser(new TSqlLexer(sql).Tokenize());
         var expr = parser.Expression();
         return parser.Peek.Kind == TokenKind.End
             ? expr

@@ -30,7 +30,7 @@ public sealed class Config
     /// Collapse every layer into a real DuckDB table at build and serve that, rather than a view
     /// over the layers. There is then no merge to bind on every read, no write branch to earn and no
     /// tombstone to hide anything: a write is a write, to the table the reads come from. Nothing is
-    /// persisted -- what a materialised lake holds is lost on exit, save for the delta a write
+    /// persisted -- what a materialized lake holds is lost on exit, save for the delta a write
     /// directory gets on a clean shutdown.
     public bool Materialize { get; set; }
 
@@ -117,7 +117,7 @@ public sealed class Config
         }
 
         // A cache inside a layer would be read back as part of the lake on the next build -- every
-        // materialised table arriving a second time, as a layer of its own.
+        // materialized table arriving a second time, as a layer of its own.
         if (Cache is { Length: > 0 } cache)
             foreach (var directory in (string?[])[.. Layers, Write])
                 if (directory is not null && Under(cache, directory))

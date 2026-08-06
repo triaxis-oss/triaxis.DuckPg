@@ -686,7 +686,7 @@ public class TdsTests : IDisposable
         Assert.Equal(4, Count(connection));
     }
 
-    /// An application takes one to serialise itself against the other connections of a database,
+    /// An application takes one to serialize itself against the other connections of a database,
     /// which a lake has none of; what it must not do is fail, since the work is inside the
     /// transaction the lock was taken for.
     [Fact]

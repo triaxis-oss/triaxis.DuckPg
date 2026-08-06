@@ -362,7 +362,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         }
     }
 
-    /// A serialised lake's turn to write, given up when the transaction that took it ends -- and
+    /// A serialized lake's turn to write, given up when the transaction that took it ends -- and
     /// with the session, so a client that vanishes mid-transaction cannot keep the lake to itself.
     void Release()
     {

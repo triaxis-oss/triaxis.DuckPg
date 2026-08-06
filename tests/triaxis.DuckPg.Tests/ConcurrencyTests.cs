@@ -5,7 +5,7 @@ namespace triaxis.DuckPg.Tests;
 
 /// Sessions have a DuckDB connection each, but a lake keeps one of its own for the work that is
 /// nobody's session -- persisting a table, seeding a sequence, rebuilding the catalog. A DuckDB
-/// connection is not two threads' to share, so what runs on that one has to be serialised: what
+/// connection is not two threads' to share, so what runs on that one has to be serialized: what
 /// concurrent writers see otherwise is not an error but a connection that dies mid-answer.
 /// What two writers do to each other is the other half, and an option: DuckDB refuses the second
 /// one rather than making it wait.
@@ -101,7 +101,7 @@ public class ConcurrencyTests
     }
 
     /// What a lake serving one application does by default: DuckDB refuses the second writer's
-    /// statement outright rather than making it wait, which is the behaviour the option exists for.
+    /// statement outright rather than making it wait, which is the behavior the option exists for.
     [Fact]
     public void ASecondWriterIsRefusedWhileTheFirstIsOpen()
     {

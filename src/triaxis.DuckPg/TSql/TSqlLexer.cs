@@ -50,7 +50,7 @@ sealed class TSqlLexer(string sql)
 {
     int pos;
 
-    public List<Token> Tokenise()
+    public List<Token> Tokenize()
     {
         var tokens = new List<Token>();
         while (true)

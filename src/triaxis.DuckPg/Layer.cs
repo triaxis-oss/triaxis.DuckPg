@@ -160,9 +160,9 @@ static class Layer
         }
     }
 
-    /// Non-parquet layers are materialised once, so a query neither re-parses the file nor pays
+    /// Non-parquet layers are materialized once, so a query neither re-parses the file nor pays
     /// inference again. Parquet is scanned in place -- that is what the format is for.
-    public static List<Column> Materialise(DuckDBConnection conn, string target, LayerSource source)
+    public static List<Column> Materialize(DuckDBConnection conn, string target, LayerSource source)
     {
         List<Column> columns = [];
         Read(source, glob =>

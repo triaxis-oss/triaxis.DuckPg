@@ -44,9 +44,9 @@ public static class DuckDbLibrary
         RootNestedTypes();
     }
 
-    /// DuckDB.NET materialises a STRUCT by calling Activator.CreateInstance on
+    /// DuckDB.NET materializes a STRUCT by calling Activator.CreateInstance on
     /// Dictionary&lt;string, object&gt;. Trimming drops that constructor's metadata, so it is declared
-    /// as a dependency here. A MAP is materialised the same way but over the column's own key and
+    /// as a dependency here. A MAP is materialized the same way but over the column's own key and
     /// value types, which cannot all be named ahead of time -- a lake that queries MAP columns has
     /// to declare its own combinations the same way.
     [DynamicDependency(DynamicallyAccessedMemberTypes.PublicConstructors, typeof(Dictionary<string, object>))]

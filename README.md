@@ -164,7 +164,7 @@ A layer is a directory. What it holds decides how each table is read:
 
 | In the directory | Published as |
 |---|---|
-| `orders.yaml`, `orders.yml` | table `orders`, materialised through JSON for type inference |
+| `orders.yaml`, `orders.yml` | table `orders`, materialized through JSON for type inference |
 | `orders.json` | table `orders`, `read_json_auto` |
 | `orders.parquet` | table `orders`, scanned in place |
 | `orders/**/*.parquet` | table `orders`, one table over every file below, `union_by_name` |
@@ -190,7 +190,7 @@ the column its type wins, because a parquet file carries a real schema while YAM
 are inferred from the values.
 
 Table names are matched case-insensitively, so an export that disagrees with itself about
-capitalisation still lands on one table. Two files of different formats claiming one table is a
+capitalization still lands on one table. Two files of different formats claiming one table is a
 mistake rather than a merge: the first is used and the other is named in a warning.
 
 `hive_partitioning` is always stated explicitly, because DuckDB's default is to turn it on — and it
@@ -231,7 +231,7 @@ wide table stacked over several layers that is most of the cost of reading it: t
 numbering that picks a winner, and a cast per column per layer.
 
 `--cache ./cache` writes the merged rows of every table more than one layer carries out once, as a
-ZSTD parquet, and publishes the view as a scan of that file. On a 300-table lake this materialises
+ZSTD parquet, and publishes the view as a scan of that file. On a 300-table lake this materializes
 the 38 tables that actually merge, costs nothing measurable at startup, and cuts planning about
 threefold. ZSTD rather than snappy or none: a third smaller for the same read, and a compressed
 scan beats an uncompressed one outright, because there is less to move.
@@ -249,7 +249,7 @@ A declared default is not written into the copy: it stays with the view, so a `(
 is stamped by whoever reads it rather than frozen into a file that outlives the process. The
 exceptions are the defaults the merge itself depends on — one on a key column decides which row
 shadows which, and a filter or a virtual column reads the merged row, defaults and all — which are
-materialised with the rows they affect. The hash ignores what a default evaluated to either way:
+materialized with the rows they affect. The hash ignores what a default evaluated to either way:
 keying on it would rebuild every stamped table on every restart, which in a real schema is most
 of them.
 
@@ -328,7 +328,7 @@ What SqlClient does, and what answers it:
 | | |
 |---|---|
 | Login, `SELECT`, typed `SqlDataReader` reads, `NULL`s | COLMETADATA / ROW / DONE |
-| Parameterised commands (`sp_executesql`) | RPC, with values bound as DuckDB parameters |
+| Parameterized commands (`sp_executesql`) | RPC, with values bound as DuckDB parameters |
 | Parameters typed `NTEXT`, `TEXT`, `IMAGE` by an older client | read as the strings and blobs they are |
 | `cmd.Prepare()`, repeated execution (`sp_prepexec` / `sp_execute` / `sp_unprepare`) | handles held per session |
 | `SqlTransaction` commit and rollback | transaction manager requests, ENVCHANGE descriptors |
@@ -377,7 +377,7 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
-| `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesised |
+| `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesized |
 | `SELECT … INTO #t FROM …`, `DROP TABLE [IF EXISTS] #t` | `CREATE TEMP TABLE #t AS …`, `DROP TABLE …` |
 | `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
 | `[flag] * [n]` where `flag` is a `bit` | `CAST(flag AS INTEGER) * n`, as T-SQL converts it |
@@ -394,7 +394,7 @@ An ORM that qualifies everything it writes — LLBLGen Pro among them — is wha
 references, column references and `TOP(@p)` paging over a row-numbered derived table all land on
 the lake without the application knowing what it is talking to.
 
-An application lock is granted by doing nothing. `sp_getapplock` serialises a caller against the
+An application lock is granted by doing nothing. `sp_getapplock` serializes a caller against the
 other connections of a shared database, and a lake is not one — it serves the application that owns
 its files, so the exclusion is already there. `EXEC` of anything else is refused by name, which is
 the answer an ORM calling a stored procedure gets rather than a syntax error about `EXEC`.
@@ -406,7 +406,7 @@ nothing else, since a lake's tables are the files under it.
 
 EF Core sends a batch of rows as a `MERGE` over `ON 1=0`, which is a multi-row insert with the
 matched branch made unreachable, and it is translated as one. Its `OUTPUT INSERTED.[key], i._Position`
-is answered: the rows are materialised, written from there, and read back from the same copy — so
+is answered: the rows are materialized, written from there, and read back from the same copy — so
 each key comes back beside the position of the row that got it. A column the rows do not carry and
 nothing generates is refused by name rather than answered with a null.
 
@@ -494,7 +494,7 @@ columns:
     const: 2020-01-01 00:00:00
     type: TIMESTAMP
     except: [regions, currencies]   # tables that never had it
-  - name: colour
+  - name: color
     expr: NULL
     type: VARCHAR
     only: [products, categories]    # when naming the exceptions is longer
@@ -656,6 +656,6 @@ both run them with nothing installed.
 
 `dotnet pack -c Release` produces the tool package.
 
-## Licence
+## License
 
 MIT.

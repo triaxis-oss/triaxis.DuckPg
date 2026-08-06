@@ -136,7 +136,7 @@ sealed class TSqlWriter(TSqlContext context)
                 Put("SET ").Put(option.Option);
                 return;
 
-            // An application lock serialises a caller against the other connections of a shared
+            // An application lock serializes a caller against the other connections of a shared
             // database, and a lake is not one: it serves the application that owns its files. The
             // exclusion asked for is already there, so granting it is rendering nothing -- the
             // empty statement is the gateway's no-op, and a batched EXEC carries no result anyway.
@@ -176,7 +176,7 @@ sealed class TSqlWriter(TSqlContext context)
 
     /// An insert asked what it made of each row. The rows are projected under the target's own
     /// column names and the answer is a `RETURNING` over them, which is the shape the gateway
-    /// materialises: it fills in what the store generates and answers from the rows it wrote.
+    /// materializes: it fills in what the store generates and answers from the rows it wrote.
     /// Written flat, this is one statement short of legal -- the target is where the missing column
     /// comes from, and only the catalog knows whether anything fills it.
     void Returning(InsertStatement insert)

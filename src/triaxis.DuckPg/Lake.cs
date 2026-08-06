@@ -105,7 +105,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
 
         await stopping.CancelAsync();
         try { await serving!.WaitAsync(cancellation); } catch (OperationCanceledException) { }
-        // Once nothing is serving, so nothing else is on this connection: a materialised lake keeps
+        // Once nothing is serving, so nothing else is on this connection: a materialized lake keeps
         // nothing of its own, and this is where what it was given goes out as a layer.
         catalog.Flush(duck);
         stopping.Dispose();
@@ -113,7 +113,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         serving = null;
     }
 
-    /// Stops without waiting: the listeners are cancelled and the sockets closed, but a serving
+    /// Stops without waiting: the listeners are canceled and the sockets closed, but a serving
     /// loop mid-row is not awaited. `DisposeAsync` is the one that waits, which is why it exists.
     public void Dispose()
     {

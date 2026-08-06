@@ -130,7 +130,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         return null;
     }
 
-    // ---- serialised transactions ------------------------------------------------------------------
+    // ---- serialized transactions ------------------------------------------------------------------
 
     /// Waits for the lake's turn, indefinitely -- which is what SQL Server does with the default
     /// LOCK_TIMEOUT. False when the option is off, and then nothing is held.
@@ -144,12 +144,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     public void ExitTurn() => turns.Release();
 
     /// Writes a table's write layer back to its file. Called once a write is committed, so a
-    /// rolled-back statement never reaches the disk. A materialised lake has no write layer and
+    /// rolled-back statement never reaches the disk. A materialized lake has no write layer and
     /// keeps nothing: what it holds goes out once, at shutdown, as a delta.
     public void Persist(string name)
     {
         lock (gate)
-            if (Catalog.Resolve(null, name) is { Writable: true, Materialised: false } table)
+            if (Catalog.Resolve(null, name) is { Writable: true, Materialized: false } table)
                 write.Persist(admin, table);
     }
 
@@ -206,7 +206,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     }
 
     /// An insert that is asked what it wrote -- `OUTPUT INSERTED.<key>`, which is how EF Core gets a
-    /// store-generated key back. The rows are materialised first, so what the store generates is
+    /// store-generated key back. The rows are materialized first, so what the store generates is
     /// decided once and can be both written down and answered from; the answer is the last step,
     /// which is what makes this a plan that returns rows with a write in front of it.
     Plan RewriteReturning(Table table, List<string> columns, string rest, int returning)
@@ -280,7 +280,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             .Where(item => item.StartsWith('"'))
             .Select(item => item[1..item.IndexOf('"', 1)]);
 
-    /// The parenthesised group after the table name is a column list unless it opens a subquery.
+    /// The parenthesized group after the table name is a column list unless it opens a subquery.
     static List<string>? ExplicitColumnList(string rest)
     {
         if (!rest.StartsWith('('))return null;
@@ -316,8 +316,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // The rewritten row lands in the write layer under the key it already had, where it shadows
         // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
         // the old one behind with nothing above it, and that is what has to be hidden.
-        // Nothing lies beneath a materialised row, so a key that moves leaves nothing to hide.
-        var moves = !table.Materialised && table.Key.Any(assignments.ContainsKey);
+        // Nothing lies beneath a materialized row, so a key that moves leaves nothing to hide.
+        var moves = !table.Materialized && table.Key.Any(assignments.ContainsKey);
 
         // With a FROM clause the target's own columns are no longer the only ones in scope, so
         // everything the statement did not assign has to say which table it came from.
@@ -393,7 +393,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         string[] steps =
             [Keys(table, scan, qualifier, predicate), .. cascade,
-             .. table.Materialised ? (string[])[] : [Tombstone(table)], Evict(table)];
+             .. table.Materialized ? (string[])[] : [Tombstone(table)], Evict(table)];
         var referenced = checks.ToArray();
 
         // A deleted row is gone by the time anything could read it, so what can be answered for is
@@ -524,7 +524,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
             steps.Add($"CREATE OR REPLACE TEMP TABLE {childKeys} AS SELECT DISTINCT {collected} " +
                       $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {matched}");
-            if (!child.Materialised) steps.Add(Tombstone(child, childKeys));
+            if (!child.Materialized) steps.Add(Tombstone(child, childKeys));
             steps.Add(Evict(child, childKeys));
 
             Cascading(child, childKeys,
@@ -562,7 +562,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             List<string> steps = [], promoted = [], tombstoned = [];
             foreach (var (table, tombstones) in tables)
             {
-                if (table.Materialised) continue;
+                if (table.Materialized) continue;
                 if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) continue;
                 steps.AddRange(Catalog.Promotion(admin, table, tombstones));
                 promoted.Add(table.Name);

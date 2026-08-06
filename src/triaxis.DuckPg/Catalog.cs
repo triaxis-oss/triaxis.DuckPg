@@ -32,13 +32,13 @@ sealed record Table(
     bool Writable,
     LayerSource? WriteSource,
     string? Filter,
-    bool Materialised = false)
+    bool Materialized = false)
 {
     public string QualifiedName => $"{SqlText.Quote(Schema)}.{SqlText.Quote(Name)}";
 
-    /// A materialised table is written to where it is read from -- there is no branch above it,
+    /// A materialized table is written to where it is read from -- there is no branch above it,
     /// because there is nothing below it either.
-    public string WriteName => Materialised
+    public string WriteName => Materialized
         ? QualifiedName
         : $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(Name)}";
     public string TombstoneName => $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(Name + "__del")}";
@@ -74,10 +74,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     bool flushed;
 
-    /// Schema holding the materialised YAML and JSON layers.
+    /// Schema holding the materialized YAML and JSON layers.
     const string LayerSchema = "layer";
 
-    /// Where a materialised lake keeps the merge it was cut from -- unread while it serves, and the
+    /// Where a materialized lake keeps the merge it was cut from -- unread while it serves, and the
     /// baseline the shutdown delta is measured against.
     public const string BaseSchema = "base";
 
@@ -91,7 +91,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         foreach (var (name, sources, writeSource) in Sources())
         {
             var settings = config.Table(name);
-            var layers = Materialise(conn, name, sources);
+            var layers = Materialize(conn, name, sources);
             var describedWrite = writeSource is null ? null
                 : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
 
@@ -108,9 +108,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                                   writable || config.Materialize, writeSource, settings.Filter,
                                   config.Materialize);
 
-            if (table.Materialised)
+            if (table.Materialized)
             {
-                Materialise(conn, table);
+                Materialize(conn, table);
                 Tables[name] = table;
                 continue;
             }
@@ -155,7 +155,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     // ---- discovery -------------------------------------------------------------------------------
 
     /// Every table any layer carries, keyed case-insensitively -- an export that disagrees with
-    /// itself about capitalisation (`ORDER_Lines` vs `Order_Lines`) still lands on one table.
+    /// itself about capitalization (`ORDER_Lines` vs `Order_Lines`) still lands on one table.
     IEnumerable<(string Name, List<LayerSource> Layers, LayerSource? Write)> Sources()
     {
         var sources = new Dictionary<string, (List<LayerSource> Layers, LayerSource? Write)>(
@@ -192,8 +192,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     }
 
     /// Parquet is scanned where it lies -- that is what the format is for. Everything else is
-    /// materialised once, so a query neither re-reads the file nor pays type inference again.
-    List<TableLayer> Materialise(DuckDBConnection conn, string name, List<LayerSource> sources)
+    /// materialized once, so a query neither re-reads the file nor pays type inference again.
+    List<TableLayer> Materialize(DuckDBConnection conn, string name, List<LayerSource> sources)
     {
         var layers = new List<TableLayer>();
         foreach (var source in sources.OrderBy(s => s.Seq))
@@ -205,9 +205,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                 continue;
             }
 
-            var materialised = $"{LayerSchema}.{SqlText.Quote($"{name}#{source.Seq}")}";
-            var columns = Layer.Materialise(conn, materialised, source);
-            if (columns.Count > 0) layers.Add(new TableLayer(source, materialised, columns));
+            var materialized = $"{LayerSchema}.{SqlText.Quote($"{name}#{source.Seq}")}";
+            var columns = Layer.Materialize(conn, materialized, source);
+            if (columns.Count > 0) layers.Add(new TableLayer(source, materialized, columns));
         }
         return layers;
     }
@@ -538,7 +538,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // ZSTD rather than none or snappy: a third smaller than snappy for the same read, and a
         // compressed scan beats an uncompressed one outright -- there is simply less to move.
         Exec(conn, $"COPY ({merged}) TO {SqlText.Literal(file)} (FORMAT PARQUET, COMPRESSION ZSTD)");
-        logger.LogDebug("materialised {Table} into {File}", table.Name, file);
+        logger.LogDebug("materialized {Table} into {File}", table.Name, file);
 
         // Whatever this table used to be keyed by is now answering nothing.
         foreach (var stale in Directory.EnumerateFiles(cache, $"{table.Name}-*.parquet"))
@@ -559,7 +559,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             .Append($"key={string.Join(",", table.Key)}")
             .Append($"filter={table.Filter}"));
 
-    /// What a materialised copy is keyed by: everything about the table that decides its rows, and
+    /// What a materialized copy is keyed by: everything about the table that decides its rows, and
     /// the bytes of every file it reads. Same fingerprint, same rows.
     static string Fingerprint(string signature, IEnumerable<TableLayer> layers)
     {
@@ -614,11 +614,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     ///
     /// The write directory is a layer like any other here -- a delta a previous run left behind is
     /// read back in and collapsed with the rest, which is what makes a restart mean anything.
-    void Materialise(DuckDBConnection conn, Table table)
+    void Materialize(DuckDBConnection conn, Table table)
     {
-        // Merged against the stacked form of the table: a materialised one writes where it reads,
+        // Merged against the stacked form of the table: a materialized one writes where it reads,
         // so asking it for its write branch by name would point the merge at itself.
-        var stacked = table with { Materialised = false };
+        var stacked = table with { Materialized = false };
         var carries = table.Writable && write.Carries(stacked);
         if (carries) write.Prepare(conn, stacked);
 
@@ -644,9 +644,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     static string Baseline(Table table) =>
         $"{SqlText.Quote(BaseSchema)}.{SqlText.Quote(table.Name)}";
 
-    /// What a materialised lake leaves behind: the rows that are not what the layers said, and the
+    /// What a materialized lake leaves behind: the rows that are not what the layers said, and the
     /// keys that were there and are not. Written in the write layer's own format, so the next run --
-    /// materialised or not -- reads it as the layer it is. Nothing is kept without a directory to
+    /// materialized or not -- reads it as the layer it is. Nothing is kept without a directory to
     /// keep it in, which is the ephemeral bargain the mode makes.
     public void Flush(DuckDBConnection conn)
     {
@@ -657,7 +657,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
         foreach (var table in Tables.Values.Where(t => t.Writable))
         {
-            var stacked = table with { Materialised = false };
+            var stacked = table with { Materialized = false };
             var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
 
             // Computed before either target is touched: the baseline view reads the very tables the

@@ -55,13 +55,13 @@ publish a temp-directory convention as API.
   hides one when it moves a key; otherwise the rewritten row shadows what is beneath it on its own.
   A `--cache` copy survives the promotion: `Catalog.Underlay` puts it below the write branch, since
   the copy is the read layers and a write does not touch those.
-- **A materialised lake is the same catalog with the merge paid once.** `Config.Materialize` cuts
-  each table out of its own stack -- `Catalog.Materialise` keeps that stack behind as a view in the
+- **A materialized lake is the same catalog with the merge paid once.** `Config.Materialize` cuts
+  each table out of its own stack -- `Catalog.Materialize` keeps that stack behind as a view in the
   `base` schema, unread while the lake serves and the only honest baseline for the delta
   `Catalog.Flush` writes at shutdown. What makes it fit the existing machinery is `Table.WriteName`
   answering `QualifiedName`: `Evict` plus the insert of `duckpg_updated` *is* an UPDATE, and `Evict`
   alone *is* a DELETE, so only the tombstone steps had to go and promotion became a no-op. The merge
-  itself has to be built against `table with { Materialised = false }`, or it would name itself as
+  itself has to be built against `table with { Materialized = false }`, or it would name itself as
   its own write branch. `Flush` runs once and computes both temp tables before touching either
   target, since the baseline reads what it is about to replace. What the baseline must *not* include
   is the previous run's delta: the write layer is rewritten whole, so a delta measured against a
@@ -121,7 +121,7 @@ publish a temp-directory convention as API.
   take public parameters, and that would make every part of a lake an API. `InternalsVisibleTo`
   covers the tool and the suite.
 - **AOT-clean**: no reflection-based serialization, no `JsonSerializer.Serialize<object>`. The
-  project ships portable but the analysers stay on, so a regression shows up as a build warning
+  project ships portable but the analyzers stay on, so a regression shows up as a build warning
   (and warnings are errors here).
 
 ## Things that were learned the hard way
@@ -164,7 +164,7 @@ publish a temp-directory convention as API.
 - **Encryption is refused with `ENCRYPT_NOT_SUP`**, which is why `Encrypt=False` is part of the
   connection string. TDS otherwise encrypts the login packet even in a plaintext session.
 - **A cancel arrives on the same connection as the query**, unlike PostgreSQL's second connection.
-  It is only noticed between row packets; see `TdsSession.Cancelled`.
+  It is only noticed between row packets; see `TdsSession.Canceled`.
 - **Nothing may be cut across the seam between two packets.** SqlClient reassembles a read that
   ended mid-packet by replaying the framing it had begun, and framing split across the seam loses
   it its place -- it then reads response bytes as a length, and the failure surfaces much later,
@@ -300,7 +300,7 @@ publish a temp-directory convention as API.
   `TSqlParser.Never`, which is EF Core's `ON 1=0` -- is a multi-row insert, and that is how a batch
   of rows arrives. A condition that *can* match is refused: what "already there" means when the row
   it would shadow is in a layer below is the layer machinery's, not one statement's. `OUTPUT` is
-  answered by writing the rows down first: `Gateway.RewriteReturning` materialises them into
+  answered by writing the rows down first: `Gateway.RewriteReturning` materializes them into
   `duckpg_written`, inserts from that, and reads the answer off the same copy -- which is why the
   plan returns rows *and* writes, and why both sessions run every step but the last as a write.
   DuckDB's `RETURNING` cannot do it alone: it sees the target's columns and not the source's, so
@@ -337,7 +337,7 @@ publish a temp-directory convention as API.
   the conditions close in reverse; parsing it left-deep leaves the last `ON` with nothing to attach
   to, which is what made a dacpac's view unpublishable. A join keyword arriving before this join's
   `ON` belongs to the operand, an `ON` ends it -- which is what keeps an ordinary chain a chain.
-- **An application lock is granted by doing nothing.** `EXEC sp_getapplock` asks to be serialised
+- **An application lock is granted by doing nothing.** `EXEC sp_getapplock` asks to be serialized
   against the other connections of a shared database; a lake serves the application that owns its
   files, so the exclusion is already there and `TSqlWriter` renders the statement as nothing --
   which `Gateway.Translate` already answers as `Plan.Empty`. Making it a real lock would promise
@@ -355,7 +355,7 @@ publish a temp-directory convention as API.
   an unaliased column after the text of the expression that produced it, and a
   `CASE WHEN EXISTS (...)` passes 255 without trying. `TdsSession.Named` cuts at 128, which is where
   SQL Server cuts (`sysname`); `TdsMsg.BVarchar` cuts at 255 as well, since a length prefix that
-  cannot say what it carries is a desynchronised stream whatever the field was.
+  cannot say what it carries is a desynchronized stream whatever the field was.
 - **The reader's type names are its own**: `UnsignedBigInt`, `TimestampMs`, `HugeInt` -- not the SQL
   spellings a `CAST` is written with. Both `PgTypes.Oid` and `TdsTypes.Describe` key off them, and a
   name that matches nothing is published as text, silently. That is how summing an integer column
