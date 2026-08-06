@@ -46,6 +46,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 {
     public Dictionary<string, Table> Tables { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// The same tables as types alone, which is all a statement being translated needs of them: a
+    /// snapshot rather than a view of the live catalog, so a rebuild cannot change what a statement
+    /// half-translated is being translated against.
+    public IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> Types { get; private set; } =
+        new Dictionary<string, IReadOnlyDictionary<string, string>>();
+
     /// Which writable tables actually carry a write branch. A view is bound on every execution, so
     /// the branch and the tombstone check are paid for by every read of a table nobody has written
     /// to -- which, on a lake serving mostly reads, is most of them.
@@ -99,6 +105,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (carries) foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             Tables[name] = table;
         }
+
+        Types = Tables.ToDictionary(
+            table => table.Key,
+            table => (IReadOnlyDictionary<string, string>)table.Value.Columns.ToDictionary(
+                column => column.Name, column => column.Type, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
 
         Declared(conn);
     }

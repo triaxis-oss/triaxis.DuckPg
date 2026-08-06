@@ -196,6 +196,14 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
+- **A `bit` is converted for arithmetic, and only where the column resolves to one.** T-SQL makes a
+  `bit` an integer to multiply it; DuckDB refuses `BOOLEAN * INTEGER` outright. The cast is written
+  by `TSqlWriter.Operand`, which asks `TypeOf` what the column actually is -- `TSqlContext.Tables`
+  is the catalog's types, and `Scope` binds each FROM clause before the items that read it, since
+  the items are written first. Guessing instead is not available: `CASE WHEN 5` is *true* to DuckDB,
+  so a coercion applied to a number would answer 1 rather than fail, and casting a DECIMAL that was
+  taken for a `bit` would truncate it. A reference into a derived table resolves to nothing and is
+  left alone -- DuckDB's error is better than a cast nobody can justify.
 - **A function is answered in .NET when its meaning is .NET's.** `CONVERT`'s styles are
   `DateTime.ToString` formats and `pwdencrypt` is SHA-512 over UTF-16 text -- written as DuckDB SQL,
   each would be an approximation of something this process can just do, and the hash would not match

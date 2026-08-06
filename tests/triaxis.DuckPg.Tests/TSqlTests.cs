@@ -77,6 +77,42 @@ public class TSqlTests
     [InlineData("SELECT CAST(a AS HUGEINT) FROM t", """SELECT CAST("a" AS HUGEINT) FROM "lake"."t" """)]
     public void RewritesTypes(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// The conversion is written only where the column resolves to a `bit`. Nothing here knows what
+    /// a derived table's columns are, so a reference into one is rendered as it was written -- and
+    /// DuckDB says what it thinks of that, which is better than a cast nobody could justify.
+    [Fact]
+    public void BitArithmeticIsConvertedWhereTheColumnResolves()
+    {
+        static string Translated(string sql) => string.Join("; ", TSqlTranslator.Translate(sql, new TSqlContext(
+            "lake", new Dictionary<string, string>(), new HashSet<string>(), "sa",
+            new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["t"] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    { ["flag"] = "BOOLEAN", ["n"] = "INTEGER", ["amount"] = "DECIMAL(18,2)" },
+                ["u"] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                    { ["flag"] = "INTEGER", ["id"] = "INTEGER" },
+            })));
+
+        Assert.Equal("""SELECT "n" * CAST("flag" AS INTEGER) FROM "lake"."t" """.Trim(),
+            Translated("SELECT n * flag FROM t"));
+
+        // Qualified, so the one that is a bit is converted and the one that is not is left alone.
+        Assert.Equal(
+            """SELECT CAST("a"."flag" AS INTEGER) + "b"."flag" FROM "lake"."t" AS "a" """ +
+            """INNER JOIN "lake"."u" AS "b" ON "b"."id" = "a"."n" """.Trim(),
+            Translated("SELECT a.flag + b.flag FROM t AS a INNER JOIN u AS b ON b.id = a.n"));
+
+        // A decimal is not a bit, and converting one would truncate it.
+        Assert.Equal("""SELECT "n" * "amount" FROM "lake"."t" """.Trim(), Translated("SELECT n * amount FROM t"));
+
+        // Nothing says what a derived table's `flag` is, so nothing is done to it.
+        Assert.Equal("""SELECT "n" * "flag" FROM (SELECT 1 AS "flag") AS "d" """.Trim(),
+            Translated("SELECT n * flag FROM (SELECT 1 AS flag) AS d"));
+
+        // Only arithmetic: a comparison and an aggregate already mean the same thing to both.
+        Assert.Equal("""SELECT * FROM "lake"."t" WHERE "flag" = 1""", Translated("SELECT * FROM t WHERE flag = 1"));
+    }
+
     [Fact]
     public void PlusConcatenatesOnlyWhenItCanBeProved()
     {

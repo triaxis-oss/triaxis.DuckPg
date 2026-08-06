@@ -9,7 +9,10 @@ sealed record TSqlContext(
     string Schema,
     IReadOnlyDictionary<string, string> Variables,
     IReadOnlySet<string> Parameters,
-    string User);
+    string User,
+    /// What each published table's columns are, by DuckDB type. A column reference is resolved
+    /// against this where the dialects disagree about a type -- which is `bit`, and only there.
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Tables = null);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -20,6 +23,11 @@ sealed class TSqlWriter(TSqlContext context)
     /// Names a query defines for itself. A common table expression is a table only inside the
     /// query that declares it, so it must not be resolved against the lake's schema.
     readonly HashSet<string> defined = new(StringComparer.OrdinalIgnoreCase);
+
+    /// What each name in scope is made of, innermost query last -- a column reference is resolved
+    /// against these, and against nothing else. A derived table or a CTE contributes no columns, so
+    /// a reference into one resolves to nothing and is rendered as it was written.
+    readonly List<Dictionary<string, IReadOnlyDictionary<string, string>>> scopes = [];
 
     public static string Write(Statement statement, TSqlContext context)
     {
@@ -304,6 +312,10 @@ sealed class TSqlWriter(TSqlContext context)
                 // a set operation or a CTE -- places that have nowhere to put a table.
                 if (select.Into is { } into)
                     throw new TSqlException($"SELECT ... INTO {into.Table.Text} is a statement of its own", 0);
+
+                // The items are written before the FROM clause and refer to it, so what it binds is
+                // worked out first.
+                Scope(select.From);
                 Put("SELECT ");
                 if (select.Distinct) Put("DISTINCT ");
                 Join(select.Items, item =>
@@ -315,6 +327,7 @@ sealed class TSqlWriter(TSqlContext context)
                 if (select.Where is not null) { Put(" WHERE "); Expression(select.Where); }
                 if (select.GroupBy.Count > 0) { Put(" GROUP BY "); Join(select.GroupBy, Expression); }
                 if (select.Having is not null) { Put(" HAVING "); Expression(select.Having); }
+                scopes.RemoveAt(scopes.Count - 1);
                 return;
 
             case SetOperationBody set:
@@ -328,6 +341,67 @@ sealed class TSqlWriter(TSqlContext context)
                 Join(values.Rows, row => { Put("("); Join(row, Expression); Put(")"); });
                 return;
         }
+    }
+
+    /// What a FROM clause puts in scope, by the name a column reference would use for it.
+    void Scope(TableSource? from)
+    {
+        var scope = new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+        Bind(from, scope);
+        scopes.Add(scope);
+    }
+
+    void Bind(TableSource? from, Dictionary<string, IReadOnlyDictionary<string, string>> scope)
+    {
+        switch (from)
+        {
+            case JoinSource join:
+                Bind(join.Left, scope);
+                Bind(join.Right, scope);
+                return;
+
+            case NamedTableSource named when context.Tables?.TryGetValue(named.Name.Table.Text, out var columns) == true:
+                scope[(named.Alias ?? named.Name.Table).Text] = columns;
+                return;
+        }
+    }
+
+    /// The DuckDB type of what a column reference names, or null when nothing in scope says. A
+    /// qualified reference is looked up under its qualifier; a bare one has to be unambiguous, since
+    /// a name two tables both carry is a name neither of them settles.
+    string? TypeOf(Expr expr)
+    {
+        if (expr is ParenExpr paren) return TypeOf(paren.Inner);
+        if (expr is not ColumnRef { Parts: [.., var column] } reference) return null;
+
+        for (var depth = scopes.Count - 1; depth >= 0; depth--)
+        {
+            if (reference.Parts.Count > 1)
+            {
+                if (scopes[depth].TryGetValue(reference.Parts[^2].Text, out var qualified))
+                    return qualified.GetValueOrDefault(column.Text);
+                continue;
+            }
+
+            var found = scopes[depth].Values.Where(t => t.ContainsKey(column.Text)).ToList();
+            if (found.Count == 1) return found[0][column.Text];
+            if (found.Count > 1) return null;
+        }
+
+        return null;
+    }
+
+    /// T-SQL converts a `bit` to an integer to do arithmetic with it; DuckDB's BOOLEAN does no such
+    /// thing, and says so rather than guessing. The conversion is written here, where the column has
+    /// just been resolved -- and only there, because a `CASE WHEN` around anything else would take a
+    /// number for a truth value and answer 1.
+    void Operand(Expr expr)
+    {
+        if (TypeOf(expr) != "BOOLEAN") { Expression(expr); return; }
+
+        Put("CAST(");
+        Expression(expr);
+        Put(" AS INTEGER)");
     }
 
     // ---- table sources ---------------------------------------------------------------------------
@@ -632,12 +706,22 @@ sealed class TSqlWriter(TSqlContext context)
 
     /// T-SQL spells string concatenation `+`, which in DuckDB is arithmetic. Only where one side is
     /// provably text does this become `||` -- guessing on the rest would turn `1 + 2` into `'12'`.
+    /// The operators a `bit` is converted for. Everything else a `bit` reaches -- a comparison,
+    /// an aggregate, a CASE -- DuckDB already answers the way SQL Server does.
+    static readonly HashSet<string> Arithmetic = ["+", "-", "*", "/", "%"];
+
     void Binary(BinaryExpr binary)
     {
-        var op = binary.Operator == "+" && (Textual(binary.Left) || Textual(binary.Right)) ? "||" : binary.Operator;
-        Expression(binary.Left);
+        var text = binary.Operator == "+" && (Textual(binary.Left) || Textual(binary.Right));
+        var op = text ? "||" : binary.Operator;
+
+        // Arithmetic is the one place the two dialects disagree about what a `bit` is: SQL Server
+        // converts it to an integer, and DuckDB refuses the operator outright.
+        Action<Expr> operand = !text && Arithmetic.Contains(binary.Operator) ? Operand : Expression;
+
+        operand(binary.Left);
         Put($" {op} ");
-        Expression(binary.Right);
+        operand(binary.Right);
     }
 
     static readonly HashSet<string> TextFunctions = new(StringComparer.OrdinalIgnoreCase)
