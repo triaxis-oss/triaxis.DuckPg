@@ -196,6 +196,16 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
+- **A declared reference is a rule over the merged view, not a constraint on a table.** DuckDB
+  enforces foreign keys but refuses to point one at a view, and a lake publishes views -- so a
+  constraint on the write table would only see the rows this process wrote, while the row pointing
+  at a parent may live in any layer. `Gateway.Referenced` builds the question as a query instead,
+  and `Plan.Checks` is what a session runs *before* the plan's steps: a statement outside a
+  transaction commits each step as it goes, so a rule enforced after the tombstone would be enforced
+  on a row already gone. The keys are selected twice for that -- once by the check, once by the plan
+  -- and only for a table something points at. A cascade is warned about rather than performed, and
+  the insert side is not checked at all: both would be more promise than a stack of files can keep,
+  since what a read layer holds can change between runs.
 - **A `bit` is converted for arithmetic, and only where the column resolves to one.** T-SQL makes a
   `bit` an integer to multiply it; DuckDB refuses `BOOLEAN * INTEGER` outright. The cast is written
   by `TSqlWriter.Operand`, which asks `TypeOf` what the column actually is -- `TSqlContext.Tables`

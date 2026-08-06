@@ -4,6 +4,12 @@ using Microsoft.Extensions.Logging;
 
 namespace triaxis.DuckPg;
 
+/// A declared reference: which columns of one table point at which columns of another, under the
+/// name the constraint was given. `OnDelete` is what the schema says should happen to the rows
+/// pointing at one that goes.
+sealed record Reference(string Name, string Table, string[] Columns,
+                        string Parent, string[] ParentColumns, string OnDelete);
+
 /// The declared schema, read straight out of a .dacpac. A dacpac is a zip whose `model.xml` holds
 /// every table as a `SqlTable` element, so DacFx is not needed to get at it -- and DacFx would not
 /// run here anyway.
@@ -18,6 +24,7 @@ sealed class DacpacSchema
     readonly Dictionary<string, string[]> keys = new(StringComparer.OrdinalIgnoreCase);
     readonly Dictionary<(string Table, string Column), string> defaults = new();
     readonly Dictionary<string, string> views = new(StringComparer.OrdinalIgnoreCase);
+    readonly List<Reference> references = [];
 
     public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
     {
@@ -41,6 +48,9 @@ sealed class DacpacSchema
     /// The T-SQL a column defaults to, as the dacpac spells it -- `(getdate())`, `((0))`.
     public string? Default(string table, string column) => defaults.GetValueOrDefault((table, column));
 
+    /// What the declared schema says points at what.
+    public IReadOnlyList<Reference> References => references;
+
     /// Each declared view and the query it stands for, in the dialect it was written in.
     public IReadOnlyDictionary<string, string> Views => views;
 
@@ -61,6 +71,7 @@ sealed class DacpacSchema
                 "SqlPrimaryKeyConstraint" => ReadKey(element),
                 "SqlDefaultConstraint" => ReadDefault(element),
                 "SqlView" => ReadView(element),
+                "SqlForeignKeyConstraint" => ReadReference(element),
                 // Every other element is something this tool does not claim to read.
                 _ => true,
             };
@@ -117,6 +128,34 @@ sealed class DacpacSchema
         keys[name] = key;
         return true;
     }
+
+    /// A declared reference: which columns of which table point at which columns of another, and the
+    /// name the constraint was given -- an application matching on the message it fails with reads
+    /// that name, so it is carried rather than made up.
+    bool ReadReference(XElement constraint)
+    {
+        var child = Unqualify(Reference(constraint, "DefiningTable"));
+        var parent = Unqualify(Reference(constraint, "ForeignTable"));
+        if (child is null || parent is null) return false;
+
+        var columns = Columns(constraint, "Columns");
+        var referenced = Columns(constraint, "ForeignColumns");
+        if (columns.Length == 0 || columns.Length != referenced.Length) return false;
+
+        references.Add(new Reference(
+            Unqualify(constraint.Attribute("Name")?.Value) ?? $"FK_{child}_{parent}",
+            child, columns, parent, referenced,
+            Property(constraint, "DeleteAction") ?? "NoAction"));
+        return true;
+    }
+
+    static string[] Columns(XElement constraint, string relationship) =>
+        [.. Related(constraint, relationship)
+            .Concat(constraint.Elements(Dac + "Relationship")
+                .Where(r => r.Attribute("Name")?.Value == relationship)
+                .Descendants(Dac + "References"))
+            .Select(element => Unqualify(element.Attribute("Name")?.Value))
+            .OfType<string>()];
 
     /// A view is its query; the header it was declared with is not in the model to begin with.
     bool ReadView(XElement view)

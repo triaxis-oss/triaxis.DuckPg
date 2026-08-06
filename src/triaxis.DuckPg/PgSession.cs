@@ -328,10 +328,23 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         RunPlan(plan, portal.Arguments, portal.ResultFormats);
     }
 
+    /// What has to be true before a plan runs at all -- a reference nothing else may still be
+    /// pointing at. Before, because a statement outside a transaction commits each step as it goes.
+    void Checked(Plan plan, object?[] arguments)
+    {
+        foreach (var check in plan.Checks ?? [])
+        {
+            using var command = Command(check.Sql, arguments);
+            using var reader = command.ExecuteReader();
+            if (reader.Read()) throw new PgError("23503", check.Message);
+        }
+    }
+
     /// Everything a rows plan does before it has rows to give: an insert asked what it wrote puts
     /// them down first, and the last step is what answers.
     void Written(Plan plan, object?[] arguments)
     {
+        Checked(plan, arguments);
         foreach (var step in plan.Steps[..^1])
         {
             using var command = Command(step, arguments);
@@ -353,6 +366,8 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
     void RunPlan(Plan plan, object?[] arguments, short[] resultFormats)
     {
+        Checked(plan, arguments);
+
         switch (plan.Kind)
         {
             case PlanKind.Empty:

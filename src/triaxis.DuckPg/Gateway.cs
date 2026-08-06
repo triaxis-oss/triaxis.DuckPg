@@ -8,8 +8,13 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// A client statement translated into what DuckDB should actually run. `Steps` execute in order;
 /// the last one supplies the row count unless `Affected` names a query that knows better, which a
 /// rewritten DML statement does -- what it touches is not what its last step writes.
+/// A query that must find nothing, and what to say when it does. What a check stands for is a rule
+/// the layers keep rather than DuckDB: a constraint over the merged view is not one a table can
+/// declare, since the row it protects may live in any layer.
+sealed record Check(string Sql, string Message);
+
 sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string? Dirty = null,
-                   string? Promoted = null, string? Tombstoned = null)
+                   string? Promoted = null, string? Tombstoned = null, Check[]? Checks = null)
 {
     public static Plan Rows(string sql) => new(PlanKind.Rows, [sql], "SELECT");
     public static Plan Count(string tag, params string[] steps) => new(PlanKind.Count, steps, tag);
@@ -358,10 +363,9 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             qualifier = SqlText.Quote(alias ?? table.Name) + ".";
         }
 
-        string[] steps = [
-            Keys(table, scan, qualifier, where < 0 ? "TRUE" : sql[(where + 5)..]),
-            Tombstone(table),
-            Evict(table)];
+        var predicate = where < 0 ? "TRUE" : sql[(where + 5)..];
+        string[] steps = [Keys(table, scan, qualifier, predicate), Tombstone(table), Evict(table)];
+        var referenced = Referenced(table, Keyed(table, scan, qualifier, predicate)).ToArray();
 
         // A deleted row is gone by the time anything could read it, so what can be answered for is
         // what was collected before it went: the keys, and whatever the statement made of them.
@@ -374,11 +378,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
             return Promoting(table, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_keys"], "DELETE")
-                with { Dirty = table.Name }, tombstones: true);
+                with { Dirty = table.Name, Checks = referenced }, tombstones: true);
         }
 
         return Promoting(table, Plan.Count("DELETE", steps)
-            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name }, tombstones: true);
+            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name, Checks = referenced },
+            tombstones: true);
     }
 
     /// The `RETURNING` clause a statement ends with, and the statement without it. A lake answers
@@ -390,10 +395,42 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         return at < 0 ? (null, sql) : (sql[(at + "RETURNING".Length)..].Trim(), sql[..at]);
     }
 
+    /// What a delete has to be sure of before anything goes: that nothing points at the rows it
+    /// collected. The check reads the referencing table as published -- a row pointing at this one
+    /// may live in any layer, and the write branch is only the topmost of them.
+    ///
+    /// It runs before the tombstone rather than after: a statement outside a transaction commits
+    /// each step as it goes, so a check that failed afterwards would have nothing left to undo.
+    IEnumerable<Check> Referenced(Table table, string keys)
+    {
+        foreach (var reference in Catalog.Referencing(table))
+        {
+            var child = Catalog.Tables[reference.Table];
+            var matched = string.Join(" AND ", reference.Columns.Zip(reference.ParentColumns)
+                .Select(pair => $"c.{SqlText.Quote(pair.First)} = k.{SqlText.Quote(pair.Second)}"));
+
+            // A table pointing at itself would find the rows going as rows still there, so the ones
+            // going are taken out of the question.
+            var others = reference.Table.Equals(table.Name, StringComparison.OrdinalIgnoreCase)
+                ? " AND NOT (" + string.Join(" AND ", table.Key.Select(key =>
+                      $"c.{SqlText.Quote(key)} IS NOT DISTINCT FROM k.{SqlText.Quote(key)}")) + ")"
+                : "";
+
+            yield return new Check(
+                $"SELECT 1 FROM {child.QualifiedName} AS c, ({keys}) AS k WHERE {matched}{others} LIMIT 1",
+                $"The DELETE statement conflicted with the REFERENCE constraint \"{reference.Name}\". " +
+                $"The conflict occurred in database \"{Config.Schema}\", table \"{reference.Table}\", " +
+                $"column '{reference.Columns[0]}'.");
+        }
+    }
+
     /// The keys a statement touches, taken from the merged view before anything moves.
     static string Keys(Table table, string scan, string qualifier, string predicate) =>
-        $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS SELECT DISTINCT " +
-        $"{string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)))} FROM {scan} WHERE {predicate}";
+        $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS {Keyed(table, scan, qualifier, predicate)}";
+
+    static string Keyed(Table table, string scan, string qualifier, string predicate) =>
+        $"SELECT DISTINCT {string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)))} " +
+        $"FROM {scan} WHERE {predicate}";
 
     /// What a DELETE calls its target, spelled out or not -- and nothing at all when the word after
     /// the table is the clause that follows it.

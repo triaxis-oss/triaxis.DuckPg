@@ -15,9 +15,16 @@ static class Dacpac
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
 
+    /// What one table's columns say about another's, as DacFx writes a foreign key.
+    public record ReferenceModel(string Name, string Table, string[] Columns, string Parent, string[] ParentColumns,
+                                 string OnDelete = "NoAction");
+
     public static void Write(string path, params TableModel[] tables) => Write(path, tables, []);
 
-    public static void Write(string path, TableModel[] tables, params ViewModel[] views)
+    public static void Write(string path, TableModel[] tables, params ViewModel[] views) =>
+        Write(path, tables, views, []);
+
+    public static void Write(string path, TableModel[] tables, ViewModel[] views, ReferenceModel[] references)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
@@ -26,7 +33,8 @@ static class Dacpac
                 tables.Select(Element)
                       .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
                       .Concat(tables.SelectMany(Defaults))
-                      .Concat(views.Select(View))));
+                      .Concat(views.Select(View))
+                      .Concat(references.Select(Reference))));
 
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         using var entry = archive.CreateEntry("model.xml").Open();
@@ -60,6 +68,17 @@ static class Dacpac
     /// DacFx writes a script as a nested `Value`, in CDATA -- not as a property attribute.
     static XElement Script(string name, string sql) =>
         new(Dac + "Property", new XAttribute("Name", name), new XElement(Dac + "Value", new XCData(sql)));
+
+    /// A foreign key names the table it defines on, the columns it is over, and the table and
+    /// columns it points at.
+    static XElement Reference(ReferenceModel reference) =>
+        El("SqlForeignKeyConstraint", $"[dbo].[{reference.Name}]",
+            new XElement(Dac + "Property", new XAttribute("Name", "DeleteAction"),
+                         new XAttribute("Value", reference.OnDelete)),
+            Rel("DefiningTable", Ref($"[dbo].[{reference.Table}]")),
+            Rel("ForeignTable", Ref($"[dbo].[{reference.Parent}]")),
+            Rel("Columns", [.. reference.Columns.Select(c => Ref($"[dbo].[{reference.Table}].[{c}]"))]),
+            Rel("ForeignColumns", [.. reference.ParentColumns.Select(c => Ref($"[dbo].[{reference.Parent}].[{c}]"))]));
 
     static XElement Key(TableModel table) =>
         El("SqlPrimaryKeyConstraint", $"[dbo].[PK_{table.Name}]",

@@ -387,6 +387,15 @@ being written and the answer comes off those same rows, which is what keeps a `g
 from being one thing in the file and another in the caller's hand. A column with no declared default
 that the caller did not send is still refused by name.
 
+**A declared reference is kept on delete.** A dacpac's foreign keys are read, and a `DELETE` of a
+row something still points at fails the way SQL Server fails it — error 547, naming the constraint —
+rather than quietly leaving an orphan. The check is over the *merged view*, since a row pointing at
+this one may live in any layer, and it runs before anything is hidden. What is not done: the insert
+side is unchecked (a row may name a parent that is not there), `ON DELETE CASCADE` is warned about
+at startup rather than performed, and a reference to columns that are not the table's key is
+skipped — a delete collects the key, so that is what a reference can be checked against. Nothing is
+enforced over files another process edits between runs; `duckpg` sees what its own writes do.
+
 **A store-generated key needs a dacpac that declares one.** A column the model marks `IsIdentity`
 draws from a sequence in the write layer, seeded past the highest value the files already hold when
 the table first grows a write branch — so keys carry on from the lake's own state, and a restart

@@ -257,6 +257,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last)
     {
+        Checked(plan, parameters);
+
         switch (plan.Kind)
         {
             case PlanKind.Empty:
@@ -314,6 +316,19 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 Done(msg, doneToken, (last ? Status.Final : Status.More) | Status.Count, affected);
                 return;
             }
+        }
+    }
+
+    /// What has to be true before a plan runs at all -- a reference nothing else may still be
+    /// pointing at. Before, because a statement outside a transaction commits each step as it goes,
+    /// so a rule enforced afterwards would be enforced on a row already gone.
+    void Checked(Plan plan, IReadOnlyDictionary<string, object?> parameters)
+    {
+        foreach (var check in plan.Checks ?? [])
+        {
+            using var command = Command(check.Sql, parameters);
+            using var reader = command.ExecuteReader();
+            if (reader.Read()) throw new PgError("23503", check.Message);
         }
     }
 
@@ -709,6 +724,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             TSqlException => 102,
             _ => PgError.SqlStateOf(e) switch
             {
+                "23503" => 547,     // a reference still points at the row
                 "42P01" => 208,     // invalid object name
                 "42703" => 207,     // invalid column name
                 "42601" => 102,     // syntax error

@@ -112,6 +112,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                 column => column.Name, column => column.Type, StringComparer.OrdinalIgnoreCase),
             StringComparer.OrdinalIgnoreCase);
 
+        Declared();
         Declared(conn);
     }
 
@@ -191,6 +192,58 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     }
 
     // ---- declared views --------------------------------------------------------------------------
+
+    /// What points at each published table, by the table pointed at. Worked out once the tables are
+    /// known, since a reference this cannot enforce is worth saying so about at startup rather than
+    /// at the first delete -- and a lake made of some of a database's tables has plenty of those.
+    readonly Dictionary<string, List<Reference>> referencing = new(StringComparer.OrdinalIgnoreCase);
+
+    /// The references a delete from this table has to answer for.
+    public IReadOnlyList<Reference> Referencing(Table table) =>
+        referencing.GetValueOrDefault(table.Name) ?? [];
+
+    void Declared()
+    {
+        referencing.Clear();
+
+        foreach (var reference in schema.References)
+        {
+            // A lake is usually some of a database's tables, so a reference to or from one it does
+            // not publish is ordinary rather than wrong.
+            if (!Tables.TryGetValue(reference.Table, out var child) ||
+                !Tables.TryGetValue(reference.Parent, out var parent)) continue;
+
+            if (!reference.OnDelete.Equals("NoAction", StringComparison.OrdinalIgnoreCase))
+            {
+                logger.LogWarning("{Reference} declares ON DELETE {Action}, which duckpg does not do: " +
+                                  "a delete from {Parent} is left to say what it says",
+                                  reference.Name, reference.OnDelete, reference.Parent);
+                continue;
+            }
+
+            // What a delete collects before the rows go is the table's key, so that is the only
+            // thing a reference can be checked against here.
+            if (!parent.Key.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).SequenceEqual(
+                    reference.ParentColumns.OrderBy(k => k, StringComparer.OrdinalIgnoreCase),
+                    StringComparer.OrdinalIgnoreCase))
+            {
+                logger.LogWarning("{Reference} points at {Columns} of {Parent}, which is not its key: " +
+                                  "duckpg checks a reference against the key a delete collects",
+                                  reference.Name, string.Join(", ", reference.ParentColumns), reference.Parent);
+                continue;
+            }
+
+            if (reference.Columns.Any(column => !child.Has(column))) continue;
+
+            if (!referencing.TryGetValue(parent.Name, out var pointing))
+                referencing[parent.Name] = pointing = [];
+            pointing.Add(reference);
+        }
+
+        if (referencing.Count > 0)
+            logger.LogDebug("{Count} declared references are enforced on delete",
+                            referencing.Values.Sum(r => r.Count));
+    }
 
     /// The dacpac's own views, published beside the tables they read: the query is T-SQL, so it is
     /// translated on the tree like any statement a client sends, and `dbo` lands on the lake.
