@@ -40,6 +40,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
     char transactionStatus = 'I';
     bool skipUntilSync;
+    bool turn;
 
     public int ProcessId { get; } = Random.Shared.Next(1, int.MaxValue);
     public int Secret { get; } = Random.Shared.Next(1, int.MaxValue);
@@ -344,13 +345,30 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     /// them down first, and the last step is what answers.
     void Written(Plan plan, object?[] arguments)
     {
-        Checked(plan, arguments);
-        foreach (var step in plan.Steps[..^1])
+        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        try
         {
-            using var command = Command(step, arguments);
-            command.ExecuteNonQuery();
+            Checked(plan, arguments);
+            foreach (var step in plan.Steps[..^1])
+            {
+                using var command = Command(step, arguments);
+                command.ExecuteNonQuery();
+            }
+            if (plan.Steps.Length > 1) Persist(plan);
         }
-        if (plan.Steps.Length > 1) Persist(plan);
+        finally
+        {
+            if (transactionStatus == 'I') Release();
+        }
+    }
+
+    /// A serialised lake's turn to write, given up when the transaction that took it ends -- and
+    /// with the session, so a client that vanishes mid-transaction cannot keep the lake to itself.
+    void Release()
+    {
+        if (!turn) return;
+        turn = false;
+        gateway.ExitTurn();
     }
 
     void Close(ref MsgReader reader)
@@ -365,6 +383,19 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     // ---- execution -------------------------------------------------------------------------------
 
     void RunPlan(Plan plan, object?[] arguments, short[] resultFormats)
+    {
+        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        try
+        {
+            Perform(plan, arguments, resultFormats);
+        }
+        finally
+        {
+            if (transactionStatus == 'I') Release();
+        }
+    }
+
+    void Perform(Plan plan, object?[] arguments, short[] resultFormats)
     {
         Checked(plan, arguments);
 
@@ -563,6 +594,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     public void Dispose()
     {
         server.Unregister(this);
+        Release();
         foreach (var portal in portals.Values) portal.Reset();
         duck.Dispose();
         client.Dispose();

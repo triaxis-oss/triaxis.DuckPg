@@ -28,6 +28,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     int tdsVersion = 0x74000004;
     long rowCount;
     int transactions;
+    bool turn;
     long descriptor;
     int handles;
 
@@ -256,6 +257,28 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     }
 
     void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last)
+    {
+        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        try
+        {
+            Perform(msg, plan, parameters, doneToken, last);
+        }
+        finally
+        {
+            if (transactions == 0) Release();
+        }
+    }
+
+    /// A serialised lake's turn to write, given up when the transaction that took it ends -- and
+    /// with the session, so a client that vanishes mid-transaction cannot keep the lake to itself.
+    void Release()
+    {
+        if (!turn) return;
+        turn = false;
+        gateway.ExitTurn();
+    }
+
+    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last)
     {
         Checked(plan, parameters);
 
@@ -598,6 +621,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         prepared.Clear();
         pendingWrites.Clear();
         transactions = 0;
+        Release();
         DropTemporaryTables();
     }
 
@@ -758,6 +782,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     public void Dispose()
     {
         server.Unregister(this);
+        Release();
         duck.Dispose();
         client.Dispose();
     }

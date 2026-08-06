@@ -54,6 +54,10 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 {
     readonly Lock gate = new();
 
+    /// One transaction at a time when the lake was asked for it. Not thread-affine, since a
+    /// session's loop may resume on another thread between statements.
+    readonly SemaphoreSlim turns = new(1, 1);
+
     public Config Config { get; } = config;
     public Catalog Catalog { get; } = catalog;
 
@@ -125,6 +129,19 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         }
         return null;
     }
+
+    // ---- serialised transactions ------------------------------------------------------------------
+
+    /// Waits for the lake's turn, indefinitely -- which is what SQL Server does with the default
+    /// LOCK_TIMEOUT. False when the option is off, and then nothing is held.
+    public bool EnterTurn()
+    {
+        if (!Config.SerializeTransactions) return false;
+        turns.Wait();
+        return true;
+    }
+
+    public void ExitTurn() => turns.Release();
 
     /// Writes a table's write layer back to its file. Called once a write is committed, so a
     /// rolled-back statement never reaches the disk.

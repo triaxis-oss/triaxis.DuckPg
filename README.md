@@ -62,10 +62,10 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
-`--write-format`, `--writable`, `--schema`, `--key` (repeatable), `--dacpac`, `--cache` and
-`--config` each override the file when both are given; argument paths are relative to the working
-directory, file paths to the file. A file named explicitly with `--config` must exist, so a typo is
-an error rather than a silent fallback to defaults.
+`--write-format`, `--writable`, `--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
+`--cache` and `--config` each override the file when both are given; argument paths are relative to
+the working directory, file paths to the file. A file named explicitly with `--config` must exist,
+so a typo is an error rather than a silent fallback to defaults.
 
 `-v` traces each translated statement with its DuckDB execution time and row count (execution and
 row streaming are timed apart, since DuckDB returns before the rows are pulled); `-vv` adds the
@@ -270,6 +270,22 @@ from an old one. Virtual columns reject writes.
 
 `--writable` accepts writes with no directory at all; they live in memory and are lost on exit,
 which is what a test wants.
+
+`--serialize-transactions` lets one transaction run at a time. Two things go wrong without it, and
+neither is something an application written against SQL Server or PostgreSQL has reason to expect.
+The first is that DuckDB does not make a second writer wait: the moment two open transactions touch
+the same row it refuses one of them outright. The second is worse, because the writes need never
+overlap for it — a DuckDB transaction fixes its **catalog** snapshot when it begins, so a write
+branch created by anybody afterwards is invisible to it for as long as it lives, and it cannot
+create one itself either. A transaction that begins, reads, and only then writes to a table someone
+else wrote to first fails with `Table with name … does not exist` against a table that is plainly
+there. Ordering only the writes cannot close that; ordering the transactions can.
+
+So a session takes the lake's turn at `BEGIN` — or at its first write, for a statement outside a
+transaction — and gives it up when that transaction ends. The next one waits, indefinitely, the way
+a real database does with the default `LOCK_TIMEOUT`. A read outside a transaction never waits; a
+read-only transaction does take the turn, since nothing says in advance that it will stay read-only.
+It is off by default: a lake serving one connection pays a lock for nothing.
 
 `CALL duckpg_reload()` rebuilds the catalog from the filesystem, picking up files that appeared
 since startup.
@@ -560,6 +576,7 @@ variables and the tool's usual override files layer over it for free.
 | `write` | `--write`, `-w` | Directory holding the writable top layer. |
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
+| `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
 | `cache` | `--cache` | Directory for merged copies of multi-layer tables, as ZSTD parquet. |

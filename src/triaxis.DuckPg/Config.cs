@@ -27,6 +27,13 @@ public sealed class Config
     /// Accept writes without a write directory -- they live in memory and are lost on exit.
     public bool Writable { get; set; }
 
+    /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
+    /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
+    /// after that is invisible to it for as long as it lives -- and it cannot create one itself
+    /// either. Ordering writes alone does not close that, since the two writes need never overlap.
+    /// Off by default: a lake serving readers pays nothing for DuckDB's own concurrency.
+    public bool SerializeTransactions { get; set; }
+
     /// Key used by any table that neither names its own nor takes one from the schema.
     public string[] DefaultKey { get; set; } = [];
 

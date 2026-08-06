@@ -246,6 +246,24 @@ publish a temp-directory convention as API.
   what the catalog remembers under the same lock, since another session's commit is what writes it.
   Nothing here is visible as an error when it goes wrong: it is a native call two threads are inside
   of, and `ConcurrencyTests` is the only thing that would notice.
+- **A DuckDB transaction fixes its catalog snapshot when it begins**, and that is what
+  `Config.SerializeTransactions` is really for. Two open transactions writing the same row refuse
+  each other, which ordering the writes would fix; but a transaction that began before another
+  committed a *promotion* cannot see the write branch, cannot create one itself -- DuckDB calls that
+  a catalog write-write conflict on create -- and stays that way until it ends. The two writes never
+  overlap, so no amount of write ordering helps. Hence the turn is taken at `BEGIN` as well as at a
+  write outside one, and given up when the transaction ends -- `transactions == 0`, or
+  `transactionStatus == 'I'`, which is why a failed transaction ('E') keeps it until the ROLLBACK.
+  It is also given up on dispose and on a pooled connection's reset, since a client that vanishes
+  mid-transaction would otherwise keep the lake to itself. A `SemaphoreSlim` rather than a `Lock`,
+  because a session's loop may resume on another thread between statements -- and a semaphore is not
+  reentrant, so `turn` is the session's record of already holding it and has to be tested *before*
+  `EnterTurn` is called. `turn |= … && EnterTurn()` reads as though it does that and does not: `|=`
+  is not the short-circuiting `||`, so the second write of a transaction waited on the lock its own
+  session was holding. The order is always the turn and then `gate`, never the reverse. A read
+  outside a transaction takes nothing; a read-only transaction does take the turn, since nothing
+  says in advance that it will stay read-only. Off by default, so a lake serving readers pays
+  nothing for it.
 - **A failure the client is told about is logged at warning.** A server that answers with an error
   and says nothing in its own log leaves a caller reporting a failure and nowhere to look -- which
   is what made an intermittent one look like the wire's fault rather than a statement's.
