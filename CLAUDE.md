@@ -206,6 +206,22 @@ publish a temp-directory convention as API.
   -- and only for a table something points at. A cascade is warned about rather than performed, and
   the insert side is not checked at all: both would be more promise than a stack of files can keep,
   since what a read layer holds can change between runs.
+- **A cascade is that same delete, one table down.** `Gateway.Cascading` walks the declared
+  references from the table being deleted from, and each level collects its own keys into a
+  `duckpg_cascade_n` temp table before hiding them -- read off the level above's temp table, since
+  by then it is there. The checks are built from the *query* that produced those keys rather than
+  from the table, because `Plan.Checks` runs before any step does; that is also why every level
+  contributes its non-cascading references, and not only the table the statement named. A cascade
+  writes to more than one table, which is what made `Plan.Dirty`, `Promoted` and `Tombstoned` lists
+  and `Promoting` take a set: each table down the chain earns its write branch the same way.
+  DacFx numbers the action -- `OnDeleteAction` `1` is CASCADE -- and leaves the property out
+  altogether when it is NO ACTION, so reading it by any other name is indistinguishable from a
+  schema where nothing cascades: no warning fires, because the fallback *is* the default. `Dacpac`
+  in the suite has to write that same encoding, or every cascade test only checks its own spelling.
+  What a cascade cannot do is demoted at startup to the refusal a plain reference gets, in
+  `Catalog.Acyclic` and `Uncascadable` -- a child that is not writable or has no key, and a cycle,
+  which SQL Server will not let you declare either. Orphaning the rows is the one answer that is
+  wrong whichever way it is reached, so the honest fallback is the refusal rather than doing nothing.
 - **A `bit` is converted for arithmetic, and only where the column resolves to one.** T-SQL makes a
   `bit` an integer to multiply it; DuckDB refuses `BOOLEAN * INTEGER` outright. The cast is written
   by `TSqlWriter.Operand`, which asks `TypeOf` what the column actually is -- `TSqlContext.Tables`

@@ -145,9 +145,22 @@ sealed class DacpacSchema
         references.Add(new Reference(
             Unqualify(constraint.Attribute("Name")?.Value) ?? $"FK_{child}_{parent}",
             child, columns, parent, referenced,
-            Property(constraint, "DeleteAction") ?? "NoAction"));
+            DeleteAction(Property(constraint, "OnDeleteAction"))));
         return true;
     }
+
+    /// DacFx numbers the action and leaves the property out altogether when it is the default, so
+    /// an absent one is `NO ACTION` -- which is why reading it by the wrong name looked like a
+    /// schema where nothing cascades rather than like a schema that was not read.
+    /// An unrecognised code is carried as itself: what a lake will not do it should at least name.
+    static string DeleteAction(string? code) => code switch
+    {
+        null or "0" => "NoAction",
+        "1" => "Cascade",
+        "2" => "SetNull",
+        "3" => "SetDefault",
+        _ => $"OnDeleteAction={code}",
+    };
 
     static string[] Columns(XElement constraint, string relationship) =>
         [.. Related(constraint, relationship)

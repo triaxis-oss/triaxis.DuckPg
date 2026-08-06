@@ -390,11 +390,23 @@ that the caller did not send is still refused by name.
 **A declared reference is kept on delete.** A dacpac's foreign keys are read, and a `DELETE` of a
 row something still points at fails the way SQL Server fails it — error 547, naming the constraint —
 rather than quietly leaving an orphan. The check is over the *merged view*, since a row pointing at
-this one may live in any layer, and it runs before anything is hidden. What is not done: the insert
-side is unchecked (a row may name a parent that is not there), `ON DELETE CASCADE` is warned about
-at startup rather than performed, and a reference to columns that are not the table's key is
-skipped — a delete collects the key, so that is what a reference can be checked against. Nothing is
-enforced over files another process edits between runs; `duckpg` sees what its own writes do.
+this one may live in any layer, and it runs before anything is hidden.
+
+**`ON DELETE CASCADE` is performed**, as the same delete against the table that pointed — and again
+against whatever pointed at that, however deep the chain goes. The rows it takes may live in any
+layer, so it hides them exactly as a delete does, and the count answered for is the target's own,
+as SQL Server answers it. Every level still answers for the references that do *not* cascade: a row
+two tables down held by one of those refuses the whole delete, before anything goes. Where a cascade
+cannot be performed — into a table this lake will not write to or has no key for, or one that could
+reach back to where it started, which SQL Server refuses to declare at all — the reference is kept
+as one that refuses instead, and the reason is logged at startup. Orphaning the rows is the one
+answer that is wrong either way.
+
+What is not done: the insert side is unchecked (a row may name a parent that is not there),
+`ON DELETE SET NULL` and `SET DEFAULT` are warned about at startup rather than performed, and a
+reference to columns that are not the table's key is skipped — a delete collects the key, so that is
+what a reference can be checked against. Nothing is enforced over files another process edits
+between runs; `duckpg` sees what its own writes do.
 
 **A store-generated key needs a dacpac that declares one.** A column the model marks `IsIdentity`
 draws from a sequence in the write layer, seeded past the highest value the files already hold when

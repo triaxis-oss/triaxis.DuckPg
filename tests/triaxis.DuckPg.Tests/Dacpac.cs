@@ -71,10 +71,16 @@ static class Dacpac
 
     /// A foreign key names the table it defines on, the columns it is over, and the table and
     /// columns it points at.
+    /// DacFx numbers the delete action and omits the property when it is the default, so a model a
+    /// test writes has to do the same -- a helper that spelled it out would test nothing.
+    static readonly string[] DeleteActions = ["NoAction", "Cascade", "SetNull", "SetDefault"];
+
     static XElement Reference(ReferenceModel reference) =>
         El("SqlForeignKeyConstraint", $"[dbo].[{reference.Name}]",
-            new XElement(Dac + "Property", new XAttribute("Name", "DeleteAction"),
-                         new XAttribute("Value", reference.OnDelete)),
+            Array.IndexOf(DeleteActions, reference.OnDelete) is var action and > 0
+                ? [new XElement(Dac + "Property", new XAttribute("Name", "OnDeleteAction"),
+                                new XAttribute("Value", action.ToString()))]
+                : (object[])[],
             Rel("DefiningTable", Ref($"[dbo].[{reference.Table}]")),
             Rel("ForeignTable", Ref($"[dbo].[{reference.Parent}]")),
             Rel("Columns", [.. reference.Columns.Select(c => Ref($"[dbo].[{reference.Table}].[{c}]"))]),

@@ -13,8 +13,8 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// declare, since the row it protects may live in any layer.
 sealed record Check(string Sql, string Message);
 
-sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string? Dirty = null,
-                   string? Promoted = null, string? Tombstoned = null, Check[]? Checks = null)
+sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string[]? Dirty = null,
+                   string[]? Promoted = null, string[]? Tombstoned = null, Check[]? Checks = null)
 {
     public static Plan Rows(string sql) => new(PlanKind.Rows, [sql], "SELECT");
     public static Plan Count(string tag, params string[] steps) => new(PlanKind.Count, steps, tag);
@@ -184,7 +184,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                    $"SELECT *, {string.Join(", ", NextValues(table, generated))} FROM ({source}) AS \"_rows\"";
         }
 
-        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = table.Name });
+        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = [table.Name] });
     }
 
     /// An insert that is asked what it wrote -- `OUTPUT INSERTED.<key>`, which is how EF Core gets a
@@ -238,7 +238,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $" {source}",
             $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written",
             $"SELECT {answered} FROM duckpg_written"],
-            "INSERT") with { Dirty = table.Name });
+            "INSERT") with { Dirty = [table.Name] });
     }
 
     /// The declared identities a statement does not name, and so leaves to the store.
@@ -328,10 +328,10 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (answered is not null)
             return Promoting(table, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_updated"], "UPDATE")
-                with { Dirty = table.Name }, tombstones: moves);
+                with { Dirty = [table.Name] }, tombstones: moves);
 
         return Promoting(table, Plan.Count("UPDATE", steps)
-            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = table.Name }, tombstones: moves);
+            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name] }, tombstones: moves);
     }
 
     Plan RewriteDelete(string sql)
@@ -364,8 +364,17 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         }
 
         var predicate = where < 0 ? "TRUE" : sql[(where + 5)..];
-        string[] steps = [Keys(table, scan, qualifier, predicate), Tombstone(table), Evict(table)];
-        var referenced = Referenced(table, Keyed(table, scan, qualifier, predicate)).ToArray();
+
+        // A cascade goes before the rows it depends on are hidden, and every level answers for the
+        // references that do not cascade -- a row two tables down may be held by one of those.
+        List<string> cascade = [];
+        List<Check> checks = [];
+        List<(Table Table, bool Tombstones)> promote = [(table, true)];
+        Cascading(table, "duckpg_keys", Keyed(table, scan, qualifier, predicate), cascade, checks, promote);
+
+        string[] steps =
+            [Keys(table, scan, qualifier, predicate), .. cascade, Tombstone(table), Evict(table)];
+        var referenced = checks.ToArray();
 
         // A deleted row is gone by the time anything could read it, so what can be answered for is
         // what was collected before it went: the keys, and whatever the statement made of them.
@@ -376,14 +385,18 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                     throw new PgError("0A000", $"OUTPUT of `{name}` on a DELETE cannot be answered: " +
                                                "the row is gone, and only its key was read first");
 
-            return Promoting(table, new Plan(PlanKind.Rows,
+            return Promoting(promote, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_keys"], "DELETE")
-                with { Dirty = table.Name, Checks = referenced }, tombstones: true);
+                with { Dirty = [.. promote.Select(p => p.Table.Name)], Checks = referenced });
         }
 
-        return Promoting(table, Plan.Count("DELETE", steps)
-            with { Affected = "SELECT count(*) FROM duckpg_keys", Dirty = table.Name, Checks = referenced },
-            tombstones: true);
+        return Promoting(promote, Plan.Count("DELETE", steps)
+            with
+            {
+                Affected = "SELECT count(*) FROM duckpg_keys",
+                Dirty = [.. promote.Select(p => p.Table.Name)],
+                Checks = referenced,
+            });
     }
 
     /// The `RETURNING` clause a statement ends with, and the statement without it. A lake answers
@@ -456,13 +469,49 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     }
 
     /// A tombstone hides the row in every layer below; the same key deleted twice is one tombstone.
-    static string Tombstone(Table table) =>
-        $"INSERT OR IGNORE INTO {table.TombstoneName} SELECT * FROM duckpg_keys";
+    static string Tombstone(Table table, string keys = "duckpg_keys") =>
+        $"INSERT OR IGNORE INTO {table.TombstoneName} SELECT * FROM {keys}";
 
     /// The write layer's own copy of a row is deleted outright -- nothing below it to hide.
-    static string Evict(Table table) =>
-        $"DELETE FROM {table.WriteName} AS w WHERE EXISTS (SELECT 1 FROM duckpg_keys k WHERE " +
+    static string Evict(Table table, string keys = "duckpg_keys") =>
+        $"DELETE FROM {table.WriteName} AS w WHERE EXISTS (SELECT 1 FROM {keys} k WHERE " +
         string.Join(" AND ", table.Key.Select(k => $"k.{SqlText.Quote(k)} IS NOT DISTINCT FROM w.{SqlText.Quote(k)}")) + ")";
+
+    /// A declared `ON DELETE CASCADE` performed as what it means: the same delete against the table
+    /// pointing at this one, keyed off what the level above collected. The steps read that as a temp
+    /// table, since it is already there by then; the checks read it as the query that produced it,
+    /// since a check runs before any step does.
+    ///
+    /// Every level answers for the references that do not cascade, not just the one deleted from --
+    /// a row two tables down may be held by a reference nothing cascades, and orphaning it because
+    /// something above it cascaded is the one answer that is wrong.
+    void Cascading(Table table, string keys, string keyed, List<string> steps, List<Check> checks,
+                   List<(Table Table, bool Tombstones)> promote)
+    {
+        checks.AddRange(Referenced(table, keyed));
+
+        foreach (var reference in Catalog.Cascading(table))
+        {
+            var child = Catalog.Tables[reference.Table];
+            var matched = string.Join(" AND ", reference.Columns.Zip(reference.ParentColumns)
+                .Select(pair => $"c.{SqlText.Quote(pair.First)} = k.{SqlText.Quote(pair.Second)}"));
+            var collected = string.Join(", ", child.Key.Select(k => "c." + SqlText.Quote(k)));
+
+            // One per level, and a level adds exactly one table to promote -- a cascade that reaches
+            // the same table twice collects for each parent separately, which is what it means.
+            var childKeys = $"duckpg_cascade_{promote.Count}";
+            promote.Add((child, true));
+
+            steps.Add($"CREATE OR REPLACE TEMP TABLE {childKeys} AS SELECT DISTINCT {collected} " +
+                      $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {matched}");
+            steps.Add(Tombstone(child, childKeys));
+            steps.Add(Evict(child, childKeys));
+
+            Cascading(child, childKeys,
+                      $"SELECT DISTINCT {collected} FROM {child.QualifiedName} AS c, ({keyed}) AS k WHERE {matched}",
+                      steps, checks, promote);
+        }
+    }
 
     static Dictionary<string, string> ParseAssignments(string setClause)
     {
@@ -476,23 +525,36 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         return assignments;
     }
 
+    Plan Promoting(Table table, Plan plan, bool tombstones = false) =>
+        Promoting([(table, tombstones)], plan);
+
     /// A table nobody has written to carries no write branch, so the first write puts one there
     /// before the rest of the plan runs -- on the session's own connection and inside its own
-    /// transaction, so a statement that rolls back takes the promotion with it.
-    Plan Promoting(Table table, Plan plan, bool tombstones = false)
+    /// transaction, so a statement that rolls back takes the promotion with it. A cascade writes to
+    /// more than one table, and each of them earns its branch the same way.
+    Plan Promoting(List<(Table Table, bool Tombstones)> tables, Plan plan)
     {
         // Under the same lock as everything else the lake's own connection does: seeding a sequence
         // reads through it, and a DuckDB connection is not two threads' to share. What the catalog
         // remembers about a table is read here too, and another session's commit is what writes it.
         lock (gate)
         {
-            if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) return plan;
+            List<string> steps = [], promoted = [], tombstoned = [];
+            foreach (var (table, tombstones) in tables)
+            {
+                if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) continue;
+                steps.AddRange(Catalog.Promotion(admin, table, tombstones));
+                promoted.Add(table.Name);
+                if (tombstones) tombstoned.Add(table.Name);
+            }
+
+            if (steps.Count == 0) return plan;
 
             return plan with
             {
-                Steps = [.. Catalog.Promotion(admin, table, tombstones), .. plan.Steps],
-                Promoted = table.Name,
-                Tombstoned = tombstones ? table.Name : null,
+                Steps = [.. steps, .. plan.Steps],
+                Promoted = [.. promoted],
+                Tombstoned = [.. tombstoned],
             };
         }
     }

@@ -198,13 +198,22 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// at the first delete -- and a lake made of some of a database's tables has plenty of those.
     readonly Dictionary<string, List<Reference>> referencing = new(StringComparer.OrdinalIgnoreCase);
 
+    /// And what a delete from each table takes with it, which is the same reference read the other
+    /// way: `ON DELETE CASCADE` says the rows pointing at one that goes go too.
+    readonly Dictionary<string, List<Reference>> cascading = new(StringComparer.OrdinalIgnoreCase);
+
     /// The references a delete from this table has to answer for.
     public IReadOnlyList<Reference> Referencing(Table table) =>
         referencing.GetValueOrDefault(table.Name) ?? [];
 
+    /// The references a delete from this table performs rather than refuses.
+    public IReadOnlyList<Reference> Cascading(Table table) =>
+        cascading.GetValueOrDefault(table.Name) ?? [];
+
     void Declared()
     {
         referencing.Clear();
+        cascading.Clear();
 
         foreach (var reference in schema.References)
         {
@@ -213,7 +222,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (!Tables.TryGetValue(reference.Table, out var child) ||
                 !Tables.TryGetValue(reference.Parent, out var parent)) continue;
 
-            if (!reference.OnDelete.Equals("NoAction", StringComparison.OrdinalIgnoreCase))
+            var cascade = reference.OnDelete.Equals("Cascade", StringComparison.OrdinalIgnoreCase);
+            if (!cascade && !reference.OnDelete.Equals("NoAction", StringComparison.OrdinalIgnoreCase))
             {
                 logger.LogWarning("{Reference} declares ON DELETE {Action}, which duckpg does not do: " +
                                   "a delete from {Parent} is left to say what it says",
@@ -235,14 +245,68 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
             if (reference.Columns.Any(column => !child.Has(column))) continue;
 
-            if (!referencing.TryGetValue(parent.Name, out var pointing))
-                referencing[parent.Name] = pointing = [];
-            pointing.Add(reference);
+            // A cascade is a delete from the child, and a delete needs what any delete needs. Where
+            // it cannot be performed the reference is kept as one that refuses instead: orphaning
+            // the rows is the one answer that is wrong either way.
+            if (cascade && Uncascadable(child) is { } why)
+            {
+                logger.LogWarning("{Reference} declares ON DELETE CASCADE, which duckpg cannot perform: " +
+                                  "{Child} {Why}, so a delete from {Parent} is refused instead",
+                                  reference.Name, child.Name, why, parent.Name);
+                cascade = false;
+            }
+
+            Pointing(cascade ? cascading : referencing, parent.Name).Add(reference);
         }
+
+        Acyclic();
+
 
         if (referencing.Count > 0)
             logger.LogDebug("{Count} declared references are enforced on delete",
                             referencing.Values.Sum(r => r.Count));
+        if (cascading.Count > 0)
+            logger.LogDebug("{Count} declared references cascade on delete",
+                            cascading.Values.Sum(r => r.Count));
+    }
+
+    static List<Reference> Pointing(Dictionary<string, List<Reference>> at, string table) =>
+        at.TryGetValue(table, out var pointing) ? pointing : at[table] = [];
+
+    static string? Uncascadable(Table child) =>
+        !child.Writable ? "is not writable"
+        : child.Key.Length == 0 ? "has no key, and a cascade has to hide the rows it takes"
+        : null;
+
+    /// A cascade that could reach the table it started from would not end. SQL Server refuses to
+    /// declare one at all; this demotes it to the refusal a plain reference gets, which is the same
+    /// answer arrived at later.
+    void Acyclic()
+    {
+        foreach (var (parent, references) in cascading.ToArray())
+            foreach (var reference in references.ToArray())
+                if (Reaches(reference.Table, parent))
+                {
+                    logger.LogWarning("{Reference} cascades from {Parent} back to itself, which cannot " +
+                                      "terminate: a delete from {Parent} is refused instead",
+                                      reference.Name, parent, parent);
+                    references.Remove(reference);
+                    Pointing(referencing, parent).Add(reference);
+                }
+    }
+
+    bool Reaches(string from, string to)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pending = new Stack<string>([from]);
+        while (pending.TryPop(out var table))
+        {
+            if (table.Equals(to, StringComparison.OrdinalIgnoreCase)) return true;
+            if (!seen.Add(table)) continue;
+            foreach (var reference in cascading.GetValueOrDefault(table) ?? [])
+                pending.Push(reference.Table);
+        }
+        return false;
     }
 
     /// The dacpac's own views, published beside the tables they read: the query is T-SQL, so it is

@@ -428,22 +428,23 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     {
         // A promotion is part of the write that caused it: it survives exactly as long, and a
         // rolled-back one is simply made again by the next write rather than assumed to be there.
-        if (plan.Promoted is { } promoted)
+        foreach (var promoted in plan.Promoted ?? [])
         {
             if (transactionStatus == 'T') pendingPromotions.Add(promoted);
             else gateway.Promoted(promoted);
         }
 
-        if (plan.Tombstoned is { } tombstoned)
+        foreach (var tombstoned in plan.Tombstoned ?? [])
         {
             if (transactionStatus == 'T') pendingTombstones.Add(tombstoned);
             else gateway.Tombstoned(tombstoned);
         }
 
-        if (plan.Dirty is { } dirty)
+        if (plan.Dirty is { Length: > 0 } dirty)
         {
-            if (transactionStatus == 'T') pendingWrites.Add(dirty);
-            else gateway.Persist(dirty);
+            foreach (var table in dirty)
+                if (transactionStatus == 'T') pendingWrites.Add(table);
+                else gateway.Persist(table);
         }
         else if (plan.Tag == "COMMIT")
         {
