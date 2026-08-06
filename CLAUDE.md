@@ -195,6 +195,15 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
+- **A DuckDB connection is not two threads' to share.** Sessions have one each, but the lake keeps
+  its own for the work that belongs to no session -- persisting a table, seeding a sequence,
+  rebuilding the catalog -- and everything that touches it holds `Gateway.gate`. `Promoting` reads
+  what the catalog remembers under the same lock, since another session's commit is what writes it.
+  Nothing here is visible as an error when it goes wrong: it is a native call two threads are inside
+  of, and `ConcurrencyTests` is the only thing that would notice.
+- **A failure the client is told about is logged at warning.** A server that answers with an error
+  and says nothing in its own log leaves a caller reporting a failure and nowhere to look -- which
+  is what made an intermittent one look like the wire's fault rather than a statement's.
 - **A write's target can be an alias its own FROM clause binds.** `DELETE FROM [s] FROM [t] AS [s]`
   is what EF Core's `ExecuteDelete` writes, and `UPDATE [o] SET … FROM [t] AS [o]` is its
   `ExecuteUpdate`; both resolve through `TSqlParser.Aliased`, and taking `s` for a table name pushed the real one into

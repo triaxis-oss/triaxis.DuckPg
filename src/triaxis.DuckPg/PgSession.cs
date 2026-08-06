@@ -533,6 +533,9 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     {
         if (transactionStatus == 'T') transactionStatus = 'E';
         var sqlState = PgError.SqlStateOf(e);
+        // Told to the client, and said out loud: a failure only the client can see is one nobody
+        // can look into afterwards.
+        logger.LogWarning("{Error}", e.Message.ReplaceLineEndings(" "));
         wire.Send('E', new Msg()
             .U8((byte)'S').Str("ERROR")
             .U8((byte)'V').Str("ERROR")

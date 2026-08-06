@@ -433,14 +433,20 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// transaction, so a statement that rolls back takes the promotion with it.
     Plan Promoting(Table table, Plan plan, bool tombstones = false)
     {
-        if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) return plan;
-
-        return plan with
+        // Under the same lock as everything else the lake's own connection does: seeding a sequence
+        // reads through it, and a DuckDB connection is not two threads' to share. What the catalog
+        // remembers about a table is read here too, and another session's commit is what writes it.
+        lock (gate)
         {
-            Steps = [.. Catalog.Promotion(admin, table, tombstones), .. plan.Steps],
-            Promoted = table.Name,
-            Tombstoned = tombstones ? table.Name : null,
-        };
+            if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) return plan;
+
+            return plan with
+            {
+                Steps = [.. Catalog.Promotion(admin, table, tombstones), .. plan.Steps],
+                Promoted = table.Name,
+                Tombstoned = tombstones ? table.Name : null,
+            };
+        }
     }
 
     /// Remembered only once the write has committed: a promotion that rolled back is simply made

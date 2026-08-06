@@ -53,7 +53,9 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             }
             catch (Exception e) when (e is not (IOException or SocketException))
             {
-                logger.LogDebug("{Error}", e.Message);
+                // A statement the client was told about is one the log should carry: a client that
+                // reports a failure and a server that says nothing leave nowhere to look.
+                logger.LogWarning("{Error}", e.Message.ReplaceLineEndings(" "));
                 var msg = new TdsMsg();
                 Error(msg, e);
                 Done(msg, TdsToken.Done, Status.Error, 0);
