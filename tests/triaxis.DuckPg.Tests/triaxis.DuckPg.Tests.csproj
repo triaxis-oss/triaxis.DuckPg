@@ -29,6 +29,14 @@
     <ProjectReference Include="../../src/triaxis.DuckPg.Cli/triaxis.DuckPg.Cli.csproj" />
   </ItemGroup>
 
+  <!-- DacFx's own output, checked in rather than built: the SQL SDK is not something every machine
+       running these tests should have to restore. `Schema/sample.sqlproj` says how to rebuild it. -->
+  <ItemGroup>
+    <None Include="Schema/sample.dacpac" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Schema/sample.sql" />
+    <None Include="Schema/sample.sqlproj" />
+  </ItemGroup>
+
   <!-- The tool links against the DuckDB installed on the machine; the tests carry their own, so a
        clean checkout and a clean CI runner can both run them. -->
   <Target Name="CopyDuckDbNative" BeforeTargets="PrepareForRun">

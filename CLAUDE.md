@@ -244,6 +244,25 @@ publish a temp-directory convention as API.
   so a coercion applied to a number would answer 1 rather than fail, and casting a DECIMAL that was
   taken for a `bit` would truncate it. A reference into a derived table resolves to nothing and is
   left alone -- DuckDB's error is better than a cast nobody can justify.
+- **A declared scalar function is a macro, and a macro is an expression.** `DacpacSchema` reads
+  `SqlScalarFunction`: `BodyScript` holds the `BEGIN … END` *alone* -- the `CREATE FUNCTION` header
+  is nowhere in the model but an annotation -- so the parameters come from the `Parameters`
+  relationship in document order, and the return type from the function's own direct `Type` child,
+  never a descendant, since every parameter has one of those too. `Catalog.Macros` translates the
+  body on the tree with `TSqlContext.Macro` set, which is what makes `@value` the macro's parameter
+  rather than a bound `$value`, and casts the result to the declared return type -- `Small` in the
+  suite is a SMALLINT over arithmetic DuckDB answers as INTEGER, which is the same narrowing COUNT
+  needs. `TSqlWriter.Declared` resolves the call site, and only for a function that was published:
+  an unpublished one keeps the name it was written with, which is the better error. DuckDB binds a
+  macro when it is *created*, not when it is called, so one calling another must be made second --
+  hence the pass that stops when it makes no progress. A body that is not one `RETURN` is refused
+  and logged, because half-translating a procedure is worse than not having it.
+- **The suite's dacpac writer is not the format.** `Dacpac.cs` writes what the readers expect, so
+  the two can agree and both be wrong -- which is exactly what happened to `OnDeleteAction`.
+  `tests/.../Schema/sample.dacpac` is DacFx's own output, checked in and *not* built by the test run,
+  with the `.sqlproj` and `.sql` beside it saying how to remake it. Its elements are listed
+  alphabetically, which is why `Amplified` is named to arrive before the `Doubled` it calls: a
+  fixture that happened to be in dependency order would prove nothing about the ordering.
 - **A function is answered in .NET when its meaning is .NET's.** `CONVERT`'s styles are
   `DateTime.ToString` formats and `pwdencrypt` is SHA-512 over UTF-16 text -- written as DuckDB SQL,
   each would be an approximation of something this process can just do, and the hash would not match

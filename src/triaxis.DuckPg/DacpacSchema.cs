@@ -10,6 +10,12 @@ namespace triaxis.DuckPg;
 sealed record Reference(string Name, string Table, string[] Columns,
                         string Parent, string[] ParentColumns, string OnDelete);
 
+/// A declared scalar function: what it is called, what it takes in order, what it returns, and the
+/// body it was written with. The `CREATE FUNCTION` header is not in the model at all -- `BodyScript`
+/// holds the `BEGIN … END` alone -- so the parameters and the return type come from the model's own
+/// relationships rather than from any text.
+sealed record ScalarFunction(string Name, string[] Parameters, string ReturnType, string Body);
+
 /// The declared schema, read straight out of a .dacpac. A dacpac is a zip whose `model.xml` holds
 /// every table as a `SqlTable` element, so DacFx is not needed to get at it -- and DacFx would not
 /// run here anyway.
@@ -25,6 +31,7 @@ sealed class DacpacSchema
     readonly Dictionary<(string Table, string Column), string> defaults = new();
     readonly Dictionary<string, string> views = new(StringComparer.OrdinalIgnoreCase);
     readonly List<Reference> references = [];
+    readonly List<ScalarFunction> functions = [];
 
     public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
     {
@@ -51,6 +58,9 @@ sealed class DacpacSchema
     /// What the declared schema says points at what.
     public IReadOnlyList<Reference> References => references;
 
+    /// The scalar functions it declares, in the order the model lists them.
+    public IReadOnlyList<ScalarFunction> Functions => functions;
+
     /// Each declared view and the query it stands for, in the dialect it was written in.
     public IReadOnlyDictionary<string, string> Views => views;
 
@@ -72,6 +82,7 @@ sealed class DacpacSchema
                 "SqlDefaultConstraint" => ReadDefault(element),
                 "SqlView" => ReadView(element),
                 "SqlForeignKeyConstraint" => ReadReference(element),
+                "SqlScalarFunction" => ReadFunction(element),
                 // Every other element is something this tool does not claim to read.
                 _ => true,
             };
@@ -187,6 +198,30 @@ sealed class DacpacSchema
         if (Parts(Reference(constraint, "ForColumn")) is not [.., var table, var column]) return false;
 
         defaults[(table, column)] = expression;
+        return true;
+    }
+
+    bool ReadFunction(XElement function)
+    {
+        if (Unqualify(function.Attribute("Name")?.Value) is not { } name) return false;
+        if (Related(function, "FunctionBody").FirstOrDefault() is not { } implementation) return false;
+        if (Property(implementation, "BodyScript") is not { Length: > 0 } body) return false;
+
+        // A parameter is named `[dbo].[FullNote].[@note]`, and the order the model lists them in is
+        // the order they were declared in -- there is no ordinal to sort by.
+        var parameters = Related(function, "Parameters")
+            .Where(p => p.Attribute("Type")?.Value == "SqlSubroutineParameter")
+            .Select(p => Unqualify(p.Attribute("Name")?.Value)?.TrimStart('@'))
+            .OfType<string>()
+            .ToArray();
+
+        // The specifier under the function's own `Type` is what it returns; the ones under its
+        // parameters belong to them, which is why only a direct child will do.
+        var returns = Related(function, "Type").FirstOrDefault() is { } specifier
+            ? DuckDbType(specifier)
+            : "VARCHAR";
+
+        functions.Add(new ScalarFunction(name, parameters, returns, body));
         return true;
     }
 

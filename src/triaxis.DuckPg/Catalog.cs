@@ -134,6 +134,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             StringComparer.OrdinalIgnoreCase);
 
         Declared();
+        Macros(conn);
         Declared(conn);
     }
 
@@ -222,6 +223,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// And what a delete from each table takes with it, which is the same reference read the other
     /// way: `ON DELETE CASCADE` says the rows pointing at one that goes go too.
     readonly Dictionary<string, List<Reference>> cascading = new(StringComparer.OrdinalIgnoreCase);
+
+    /// The declared scalar functions that were actually published as macros. A call to one of these
+    /// is resolved onto the lake; a call to anything else is left as it was written.
+    readonly HashSet<string> macros = new(StringComparer.OrdinalIgnoreCase);
+
+    public IReadOnlySet<string> Functions => macros;
 
     /// The references a delete from this table has to answer for.
     public IReadOnlyList<Reference> Referencing(Table table) =>
@@ -337,10 +344,96 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// nothing about which. Rather than order them, each round creates what it can and the next
     /// round tries the rest -- a round that adds nothing is one where what is left is broken rather
     /// than merely early, and those are named and skipped instead of stopping the lake.
+    /// A declared scalar function, published as a macro beside the tables it reads. A macro is an
+    /// expression, so only a body that answers with one can become one: anything with a variable, a
+    /// branch or a second statement is a procedure, and is left undeclared and said so at startup
+    /// rather than at the first call. The body is translated on the tree like any other T-SQL, with
+    /// `@parameter` rendering as the macro's own parameter rather than as a value the caller bound.
+    ///
+    /// DuckDB binds a macro when it is created and not when it is called, so one that calls another
+    /// has to be made second -- which is what a pass that stops making progress settles, exactly as
+    /// it does for the views below.
+    void Macros(DuckDBConnection conn)
+    {
+        macros.Clear();
+        var declared = new HashSet<string>(schema.Functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
+        var pending = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var refused = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var function in schema.Functions)
+            try
+            {
+                if (Returned(function.Body) is not { } answer)
+                    throw new InvalidOperationException(
+                        "its body is more than one RETURN, and a macro is an expression");
+
+                var context = new TSqlContext(
+                    config.Schema, new Dictionary<string, string>(),
+                    new HashSet<string>(function.Parameters, StringComparer.OrdinalIgnoreCase),
+                    Environment.UserName, Types, declared, Macro: true);
+
+                var body = TSqlWriter.Write(TSqlParser.ParseExpression(answer), context);
+                var parameters = string.Join(", ", function.Parameters.Select(SqlText.Quote));
+
+                // Cast to what it was declared to return: a function returning `int` whose body adds
+                // two of them is an int in SQL Server and a BIGINT here, and a caller reading the
+                // scalar as an int throws on the difference.
+                pending[function.Name] =
+                    $"CREATE OR REPLACE MACRO {SqlText.Quote(config.Schema)}.{SqlText.Quote(function.Name)}" +
+                    $"({parameters}) AS (CAST({body} AS {function.ReturnType}))";
+            }
+            catch (Exception e)
+            {
+                refused[function.Name] = e.Message.ReplaceLineEndings(" ");
+            }
+
+        while (pending.Count > 0)
+        {
+            var published = 0;
+            foreach (var (name, statement) in pending.ToList())
+                try
+                {
+                    Exec(conn, statement);
+                    pending.Remove(name);
+                    macros.Add(name);
+                    published++;
+                }
+                catch (Exception e)
+                {
+                    refused[name] = e.Message.ReplaceLineEndings(" ");
+                }
+
+            if (published == 0) break;
+        }
+
+        foreach (var name in declared.Where(n => !macros.Contains(n)))
+            logger.LogWarning("function {Function} is not published: {Reason}",
+                              name, refused.GetValueOrDefault(name, "unknown"));
+    }
+
+    /// The one body a macro can carry: an answer, and nothing else. DacFx stores every function's
+    /// body wrapped in `BEGIN … END`, so that is peeled rather than required -- and the trailing
+    /// `END` of a `CASE` survives it, since only the outermost pair goes.
+    static string? Returned(string body)
+    {
+        var text = body.Trim();
+        if (text.StartsWith("BEGIN", StringComparison.OrdinalIgnoreCase) &&
+            text.EndsWith("END", StringComparison.OrdinalIgnoreCase))
+            text = text[5..^3].Trim();
+
+        if (!text.StartsWith("RETURN", StringComparison.OrdinalIgnoreCase)) return null;
+
+        // `RETURNS`, or a column called `RETURNED`, is not the keyword.
+        var rest = text[6..];
+        if (rest.Length > 0 && (char.IsLetterOrDigit(rest[0]) || rest[0] == '_')) return null;
+
+        return rest.Trim().TrimEnd(';').Trim() is { Length: > 0 } answer ? answer : null;
+    }
+
     void Declared(DuckDBConnection conn)
     {
         var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
-                                      new HashSet<string>(), Environment.UserName);
+                                      new HashSet<string>(), Environment.UserName, Types, macros);
         var pending = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var refused = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 

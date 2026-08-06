@@ -239,7 +239,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     {
         var context = new TSqlContext(gateway.Config.Schema, Variables(),
             (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"],
-            gateway.Catalog.Types);
+            gateway.Catalog.Types, gateway.Catalog.Functions);
         var statements = TSqlTranslator.Translate(sql, context);
 
         if (statements.Count == 0)

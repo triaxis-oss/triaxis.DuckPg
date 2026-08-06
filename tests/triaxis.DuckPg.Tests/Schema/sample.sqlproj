@@ -1,0 +1,12 @@
+<!--
+  The dacpac beside this file is DacFx's own output, checked in so the reader is held to the shape
+  DacFx actually writes rather than to the one the test helper writes. It is NOT built by the test
+  run: that would need the SQL SDK and a restore on every machine. Rebuild it by hand after editing
+  the .sql, with `dotnet build sample.sqlproj` and copying bin/Debug/sample.dacpac beside this file.
+-->
+<Project Sdk="Microsoft.Build.Sql/2.2.0">
+  <PropertyGroup>
+    <Name>sample</Name>
+    <DSP>Microsoft.Data.Tools.Schema.Sql.Sql160DatabaseSchemaProvider</DSP>
+  </PropertyGroup>
+</Project>

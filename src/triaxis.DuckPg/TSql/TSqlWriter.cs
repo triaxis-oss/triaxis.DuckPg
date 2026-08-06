@@ -12,7 +12,14 @@ sealed record TSqlContext(
     string User,
     /// What each published table's columns are, by DuckDB type. A column reference is resolved
     /// against this where the dialects disagree about a type -- which is `bit`, and only there.
-    IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Tables = null);
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>>? Tables = null,
+    /// The scalar functions the schema declared, published as macros beside the tables. A call to
+    /// one lands on the lake exactly as a table reference does; a call to anything else is left
+    /// spelled as it was written, so DuckDB names what it could not find.
+    IReadOnlySet<string>? Functions = null,
+    /// Set while rendering one of those macros' own bodies, where `@parameter` is the macro's
+    /// parameter -- an identifier -- rather than a value the caller bound.
+    bool Macro = false);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -741,11 +748,25 @@ sealed class TSqlWriter(TSqlContext context)
         _ => false,
     };
 
+    /// A scalar function the schema declared, resolved the way a table of the same schema is: `dbo`
+    /// means the lake. Nothing else is touched -- a name this does not know is DuckDB's to complain
+    /// about, and it complains better about the name that was actually written.
+    string? Declared(List<Name> name)
+    {
+        if (context.Functions is null || name is not [{ } schema, { } function]) return null;
+        if (!context.Functions.Contains(function.Text)) return null;
+
+        var resolved = schema.Text.Equals("dbo", StringComparison.OrdinalIgnoreCase)
+            ? context.Schema
+            : schema.Text;
+        return SqlText.Quote(resolved) + "." + SqlText.Quote(function.Text);
+    }
+
     string Variable(VariableRef variable)
     {
         if (!variable.System)
             return context.Parameters.Contains(variable.Name)
-                ? "$" + variable.Name
+                ? context.Macro ? SqlText.Quote(variable.Name) : "$" + variable.Name
                 : throw new TSqlException($"undeclared variable @{variable.Name}", 0);
 
         return context.Variables.TryGetValue(variable.Name, out var value)
@@ -768,6 +789,7 @@ sealed class TSqlWriter(TSqlContext context)
 
         // A function name is not an identifier to be quoted: `"COUNT"` is a column called COUNT.
         if (counting == "count_big") Put("count");
+        else if (Declared(call.Name) is { } declared) Put(declared);
         else Join(call.Name, part => Put(part.Quoted ? Quote(part) : part.Text), ".");
 
         Put("(");

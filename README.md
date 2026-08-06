@@ -438,6 +438,16 @@ reference to columns that are not the table's key is skipped — a delete collec
 what a reference can be checked against. Nothing is enforced over files another process edits
 between runs; `duckpg` sees what its own writes do.
 
+**A declared scalar function is published as a macro.** A dacpac's `SqlScalarFunction` becomes a
+DuckDB macro beside the tables, so `[dbo].[Doubled]([order_id])` resolves onto the lake exactly as a
+table reference does. The body is translated on the tree like any other T-SQL — `+` over text
+concatenates, `ISNULL` is a coalesce — with `@parameter` rendering as the macro's own parameter, and
+the whole thing cast to what the function declared it returns, so a body DuckDB widens still answers
+in the type SQL Server would have. A macro is an expression, so that is the only body that can
+become one: anything with a variable, a branch or a second statement is a procedure, and is left
+undeclared with the reason logged at startup rather than half-translated. Table-valued functions are
+not read at all.
+
 **A store-generated key needs a dacpac that declares one.** A column the model marks `IsIdentity`
 draws from a sequence in the write layer, seeded past the highest value the files already hold when
 the table first grows a write branch — so keys carry on from the lake's own state, and a restart
