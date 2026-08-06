@@ -30,6 +30,7 @@ publish a temp-directory convention as API.
 | `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
 | `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |
 | `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
+| `HostFunctions.cs` | The SQL Server functions answered in .NET: `pwdencrypt`, `pwdcompare`, `CONVERT` styles. |
 | `SqlText.cs` | Enough SQL scanning to find top-level keywords without a parser. |
 | `DuckDbLibrary.cs` | Finding the machine's DuckDB, and the AOT dependencies DuckDB.NET needs. |
 | `DuckDbDownload.cs` | Fetching that library from DuckDB's releases, when asked and only then. |
@@ -195,6 +196,16 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
+- **A function is answered in .NET when its meaning is .NET's.** `CONVERT`'s styles are
+  `DateTime.ToString` formats and `pwdencrypt` is SHA-512 over UTF-16 text -- written as DuckDB SQL,
+  each would be an approximation of something this process can just do, and the hash would not match
+  the one a real SQL Server wrote. `HostFunctions.Register` runs once at startup: a registration
+  belongs to the database, not to the connection that made it, so every session's own connection
+  finds them. The constraints are the price: DuckDB calls them from whatever thread runs the scan,
+  so nothing there may hold session state (which is why `SUSER_SNAME()` stays a rendered literal),
+  and none of them belongs in a published view -- that is a managed call per row, on every read.
+  These bindings read a blob argument as a stream but cannot write a blob result, which is why
+  `pwdencrypt` hands back hex and a macro turns it into the blob the caller is owed.
 - **A DuckDB connection is not two threads' to share.** Sessions have one each, but the lake keeps
   its own for the work that belongs to no session -- persisting a table, seeding a sequence,
   rebuilding the catalog -- and everything that touches it holds `Gateway.gate`. `Promoting` reads

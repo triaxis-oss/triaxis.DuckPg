@@ -335,6 +335,8 @@ matching on text, which is why `'a' + b` and `1 + 2` can be told apart at all.
 | `DATEPART(day, d)`, `DATEDIFF`, `DATEADD` | `date_part('day', d)`, `date_diff`, interval arithmetic |
 | `CAST(x AS NVARCHAR(MAX))`, `INT`, `BIT`, `DATETIME2`, `UNIQUEIDENTIFIER`, `MONEY` | `VARCHAR`, `INTEGER`, `BOOLEAN`, `TIMESTAMP`, `UUID`, `DECIMAL(19,4)` |
 | `CONVERT(INT, x)` | `CAST(x AS INTEGER)` |
+| `CONVERT(varchar, d, 120)` and the other styles | the date format the style names, applied in .NET |
+| `pwdencrypt`, `pwdcompare` | SQL Server's own hash: version, salt, SHA-512 over UTF-16 |
 | `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
@@ -394,9 +396,17 @@ nothing — marking a point costs nothing — but DuckDB has no savepoints to re
 `ROLLBACK TRANSACTION x` fails loudly instead of quietly keeping the writes it was asked to discard.
 EF Core marks one whenever it saves inside a transaction the caller opened.
 
+A handful of functions are answered in .NET rather than rewritten into DuckDB expressions, because
+their meaning is .NET's: `CONVERT`'s styles are the date formats `DateTime.ToString` already knows,
+and `pwdencrypt` hashes UTF-16 text the way SQL Server does — so a hash your real database wrote
+verifies here, and one written here verifies there. A style or a hash format that is not covered is
+named rather than approximated. They are registered on the database at startup, so both front doors
+find them; they are not for a view, since a view is bound and evaluated on every execution and these
+are a managed call per row.
+
 A statement the parser does not cover — DDL, procedural batches, cursors, `DECLARE`, the `MERGE`
-branches that add or remove rows, `CONVERT` with a style — is refused with a syntax error naming it,
-rather than passed through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
+branches that add or remove rows — is refused with a syntax error naming it, rather than passed
+through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's
 `[a-z]` ranges have no DuckDB equivalent.
 
 ## Columns the files do not contain

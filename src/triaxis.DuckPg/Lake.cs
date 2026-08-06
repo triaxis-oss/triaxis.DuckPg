@@ -86,6 +86,10 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
             command.ExecuteNonQuery();
         }
 
+        // Registered on the database rather than on this connection, so every session's own
+        // connection finds them without registering anything of its own.
+        HostFunctions.Register(duck);
+
         catalog.Build(duck);
 
         server.Start();

@@ -417,6 +417,28 @@ sealed class TSqlWriter(TSqlContext context)
         Put(SqlText.Quote(resolved)).Put(".").Put(Quote(name.Table));
     }
 
+    /// A style says what the text on the other side of the conversion looks like, and the styles are
+    /// .NET's date formats by another name -- so the conversion is one duckpg does in .NET rather
+    /// than an expression built out of DuckDB's own formatting. Which direction it goes is the type
+    /// being converted to: text out of a date, or a date out of text.
+    void Styled(ConvertExpr convert)
+    {
+        var type = TypeName(convert.Type);
+        if (type is not ("VARCHAR" or "TIMESTAMP" or "DATE" or "TIME"))
+            throw new TSqlException($"CONVERT to {convert.Type.Name} takes no style: a style says what a " +
+                                    "date looks like written down, and nothing else has one", 0);
+
+        // Coming back as a date, the format is read into a timestamp and then narrowed to whatever
+        // was asked for -- the style describes the text either way.
+        if (type != "VARCHAR") Put("CAST(");
+        Put(type == "VARCHAR" ? "duckpg_convert_to_text(" : "duckpg_convert_from_text(");
+        Expression(convert.Value);
+        Put(", CAST(");
+        Expression(convert.Style!);
+        Put(" AS INTEGER))");
+        if (type != "VARCHAR") Put($" AS {type})");
+    }
+
     /// `#t` is a temporary table, and DuckDB's belong to a connection exactly as SQL Server's
     /// belong to a session -- so it needs no schema and must not be given the lake's. `##t` is a
     /// different promise: a global temporary table is one another connection can see, and there is
@@ -553,8 +575,7 @@ sealed class TSqlWriter(TSqlContext context)
                 return;
 
             case ConvertExpr convert:
-                if (convert.Style is not null)
-                    throw new TSqlException("CONVERT with a style is not supported; use FORMAT or CAST", 0);
+                if (convert.Style is not null) { Styled(convert); return; }
                 Put("CAST(");
                 Expression(convert.Value);
                 Put(" AS ").Put(TypeName(convert.Type)).Put(")");

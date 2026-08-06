@@ -68,6 +68,11 @@ public class TSqlTests
     [InlineData("SELECT CAST(a AS DECIMAL(10,2)) FROM t", """SELECT CAST("a" AS DECIMAL(10, 2)) FROM "lake"."t" """)]
     [InlineData("SELECT CAST(a AS UNIQUEIDENTIFIER) FROM t", """SELECT CAST("a" AS UUID) FROM "lake"."t" """)]
     [InlineData("SELECT CONVERT(INT, a) FROM t", """SELECT CAST("a" AS INTEGER) FROM "lake"."t" """)]
+    // A style names a date format, which is a thing .NET spells out and duckpg answers in .NET.
+    [InlineData("SELECT CONVERT(VARCHAR, d, 120) FROM t",
+        """SELECT duckpg_convert_to_text("d", CAST(120 AS INTEGER)) FROM "lake"."t" """)]
+    [InlineData("SELECT CONVERT(datetime, s, 103) FROM t",
+        """SELECT CAST(duckpg_convert_from_text("s", CAST(103 AS INTEGER)) AS TIMESTAMP) FROM "lake"."t" """)]
     // A type SQL Server does not have is one the caller meant literally.
     [InlineData("SELECT CAST(a AS HUGEINT) FROM t", """SELECT CAST("a" AS HUGEINT) FROM "lake"."t" """)]
     public void RewritesTypes(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
@@ -379,7 +384,7 @@ public class TSqlTests
     // A global temporary table is one another connection can see, and there is none to share with.
     [InlineData("SELECT * INTO ##shared FROM orders", "global temporary table")]
     [InlineData("SELECT (SELECT x INTO #t FROM u) FROM v", "statement of its own")]
-    [InlineData("SELECT CONVERT(VARCHAR, d, 120) FROM t", "CONVERT with a style")]
+    [InlineData("SELECT CONVERT(INT, s, 120) FROM t", "takes no style")]
     [InlineData("SELECT * FROM", "expected a name")]
     [InlineData("SELECT 'unterminated", "unterminated")]
     public void RefusesWhatItCannotTranslate(string tsql, string expected) =>
