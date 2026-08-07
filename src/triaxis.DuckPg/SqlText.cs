@@ -1,9 +1,40 @@
+using System.Text;
+
 namespace triaxis.DuckPg;
 
 /// Minimal SQL text utilities: enough to find top-level keywords and identifiers without a parser.
 /// DuckDB's json_serialize_sql() only handles SELECT, so DML rewriting has to do its own scanning.
 static class SqlText
 {
+    /// PostgreSQL's `$1` written as DuckDB's named `$p1`. A numbered parameter must be bound by the
+    /// number it was written with, and DuckDB counts only the ones a statement actually mentions --
+    /// so `$3` on its own is "parameter number 3" in a statement that "only has 1", and no value can
+    /// reach it by any spelling. A rewritten DML statement is several steps and none of them has to
+    /// use every parameter, which makes that unreachable case the ordinary one. A name is not counted
+    /// that way: DuckDB ignores one it was handed and does not want, so every step can take the same
+    /// arguments. It is also what the TDS door has always sent, `@p0` rendering as `$p0`.
+    public static string Rename(string sql)
+    {
+        StringBuilder? renamed = null;
+        var copied = 0;
+        for (var i = 0; i < sql.Length;)
+        {
+            var skip = SkipNonCode(sql, i);
+            if (skip >= 0) { i = skip; continue; }
+
+            if (sql[i] == '$' && i + 1 < sql.Length && char.IsAsciiDigit(sql[i + 1]) && IsBoundary(sql, i - 1))
+            {
+                renamed ??= new StringBuilder(sql.Length + 8);
+                renamed.Append(sql, copied, i + 1 - copied).Append('p');
+                copied = i + 1;
+                for (i += 2; i < sql.Length && char.IsAsciiDigit(sql[i]); i++) { }
+                continue;
+            }
+            i++;
+        }
+        return renamed is null ? sql : renamed.Append(sql, copied, sql.Length - copied).ToString();
+    }
+
     public static IEnumerable<string> SplitStatements(string sql)
     {
         var start = 0;

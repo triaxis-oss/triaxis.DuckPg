@@ -215,7 +215,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         var oids = new int[reader.I16()];
         for (var i = 0; i < oids.Length; i++) oids[i] = reader.I32();
 
-        statements[name] = new Prepared(sql, oids);
+        statements[name] = new Prepared(SqlText.Rename(sql), oids);
         wire.Send('1');
     }
 
@@ -287,7 +287,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
         var probe = statement.Sql;
         for (var i = statement.ParameterOids.Length; i >= 1; i--)
-            probe = probe.Replace($"${i}", $"CAST(NULL AS {PgTypes.DuckDbType(statement.ParameterOids[i - 1])})");
+            probe = probe.Replace($"$p{i}", $"CAST(NULL AS {PgTypes.DuckDbType(statement.ParameterOids[i - 1])})");
 
         try
         {
@@ -506,7 +506,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         var command = duck.CreateCommand();
         command.CommandText = sql;
         for (var i = 0; i < arguments.Length; i++)
-            command.Parameters.Add(new DuckDBParameter((i + 1).ToString(), arguments[i]));
+            command.Parameters.Add(new DuckDBParameter($"p{i + 1}", arguments[i]));
         return command;
     }
 

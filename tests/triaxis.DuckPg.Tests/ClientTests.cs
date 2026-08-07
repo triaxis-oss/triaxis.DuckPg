@@ -197,6 +197,56 @@ public class ClientTests : IDisposable
         Assert.Equal(1, delete.ExecuteNonQuery());
     }
 
+    /// A rewritten write is several steps and none of them has to mention every parameter -- the
+    /// step collecting keys reads the predicate alone, never the assignments. A numbered parameter
+    /// cannot be bound in that case at all, since DuckDB counts only the ones a statement uses and
+    /// still demands the number it was written with.
+    [Fact]
+    public void ParametersReachStepsThatDoNotAllUseThem()
+    {
+        using (var update = db.CreateCommand("UPDATE lake.orders SET amount = $1 WHERE order_id = $2"))
+        {
+            update.Parameters.AddWithValue(43.5m);
+            update.Parameters.AddWithValue(1);
+            Assert.Equal(1, update.ExecuteNonQuery());
+        }
+
+        // Past nine, so a rename that took `$1` for the start of `$12` would put the values back.
+        using (var wide = db.CreateCommand(
+                   "UPDATE lake.orders SET amount = $11 WHERE order_id = $12 AND $1 = $1 AND " +
+                   "COALESCE($2, $3, $4, $5, $6, $7, $8, $9, $10) IS NOT NULL"))
+        {
+            for (var i = 1; i <= 10; i++) wide.Parameters.AddWithValue(i);
+            wide.Parameters.AddWithValue(44.5m);
+            wide.Parameters.AddWithValue(2);
+            Assert.Equal(1, wide.ExecuteNonQuery());
+        }
+
+        using (var deleted = db.CreateCommand("DELETE FROM lake.orders WHERE order_id = $1 AND amount > $2"))
+        {
+            deleted.Parameters.AddWithValue(1);
+            deleted.Parameters.AddWithValue(1m);
+            Assert.Equal(1, deleted.ExecuteNonQuery());
+        }
+
+        using var check = db.CreateCommand("SELECT amount FROM lake.orders WHERE order_id = $1");
+        check.Parameters.AddWithValue(2);
+        Assert.Equal(44.5m, check.ExecuteScalar());
+    }
+
+    /// A `$1` inside a literal is text, not a placeholder -- renaming it would change the value the
+    /// caller stored.
+    [Fact]
+    public void ADollarInsideALiteralIsNotAParameter()
+    {
+        using var command = db.CreateCommand("SELECT '$1 and $2' AS t, $1 AS v");
+        command.Parameters.AddWithValue(7);
+        using var reader = command.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal("$1 and $2", reader.GetString(0));
+        Assert.Equal(7, reader.GetInt32(1));
+    }
+
     [Fact]
     public void BatchesRunAsOneRoundTrip()
     {

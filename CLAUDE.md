@@ -224,6 +224,15 @@ publish a temp-directory convention as API.
   text to real codes is what makes a failed query survivable. Cancellation must map to `57014`.
 - Npgsql hands back every column as `String` regardless of OID until the data goes out in binary
   format — hence `PgTypes.WriteBinary`, including base-10000 `numeric`.
+- **A numbered parameter cannot be bound to a statement that skips one, so `SqlText.Rename` makes
+  every `$1` a named `$p1`.** DuckDB counts only the parameters a statement mentions and still
+  demands the number each was written with: `$3` on its own is "parameter number 3" in a statement
+  that "only has 1", and no spelling reaches it -- binding "1" answers "values were not provided
+  for 3", binding "3" answers that there is no 3. A rewritten write is several steps and none of
+  them has to use every parameter (the step collecting keys reads the predicate, never the
+  assignments), so that unreachable case is the ordinary one rather than a corner. A *name* is not
+  counted: DuckDB ignores one it was handed and does not want, which is what lets every step take
+  the same arguments — and is what the TDS door was always doing, `@p0` rendering as `$p0`.
 - A DataRow is a few bytes and a socket write is a syscall, which is what once held the PostgreSQL
   wire to ~250k rows/s. Responses go out through a `BufferedStream`; only the write side, because
   one cannot interleave reads and writes over a socket, and `PgWire` flushes before every read so
