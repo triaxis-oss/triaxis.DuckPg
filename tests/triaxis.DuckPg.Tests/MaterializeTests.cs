@@ -1,3 +1,4 @@
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Data.SqlClient;
 
 namespace triaxis.DuckPg.Tests;
@@ -296,5 +297,73 @@ public class MaterializeRefusalTests
 
         var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
         Assert.Contains("session variable", refused.Message);
+    }
+}
+
+/// The lifecycle an embedder has, and the CLI with it: a lake from the factory, never told to stop,
+/// just disposed -- or not even that, if a signal takes the process before the unwinding finishes.
+/// Every one of those paths has to leave the delta behind, because none of them is unusual.
+public class MaterializedShutdownTests
+{
+    static (Config Config, string Root) Lake()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "duckpg-tests", $"shutdown-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(root, "base"));
+        Directory.CreateDirectory(Path.Combine(root, "local"));
+        File.WriteAllText(Path.Combine(root, "base", "orders.json"), """[{"order_id": 1, "note": "base"}]""");
+
+        return (new Config
+        {
+            Listen = "127.0.0.1:0",
+            Layers = [Path.Combine(root, "base")],
+            Write = Path.Combine(root, "local"),
+            Materialize = true,
+            DefaultKey = ["order_id"],
+        }, root);
+    }
+
+    static void Write(Lake lake)
+    {
+        using var connection = new Npgsql.NpgsqlConnection(lake.ConnectionString("admin"));
+        connection.Open();
+        new Npgsql.NpgsqlCommand("UPDATE lake.orders SET note = 'written' WHERE order_id = 1", connection)
+            .ExecuteNonQuery();
+    }
+
+    /// Disposed asynchronously, never stopped -- what `await using` gives an embedder.
+    [Fact]
+    public async Task ADisposedLakeLeavesItsDelta()
+    {
+        var (config, root) = Lake();
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddDuckPgFactory();
+        await using var provider = services.BuildServiceProvider();
+
+        var lake = await provider.GetRequiredService<IDuckPgLakeFactory>()
+            .StartAsync(config, TestContext.Current.CancellationToken);
+        Write(lake);
+        await lake.DisposeAsync();
+
+        Assert.NotEmpty(Directory.GetFiles(config.Write!));
+        Directory.Delete(root, true);
+    }
+
+    /// And disposed synchronously, which is what a container teardown does -- and what the CLI's own
+    /// shutdown came down to. This one wrote nothing at all until it was made to.
+    [Fact]
+    public async Task ASynchronouslyDisposedLakeLeavesItToo()
+    {
+        var (config, root) = Lake();
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddDuckPgFactory();
+        await using var provider = services.BuildServiceProvider();
+
+        var lake = await provider.GetRequiredService<IDuckPgLakeFactory>()
+            .StartAsync(config, TestContext.Current.CancellationToken);
+        Write(lake);
+        lake.Dispose();
+
+        Assert.NotEmpty(Directory.GetFiles(config.Write!));
+        Directory.Delete(root, true);
     }
 }

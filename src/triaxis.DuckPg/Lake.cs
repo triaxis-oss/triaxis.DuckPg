@@ -15,6 +15,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
 {
     readonly Config config;
     readonly Catalog catalog;
+    readonly Gateway gateway;
     readonly PgServer server;
     readonly TdsServer tds;
     readonly DuckDBConnection duck;
@@ -23,11 +24,12 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
     /// Assembled by `AddDuckPg` rather than by a caller: what a lake is made of -- the catalog, the
     /// gateway, the two front doors -- is not a surface worth publishing, and freezing it would
     /// make every part of it an API.
-    internal Lake(Config config, Catalog catalog, PgServer server, TdsServer tds, DuckDBConnection duck,
-                  IDuckDbInstaller installer)
+    internal Lake(Config config, Catalog catalog, Gateway gateway, PgServer server, TdsServer tds,
+                  DuckDBConnection duck, IDuckDbInstaller installer)
     {
         this.config = config;
         this.catalog = catalog;
+        this.gateway = gateway;
         this.server = server;
         this.tds = tds;
         this.duck = duck;
@@ -107,7 +109,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         try { await serving!.WaitAsync(cancellation); } catch (OperationCanceledException) { }
         // Once nothing is serving, so nothing else is on this connection: a materialized lake keeps
         // nothing of its own, and this is where what it was given goes out as a layer.
-        catalog.Flush(duck);
+        gateway.Flush();
         stopping.Dispose();
         stopping = null;
         serving = null;
@@ -121,6 +123,10 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         disposed = true;
 
         stopping?.Cancel();
+        // Not waited for -- that is what `DisposeAsync` is -- but the writes still have to get out.
+        // The listeners are cancelled above, and `Flush` runs on this connection under the gateway's
+        // lock, which is what a session's own commit takes to reach it.
+        gateway.Flush();
         stopping?.Dispose();
         stopping = null;
         duck.Dispose();
@@ -136,7 +142,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         {
             await stopping.CancelAsync();
             try { await serving!.ConfigureAwait(false); } catch (OperationCanceledException) { }
-            catalog.Flush(duck);
+            gateway.Flush();
             stopping.Dispose();
             stopping = null;
         }

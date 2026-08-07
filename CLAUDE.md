@@ -188,6 +188,18 @@ publish a temp-directory convention as API.
   type a layer already has, no merge wrapper around a table only one layer carries, `--cache` writing
   a merged table out once as parquet -- and, further along the same line, `--materialize` not
   publishing a view at all.
+- **A shutdown that is not reached writes nothing.** A materialized lake's delta goes out at
+  shutdown, so every way of shutting down has to reach it -- and the `duckpg` command reached none
+  of them. `Lake.Completion` answers to the lake's own token, which no signal touches, so the await
+  never returned; and SIGINT unhandled ends the process where it stands, so nothing unwound. The
+  writes were simply gone, with no error anywhere. `ServeCommand` takes SIGINT, SIGTERM and SIGQUIT
+  itself and sets `PosixSignalContext.Cancel` so the runtime does not end the process first, then
+  stops the lake rather than only disposing it; a second signal is left to the default, which is the
+  escape hatch if a stop hangs. `Lake.Dispose` flushes too, since a container teardown is
+  synchronous and losing a lake's writes there would be just as quiet. `Gateway.Flush` is what both
+  call, under `gate`, because it is the lake's own connection and a committing session is on it.
+  What the unit tests could not have caught is that none of this is reached: they all called
+  `StopAsync`, which worked the whole time.
 - **A lake owns what it was built from, or nothing at all.** A factory-built lake holds its own
   container and releases it on disposal, which is what lets a caller hold one object instead of two
   with an ordering constraint; one resolved from someone else's container owns nothing of theirs.

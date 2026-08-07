@@ -108,8 +108,9 @@ public static class DuckPgServiceCollectionExtensions
         // could not take it -- which is the point: the parts are not the contract.
         services.TryAddSingleton(p => new Lake(
             p.GetRequiredService<Config>(), p.GetRequiredService<Catalog>(),
-            p.GetRequiredService<PgServer>(), p.GetRequiredService<TdsServer>(),
-            p.GetRequiredService<DuckDBConnection>(), p.GetRequiredService<IDuckDbInstaller>()));
+            p.GetRequiredService<Gateway>(), p.GetRequiredService<PgServer>(),
+            p.GetRequiredService<TdsServer>(), p.GetRequiredService<DuckDBConnection>(),
+            p.GetRequiredService<IDuckDbInstaller>()));
 
         return services;
     }

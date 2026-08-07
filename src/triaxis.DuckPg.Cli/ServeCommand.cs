@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.CommandLine.Parsing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -120,8 +121,34 @@ public class ServeCommand : LoggingCommand
                 table.Writable ? " [writable]" : "",
                 table.Virtuals.Count > 0 ? " +" + string.Join(",", table.Virtuals.Select(v => v.Name)) : "");
 
-        // Serving until something stops it: Ctrl+C, SIGTERM, or a listener falling over.
-        await lake.Completion;
+        // Serving until something stops it: Ctrl+C, SIGTERM, or a listener falling over. The signals
+        // are taken here because nothing else takes them -- unhandled, SIGINT and SIGTERM end the
+        // process where it stands, and a materialized lake's delta is written by the shutdown that
+        // never runs. `Cancel` on the context is what keeps the runtime from ending it for us.
+        using var signalled = new CancellationTokenSource();
+        void Signal(PosixSignalContext context)
+        {
+            context.Cancel = true;
+            Logger.LogInformation("{Signal}, stopping", context.Signal);
+            signalled.Cancel();
+        }
+
+        using var interrupt = PosixSignalRegistration.Create(PosixSignal.SIGINT, Signal);
+        using var terminate = PosixSignalRegistration.Create(PosixSignal.SIGTERM, Signal);
+        using var quit = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, Signal);
+
+        using var stopping = CancellationTokenSource.CreateLinkedTokenSource(signalled.Token, cancellation);
+        try
+        {
+            await lake.Completion.WaitAsync(stopping.Token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        // Stopped rather than only disposed, so the listeners are waited for and whatever a
+        // materialized lake was given is on disk before the process ends.
+        await lake.StopAsync(CancellationToken.None);
     }
 
     /// The tool links against the machine's own DuckDB, and the first native call is where a

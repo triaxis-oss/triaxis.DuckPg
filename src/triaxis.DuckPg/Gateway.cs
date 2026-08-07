@@ -143,6 +143,14 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
     public void ExitTurn() => turns.Release();
 
+    /// Everything a materialized lake was given, out as the delta the write directory keeps. Under
+    /// `gate` like everything else that touches the lake's own connection: a session's commit
+    /// reaches it through `Persist`, and the two must not be on it at once.
+    public void Flush()
+    {
+        lock (gate) Catalog.Flush(admin);
+    }
+
     /// Writes a table's write layer back to its file. Called once a write is committed, so a
     /// rolled-back statement never reaches the disk. A materialized lake has no write layer and
     /// keeps nothing: what it holds goes out once, at shutdown, as a delta.
