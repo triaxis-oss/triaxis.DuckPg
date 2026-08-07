@@ -38,8 +38,8 @@ columns:
 
 tables:
   customers:
-    # Filtering on the session variable is row-level security for free: `psql -U emea` sees the
-    # EMEA customers, `psql -U admin` sees all of them.
+    # A filter reading the session variable serves each caller a slice: `psql -U emea` sees the
+    # EMEA customers, `psql -U admin` sees all of them. Trust auth, so it is not a boundary.
     filter: getvariable('tenant') = 'admin' OR region = getvariable('tenant')
 
   orders:

@@ -1,0 +1,128 @@
+# The T-SQL duckpg accepts
+
+A client on the [TDS front door](protocols.md#the-tds-door) sends T-SQL; DuckDB does not speak
+it. duckpg **parses** it — lexer, recursive-descent parser, and a renderer that emits DuckDB SQL from
+the tree. Nothing in the dialect is rewritten by pattern matching on text, which is why `'a' + b` and
+`1 + 2` can be told apart at all. The same translator reads a dacpac's views, scalar functions and
+default expressions, so everything below is what those may contain too.
+
+## Names
+
+| Written | Becomes |
+|---|---|
+| `[bracketed]`, `"quoted"` names | quoted identifiers |
+| `dbo.orders`, `app.dbo.orders`, bare `orders` | the lake's schema |
+| `[dbo].[orders].[id]`, `[app].[dbo].[orders].[id]` | the same schema, so a qualified column still finds its table |
+
+## Selecting rows
+
+| Written | Becomes |
+|---|---|
+| `SELECT TOP 5`, `OFFSET … FETCH NEXT` | `LIMIT` / `OFFSET` |
+| `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
+| `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesized |
+| `INNER LOOP JOIN`, `HASH`, `MERGE`, `REMOTE` join hints | dropped |
+| `WITH (NOLOCK)` and other table hints | dropped |
+
+A hint is dropped rather than translated because it steers an optimiser this does not have, and says
+nothing about which rows come back.
+
+## Literals, types and operators
+
+| Written | Becomes |
+|---|---|
+| `N'text'`, `0xDEAD` | `'text'`, `from_hex('DEAD')` |
+| `CAST(x AS NVARCHAR(MAX))`, `INT`, `BIT`, `DATETIME2`, `UNIQUEIDENTIFIER`, `MONEY` | `VARCHAR`, `INTEGER`, `BOOLEAN`, `TIMESTAMP`, `UUID`, `DECIMAL(19,4)` |
+| `CONVERT(INT, x)` | `CAST(x AS INTEGER)` |
+| `[flag] * [n]` where `flag` is a `bit` | `CAST(flag AS INTEGER) * n`, as T-SQL converts it |
+
+`+` becomes `||` only where one side is provably text — a string literal, a `CAST` to a character
+type, or a function that returns one. Everywhere else it stays arithmetic, because guessing would
+turn `1 + 2` into `'12'`.
+
+A `bit` is converted for arithmetic only where the column resolves to one, since DuckDB refuses
+`BOOLEAN * INTEGER` outright. A reference into a derived table resolves to nothing and is left
+alone — DuckDB's error is better than a cast nobody can justify.
+
+## Functions
+
+| Written | Becomes |
+|---|---|
+| `ISNULL`, `LEN`, `IIF`, `CHARINDEX`, `NEWID`, `GETDATE`, `GETUTCDATE`, `CEILING` | their DuckDB equivalents, argument order and all |
+| `DATEPART(day, d)`, `DATEDIFF`, `DATEADD` | `date_part('day', d)`, `date_diff`, interval arithmetic |
+| `CONVERT(varchar, d, 120)` and the other styles | the date format the style names, applied in .NET |
+| `pwdencrypt`, `pwdcompare` | SQL Server's own hash: version, salt, SHA-512 over UTF-16 |
+
+The last two are answered in .NET rather than rewritten into DuckDB expressions, because their
+meaning is .NET's: the styles are the date formats `DateTime.ToString` already knows, and the hash is
+SHA-512 over UTF-16 text the way SQL Server writes it — so a hash your real database wrote verifies
+here, and one written here verifies there. They are registered on the database at startup, so both
+front doors find them, and they are not for a view, since these are a managed call per row.
+
+A declared scalar function from a dacpac is published as a macro and resolves at its call site the
+same way; see [the schema, from a dacpac](schema.md).
+
+## Writes
+
+| Written | Becomes |
+|---|---|
+| `MERGE t a USING s ON … WHEN MATCHED THEN UPDATE SET …` | `UPDATE t AS a SET … FROM s WHERE …` |
+| `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
+| `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
+| `UPDATE [o] SET … FROM [t] AS [o] WHERE …` — its `ExecuteUpdate` | the same, on the other write |
+| either of those joined to another table | the other tables become the write's own `FROM`, their conditions its `WHERE` |
+| `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
+| `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
+
+Only an inner join folds into the write's own clauses: an outer one keeps the rows matching nothing,
+and those are rows the write would still touch, which a condition cannot say once the join is gone.
+
+`OUTPUT INSERTED.[key], i._Position` is answered by materializing the rows, writing from there and
+reading back off the same copy, so each key comes back beside the position of the row that got it. A
+column the rows do not carry and nothing generates is refused by name rather than answered with a
+null — but a column with a declared default *is* generated, stamped into those same rows as they are
+written, which is what keeps a `getdate()` default from being one thing in the file and another in
+the caller's hand.
+
+The `MERGE` branches that add or remove rows are refused: what "already there" means when the row a
+statement would shadow lives in a layer below is the lake's question, not one statement's.
+
+An ORM that qualifies everything it writes — LLBLGen Pro among them — is what all of this is for:
+table references, column references and `TOP(@p)` paging over a row-numbered derived table all land
+on the lake without the application knowing what it is talking to.
+
+## Session state, transactions and locks
+
+| Written | Becomes |
+|---|---|
+| `SUSER_SNAME()`, `SUSER_NAME()`, `USER_NAME()`, `ORIGINAL_LOGIN()` | the session's login name, as a literal |
+| `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
+| `SET NOCOUNT ON`, isolation levels | no-ops |
+| `SAVE TRANSACTION x` | nothing; `ROLLBACK TRANSACTION x` is refused rather than faked |
+| `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted; every other `EXEC` is refused by name |
+
+A savepoint is refused rather than approximated. `SAVE TRANSACTION` renders to nothing, since marking
+a point costs nothing, but DuckDB has no savepoint to return to — so `ROLLBACK TRANSACTION x` fails
+loudly instead of quietly keeping the writes it was asked to discard. EF Core marks one whenever it
+saves inside a transaction the caller opened.
+
+An application lock is granted by doing nothing. `sp_getapplock` serializes a caller against the
+other connections of a shared database, and a lake is not one — it serves the application that owns
+its files, so the exclusion is already there. `EXEC` of anything else is refused by name, which is a
+better answer for an ORM calling a stored procedure than a syntax error about `EXEC`.
+
+## Temporary tables
+
+`SELECT … INTO #t FROM …` becomes `CREATE TEMP TABLE #t AS …`, and `DROP TABLE [IF EXISTS] #t` the
+plain drop. A `#table` belongs to a DuckDB connection exactly as SQL Server's belongs to a session,
+including going away when a pooled connection is handed out again. `##global` ones are refused, since
+another connection cannot see them here, and `SELECT … INTO` and `DROP TABLE` accept nothing else: a
+lake's tables are the files under it.
+
+## What is refused
+
+A style or a hash format that is not covered is named rather than approximated, and so is a statement
+the parser does not cover at all: DDL, procedural batches, cursors, `DECLARE` and the `MERGE`
+branches above are refused with a syntax error naming them and its position, rather than passed
+through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's `[a-z]` ranges
+have no DuckDB equivalent.
