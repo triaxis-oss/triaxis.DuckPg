@@ -69,6 +69,7 @@ sealed class TdsServer(Config config, Gateway gateway, DuckDBConnection root, IL
         {
             var connection = DuckDbSession.Of(root);
             connection.Open();
+            DuckDbSession.SearchPath(connection, gateway.Config);
             using var session = new TdsSession(client, gateway, connection, this, loggers.CreateLogger<TdsSession>());
             Register(session);
             session.Run();

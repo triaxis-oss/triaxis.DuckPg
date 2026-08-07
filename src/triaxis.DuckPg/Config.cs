@@ -10,7 +10,8 @@ public sealed class Config
     /// Listen address for the TDS front door, which SqlClient speaks. Off unless it is set.
     public string? Tds { get; set; }
 
-    /// Schema the generated views live in.
+    /// Schema the generated views live in. Whatever it is called, it goes in front of every
+    /// session's search path, so an unqualified name finds it without the caller knowing the name.
     public string Schema { get; set; } = "lake";
 
     /// Layer directories, lowest first. Each is scanned for `<table>.yaml`, `<table>.json`,

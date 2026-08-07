@@ -227,6 +227,16 @@ publish a temp-directory convention as API.
   with an ordering constraint; one resolved from someone else's container owns nothing of theirs.
   `DisposeAsync` waits for the listeners, `Dispose` only cancels them -- a synchronous dispose that
   blocked on a serving loop is the sync-over-async this exists to avoid.
+- **The lake's schema goes in front of every session's search path, and `main` stays behind it.**
+  DuckDB's own default is `main` and PostgreSQL's is `public`, so whatever a lake publishes into is a
+  schema some caller does not expect -- and `SELECT * FROM orders` misses it. `DuckDbSession.SearchPath`
+  is what makes the name stop mattering; it is set on the session's own connection, since DuckDB scopes
+  `search_path` per connection. `main` has to stay in the path because `Shims.Apply` rewrites
+  `pg_catalog.pg_class` to an unqualified `duckpg_pg_class`, and the shims are created unqualified on
+  the lake's own connection, which is to say in `main`. Nothing else moves: an unqualified `CREATE`
+  would follow the path, but every temp table duckpg builds says `TEMP`, which names the catalog
+  outright -- and the TDS door never used the path at all, since `TSqlWriter.Table` writes the lake's
+  schema onto `[orders]` itself.
 - **Both front doors are opt-in, and a lake needs one.** `PgServer.Enabled` and `TdsServer.Enabled`
   read the same way, so a consumer speaking one protocol opens one listener. `Config.Validate` is
   what makes "neither" an error rather than a lake nothing can reach.

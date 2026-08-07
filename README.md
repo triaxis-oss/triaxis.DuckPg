@@ -158,6 +158,26 @@ under load. The lake stops being a separate process and starts sharing a heap, a
 and a thread pool with everything else the host is doing. What you buy is no executable on `PATH`,
 no port to coordinate, and a lake that lives and dies with the test — not speed.
 
+## The schema, and not having to know it
+
+Tables are published into one schema, `lake` by default and `--schema` otherwise. You do not have to
+name it: it goes in front of every session's search path, so
+
+```sql
+SELECT * FROM orders           -- finds lake.orders, or whatever you called it
+```
+
+works on a fresh connection, and `current_schema()` says which one answered. `main` stays behind it,
+because the `pg_catalog` shims live there and every client that reads the catalog needs them.
+
+That matters because neither default would have been right on its own: DuckDB's own default schema is
+`main`, PostgreSQL's is `public`, and a lake publishing into either would still be the wrong one for
+half its callers. Set `--schema public` if a tool of yours writes `public.orders` outright — an
+EF Core model built for PostgreSQL does — and the unqualified form keeps working either way.
+
+The TDS door never needed this: `[orders]` and `[dbo].[orders]` are both written into the lake's
+schema by the T-SQL renderer, whatever it is called.
+
 ## Layers
 
 A layer is a directory. What it holds decides how each table is read:
@@ -664,7 +684,7 @@ variables and the tool's usual override files layer over it for free.
 |---|---|---|
 | `listen` | `--pgwire`, `-l` | PostgreSQL listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
 | `tds` | `--tds` | TDS listen address, e.g. `127.0.0.1:1433`. Off unless set. |
-| `schema` | `--schema` | Schema the published views live in. Default `lake`. |
+| `schema` | `--schema` | Schema the published views live in, and the front of every session's search path. Default `lake`. |
 | `layers` | positional | Layer directories, lowest first. |
 | `write` | `--write`, `-w` | Directory holding the writable top layer. |
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
