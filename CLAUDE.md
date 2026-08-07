@@ -43,7 +43,7 @@ publish a temp-directory convention as API.
   write layer.
 - **A file's *shape* is the file's too, but which column a mapping key fills is the table's.** That
   split is why `LayerSource.KeyedBy` is set in `Catalog.Build` -- where `MappingKey` knows the key --
-  rather than in `Layer.Scan`, which sees files and no configuration. `Yaml.IsKeyed` answers only the
+  rather than in `Layer.Scan`, which sees files and no configuration. `Yaml.Shape` answers only the
   half a file can: root is a mapping, every value is a mapping. The other half is that the key is
   exactly one column, since a mapping key is one value; a table with a composite key or none reads
   the same document as the single row an object-rooted JSON file has always been, and that fallback
@@ -54,6 +54,18 @@ publish a temp-directory convention as API.
   number and quoted for text -- quoted reads back as the same string, and plain would turn `007`
   into seven. JSON cannot write a non-string key at all, which is why a keyed JSON key is read from
   its text rather than its quoting, and why that one format cannot hold `007` as a key.
+- **The fallback is right and indistinguishable from the mistake, so the answer is signal and never
+  a guess.** A root mapping publishes one row, which is also what a file looks like when its author
+  wrapped the rows in a `widgets:` key or named them with no key column to put the names in. Neither
+  is unwrapped: a heuristic would be right most of the time and, the rest of the time, wrong with no
+  more signal than there was before it, and a documented rule would have become conditional on it.
+  So `Yaml.Shape` reads both out of the parse `Keyed` already paid for -- `Layer.Shapes` is where
+  that one reading is done, and `Catalog.Diagnose` is what says it, because the second half of the
+  question (has this table a single key column?) is the catalog's. Above both is
+  `TableLayer.Shape` on the startup line: rows and columns as they turned out, which guesses nothing
+  and is the only one of the three that catches a surprise nobody anticipated. The rows are counted
+  only for a materialized layer, where the count is a table already in memory -- reading a lake's
+  parquet footers to answer a log line is not what starting up is for.
 - **Layer sequence numbers decide everything.** Read layers are 0..n-1 in configured order, the
   write layer is n. `QUALIFY … ORDER BY _seq DESC` is what makes a higher layer shadow a lower one,
   and a tombstone only hides rows with `_seq < writeSeq`.

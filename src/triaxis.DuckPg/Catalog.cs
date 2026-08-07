@@ -18,8 +18,24 @@ sealed record Column(string Name, string Type, ColumnDefault? Default = null, bo
 
 sealed record VirtualColumn(string Name, string Expr);
 
-/// One layer's rows for one table, as something the view can select from.
-sealed record TableLayer(LayerSource Source, string Scan, List<Column> Columns);
+/// One layer's rows for one table, as something the view can select from. `Rows` is what it turned
+/// out to hold, where that was free to find out -- a materialized layer, which is everything but
+/// parquet.
+sealed record TableLayer(LayerSource Source, string Scan, List<Column> Columns, long? Rows = null)
+{
+    /// What this layer publishes, for the line a lake prints as it starts. A table nobody meant to
+    /// write is visible as its shape long before anyone queries it -- a file whose rows were meant
+    /// to be rows publishes one of them -- and unlike every check that could be made this guesses
+    /// nothing.
+    ///
+    /// The columns are named only where there are few enough for the name to be the point: a shape
+    /// narrow enough to be a mistake is narrow enough to name.
+    public string Shape =>
+        $"({(Rows is { } rows ? $"{Count(rows, "row")}, " : "")}{Count(Columns.Count, "column")}" +
+        $"{(Columns.Count is > 0 and <= 3 ? ": " + string.Join(", ", Columns.Select(c => c.Name)) : "")})";
+
+    static string Count(long n, string what) => $"{n} {what}{(n == 1 ? "" : "s")}";
+}
 
 /// A table as published: the layers it stacks, the shape it shows, and how a row is identified.
 sealed record Table(
@@ -101,10 +117,17 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
             // Whether a file's rows are mapping entries is a property of the file, but which column
             // the mapping keys fill is the table's -- so it is decided here, where the key is known,
-            // and carried on the source rather than worked out again wherever one is read.
+            // and carried on the source rather than worked out again wherever one is read. The same
+            // reading of the file says what is worth warning about, which is why it is read once
+            // here and handed to both.
             var keyed = MappingKey(name, settings);
-            var layers = Materialize(conn, name, [.. sources.Select(s => Layer.Keyed(s, keyed)!)]);
-            var writeSource = Layer.Keyed(declaredWrite, keyed);
+            var shapes = sources.Select(Layer.Shapes).ToList();
+            var writeShapes = Layer.Shapes(declaredWrite);
+            foreach (var files in shapes.Append(writeShapes)) Diagnose(name, keyed, files);
+
+            var layers = Materialize(conn, name,
+                [.. sources.Zip(shapes, (source, files) => Layer.Keyed(source, keyed, files)!)]);
+            var writeSource = Layer.Keyed(declaredWrite, keyed, writeShapes);
             var describedWrite = writeSource is null ? null
                 : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
 
@@ -149,6 +172,22 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Declared();
         Macros(conn);
         Declared(conn);
+        Empty();
+    }
+
+    /// A lake holding nothing answers every query with "no such table", and nothing in that answer
+    /// says the directory was what went wrong. It is not an error -- `CALL duckpg_reload` reads the
+    /// layers again, so a lake started before its files arrive is something someone may mean -- but
+    /// it is never what a bare `duckpg` meant, and that is the shape this is usually reached in.
+    void Empty()
+    {
+        if (Tables.Count > 0) return;
+
+        string?[] searched = [.. config.Layers, write.Directory];
+        logger.LogWarning("this lake publishes no tables: {Reason}",
+            searched.Where(d => d is { Length: > 0 }).ToList() is { Count: > 0 } directories
+                ? $"nothing was found in {string.Join(", ", directories)}"
+                : "no layer directory was given -- set `layers`, or name one on the command line");
     }
 
     public void Rebuild(DuckDBConnection conn)
@@ -231,10 +270,30 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             }
 
             var materialized = $"{LayerSchema}.{SqlText.Quote($"{name}#{source.Seq}")}";
-            var columns = Layer.Materialize(conn, materialized, source);
-            if (columns.Count > 0) layers.Add(new TableLayer(source, materialized, columns));
+            var (columns, rows) = Layer.Materialize(conn, materialized, source);
+            if (columns.Count > 0) layers.Add(new TableLayer(source, materialized, columns, rows));
         }
         return layers;
+    }
+
+    /// What a layer file's shape is worth saying out loud. Neither of these is an error: both files
+    /// publish exactly what the documented rule says they publish, and a lake that unwrapped one
+    /// instead would be guessing -- right most of the time and, the rest of the time, wrong with no
+    /// more signal than there is now. Both are what a file looks like when its author meant the
+    /// other thing, so what is left is to say so before anyone reads the answer.
+    void Diagnose(string table, string? key, List<(string File, YamlShape Shape)> shapes)
+    {
+        foreach (var (file, shape) in shapes)
+            if (shape.Wraps is { } wrapper)
+                logger.LogWarning("{File} publishes one row whose only column is '{Column}', a list of " +
+                                  "{Objects}: remove that top-level key if those were meant to be the " +
+                                  "rows", file, wrapper,
+                                  shape.Wrapped == 1 ? "1 object" : $"{shape.Wrapped} objects");
+            else if (shape.Keyed && key is null)
+                logger.LogWarning("{File} names its rows, and {Table} has no single key column for the " +
+                                  "entry keys to fill: it publishes one row whose columns are the entry " +
+                                  "names -- name a key with --key, `tables:` or a dacpac, or write the " +
+                                  "entries as a sequence", file, table);
     }
 
     // ---- declared views --------------------------------------------------------------------------

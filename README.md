@@ -216,6 +216,35 @@ Otherwise the document is a single row, which is what an object-rooted JSON file
 row that also carries the key column inside itself is a second answer to a question the file already
 answered; the entry's key is the one it was organized by, and the inner one is dropped.
 
+**Both of those rules publish something, and both are what a mistake looks like**, so a lake says
+what it made of each file rather than leaving it to be found in a query's answer. Every table's
+layers are logged as they are read, with what each one turned out to publish:
+
+```
+lake.orders  <- ./common/orders.yaml (2 rows, 2 columns: id, amount)
+lake.widgets <- ./common/widgets.yaml (1 row, 1 column: widgets)
+```
+
+A one-row, one-column table is self-evidently not what anyone was writing, and nothing about that
+line is a guess. Two shapes are specific enough to be warned about by name:
+
+- A root mapping with exactly *one* key holding a sequence of mappings — `widgets:` above the rows,
+  the wrapper an export or a hand-written file most often carries. It publishes one row whose only
+  column is that list, and it is warned about with the file, the column and the fix.
+- A file whose rows are named — a mapping of mappings — where the table has no single key column
+  for the entry keys to fill. The document is a single row whose columns are the entry names, and
+  the rows have lost theirs.
+
+Neither is an error and neither changes what is published. The wrapper key is *not* unwrapped and
+the rule stays the rule: a guess would be right most of the time and, the rest of the time, wrong
+with no more signal than there was before it. A file that really does carry one list column, or one
+row of its own fields, says nothing at all.
+
+A lake that ends up with **no tables at all** is warned about the same way, and for the same reason
+— it serves, and answers every query with "no such table", which says nothing about the directory
+being the problem. It is not an error: `CALL duckpg_reload` reads the layers again, so a lake
+started before its files arrive is a thing someone may mean.
+
 A key is typed like any other YAML scalar, so `1:` is a number and `"007":` is text. JSON has no way
 to write a mapping key that is not a string, so there the quoting says nothing and the text is what
 the key is read from — which means a keyed JSON layer cannot hold `007` as text, and a table that
