@@ -40,6 +40,19 @@ publish a temp-directory convention as API.
 - **A layer's format is a property of the file, not of the layer.** Anything that special-cases
   "the parquet layer" or "the seed layer" is a step backwards; the only layer with a role is the
   write layer.
+- **A file's *shape* is the file's too, but which column a mapping key fills is the table's.** That
+  split is why `LayerSource.KeyedBy` is set in `Catalog.Build` -- where `MappingKey` knows the key --
+  rather than in `Layer.Scan`, which sees files and no configuration. `Yaml.IsKeyed` answers only the
+  half a file can: root is a mapping, every value is a mapping. The other half is that the key is
+  exactly one column, since a mapping key is one value; a table with a composite key or none reads
+  the same document as the single row an object-rooted JSON file has always been, and that fallback
+  is what keeps this from breaking a lake that already had one. `Converted` -- YAML always, keyed
+  either format -- is what `HasFileName` now answers to, because a copy cannot publish provenance.
+  The shape survives a write: `WriteLayer.Persist` passes `KeyedBy` back, since rewriting someone's
+  keyed file as a sequence would be a change nobody asked for. A mapping key is written plain for a
+  number and quoted for text -- quoted reads back as the same string, and plain would turn `007`
+  into seven. JSON cannot write a non-string key at all, which is why a keyed JSON key is read from
+  its text rather than its quoting, and why that one format cannot hold `007` as a key.
 - **Layer sequence numbers decide everything.** Read layers are 0..n-1 in configured order, the
   write layer is n. `QUALIFY … ORDER BY _seq DESC` is what makes a higher layer shadow a lower one,
   and a tombstone only hides rows with `_seq < writeSeq`.

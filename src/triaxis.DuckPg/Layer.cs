@@ -13,12 +13,18 @@ public enum LayerFormat { Parquet, Json, Yaml }
 /// to read it. `Seq` is the layer's height in the stack -- higher shadows lower. `Partitions` names
 /// the columns the `k=v` directories in the path contribute, which is what tells a partition the
 /// lake owns from one it merely happens to sit under.
-sealed record LayerSource(int Seq, LayerFormat Format, string Path, string[] Partitions)
+sealed record LayerSource(int Seq, LayerFormat Format, string Path, string[] Partitions,
+                          string? KeyedBy = null)
 {
     public bool Hive => Partitions.Length > 0;
 
-    /// YAML is read through a converted copy, so its file names cannot be published as provenance.
-    public bool HasFileName => Format != LayerFormat.Yaml;
+    /// Whether the files have to be rewritten before DuckDB can read them: always for YAML, which it
+    /// does not speak, and for a keyed file of either format, whose rows are mapping entries rather
+    /// than array items.
+    public bool Converted => Format == LayerFormat.Yaml || KeyedBy is not null;
+
+    /// A converted source is read out of a copy, so its file names cannot be published as provenance.
+    public bool HasFileName => !Converted;
 }
 
 /// Reads layer directories: what tables they hold, and their rows into DuckDB.
@@ -139,17 +145,31 @@ static class Layer
         $"({SqlText.Literal(glob.Replace('\\', '/'))}, union_by_name=true, filename=true, " +
         $"hive_partitioning={(hive ? "true" : "false")})";
 
+    /// The source as it should be read given the key the table would take its mapping keys into --
+    /// unchanged where the files are ordinary sequences of rows, or where the table has no single
+    /// column for a mapping key to fill. A mapping key is one value, so a composite key cannot come
+    /// out of one and the question is not asked.
+    ///
+    /// Parquet carries its own shape and is never in question. Everything else is decided by looking
+    /// at the files: a source whose files disagree is converted whole, and each file is then read as
+    /// whatever it is.
+    public static LayerSource? Keyed(LayerSource? source, string? key) =>
+        source is null || key is null || source.Format == LayerFormat.Parquet
+        || !Yaml.Expand(source.Path).Any(Yaml.IsKeyed)
+            ? source
+            : source with { KeyedBy = key };
+
     /// Runs <paramref name="body"/> against the glob DuckDB can actually read the source from, and
     /// cleans up whatever conversion getting there needed.
     public static void Read(LayerSource source, Action<string> body)
     {
-        if (source.Format != LayerFormat.Yaml)
+        if (!source.Converted)
         {
             body(source.Path);
             return;
         }
 
-        var converted = Yaml.ToJsonTree(source.Path);
+        var converted = Yaml.ToJsonTree(source.Path, source.KeyedBy, source.Format);
         try
         {
             body(converted);
@@ -215,13 +235,17 @@ static class Layer
     // ---- writing ---------------------------------------------------------------------------------
 
     /// Replaces a layer file with the contents of a table. The write is staged next to the target
-    /// and moved into place, so a reader never sees a half-written file.
-    public static void Write(DuckDBConnection conn, string select, string path, LayerFormat format)
+    /// and moved into place, so a reader never sees a half-written file. A file that was read as
+    /// mapping entries is written back as mapping entries: the shape belongs to the file, and a lake
+    /// that quietly rewrote one as a sequence would have changed something nobody asked it to.
+    public static void Write(DuckDBConnection conn, string select, string path, LayerFormat format,
+                             string? keyedBy = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         var staged = Path.Combine(Path.GetDirectoryName(path)!, "." + Path.GetFileName(path) + ".tmp");
 
-        if (format == LayerFormat.Yaml) Yaml.Write(conn, select, staged);
+        if (keyedBy is not null) Yaml.WriteKeyed(conn, select, staged, keyedBy, format);
+        else if (format == LayerFormat.Yaml) Yaml.Write(conn, select, staged);
         else
             Exec(conn, $"COPY ({select}) TO {SqlText.Literal(staged.Replace('\\', '/'))} " +
                        $"(FORMAT {(format == LayerFormat.Parquet ? "PARQUET" : "JSON, ARRAY true")})");
@@ -246,7 +270,7 @@ static class Yaml
     /// The source as JSON DuckDB can read. The whole tree is mirrored rather than one file,
     /// because the `k=v` directories above the files are part of what is being read -- the copy
     /// has to keep them for the partitions to survive the conversion.
-    public static string ToJsonTree(string glob)
+    public static string ToJsonTree(string glob, string? key, LayerFormat format)
     {
         var root = Root(glob);
         var scratch = Path.Combine(Scratch, $"{Path.GetFileName(root)}-{glob.GetHashCode():x8}");
@@ -255,10 +279,37 @@ static class Yaml
         {
             var target = Path.Combine(scratch, Path.GetRelativePath(root, file) + ".json");
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            Convert(file, target);
+            Convert(file, target, key, format);
         }
 
         return Path.Combine(scratch, Path.GetRelativePath(root, glob) + ".json");
+    }
+
+    /// A file whose rows are the entries of one mapping -- the row's key as the entry's key, the rest
+    /// of the row as its value -- rather than a sequence of rows. Every value has to be a mapping for
+    /// that reading to hold: one that is not means the document is a single row whose columns happen
+    /// to include a nested one, which is what an object-rooted JSON file has always been.
+    ///
+    /// A sequence root is the ordinary shape and is ruled out on the first character, so the parse is
+    /// only paid by a file that might actually be keyed.
+    public static bool IsKeyed(string path)
+    {
+        using (var peek = File.OpenText(path))
+            for (int c; (c = peek.Read()) >= 0;)
+            {
+                if (char.IsWhiteSpace((char)c)) continue;
+                // `-` opens a YAML sequence entry, but `---` opens a document -- and that document
+                // may still be a mapping.
+                if (c == '[' || (c == '-' && peek.Peek() is var next && (next < 0 || char.IsWhiteSpace((char)next))))
+                    return false;
+                break;
+            }
+
+        var yaml = new YamlStream();
+        using (var text = File.OpenText(path)) yaml.Load(text);
+        return yaml.Documents is [{ RootNode: YamlMappingNode root }, ..]
+               && root.Children.Count > 0
+               && root.Children.Values.All(value => value is YamlMappingNode);
     }
 
     public static void Discard(string converted)
@@ -276,7 +327,7 @@ static class Yaml
 
     /// The files a glob of whole-segment wildcards matches. Only partition globs get here, so a
     /// segment is either a literal or a single `*`.
-    static IEnumerable<string> Expand(string glob)
+    public static IEnumerable<string> Expand(string glob)
     {
         var segments = glob.Split(Path.DirectorySeparatorChar);
         IEnumerable<string> paths = [segments[0].Length == 0 ? $"{Path.DirectorySeparatorChar}" : segments[0]];
@@ -295,23 +346,70 @@ static class Yaml
     /// YamlDotNet's own JSON emitter leaves control characters unescaped -- real exports carry tabs
     /// inside plain scalars -- so the document is walked and written with a real JSON writer. Going
     /// through the node model rather than a typed deserialiser also keeps this reflection-free.
-    static void Convert(string source, string target)
+    static void Convert(string source, string target, string? key, LayerFormat format)
     {
         var yaml = new YamlStream();
         using (var text = File.OpenText(source)) yaml.Load(text);
 
         using var stream = File.Create(target);
         using var writer = new Utf8JsonWriter(stream);
-        if (yaml.Documents.Count > 0 && yaml.Documents[0].RootNode is YamlSequenceNode rows)
+        switch (yaml.Documents is [{ RootNode: var node }, ..] ? node : null)
         {
-            Write(writer, rows);
-        }
-        else
-        {
-            writer.WriteStartArray();
-            writer.WriteEndArray();
+            case YamlSequenceNode rows:
+                Write(writer, rows);
+                break;
+
+            // Keyed only where the table has a column for the mapping keys to fill; without one the
+            // same document is the single row an object-rooted JSON file has always been, and saying
+            // so beats publishing a table whose rows have lost their names.
+            case YamlMappingNode rows when key is not null && rows.Children.Count > 0
+                                           && rows.Children.Values.All(value => value is YamlMappingNode):
+                WriteKeyed(writer, rows, key, format);
+                break;
+
+            case YamlMappingNode row:
+                writer.WriteStartArray();
+                Write(writer, row);
+                writer.WriteEndArray();
+                break;
+
+            default:
+                writer.WriteStartArray();
+                writer.WriteEndArray();
+                break;
         }
         writer.Flush();
+    }
+
+    /// One row per mapping entry, the entry's key written into the key column. A row that carries
+    /// that column *inside* it as well is a second answer to a question the file already answered,
+    /// and the entry's key is the one the file was organized by -- so the inner one is dropped.
+    ///
+    /// The key is typed as any other scalar for YAML, where quoting is the author's own choice and
+    /// `"007"` is deliberately text. JSON has no way to write a mapping key that is not a string, so
+    /// there the quoting says nothing and the text is what it is read from -- otherwise every key of
+    /// a keyed JSON file would be text, and an `id` of 1 would not match the same row in a layer
+    /// beneath it.
+    static void WriteKeyed(Utf8JsonWriter json, YamlMappingNode rows, string key, LayerFormat format)
+    {
+        json.WriteStartArray();
+        foreach (var (name, value) in rows.Children)
+        {
+            json.WriteStartObject();
+            json.WritePropertyName(key);
+            if (name is YamlScalarNode scalar && format != LayerFormat.Json) WriteScalar(json, scalar);
+            else WriteInferred(json, (name as YamlScalarNode)?.Value ?? name.ToString());
+
+            foreach (var (field, item) in ((YamlMappingNode)value).Children)
+            {
+                var column = (field as YamlScalarNode)?.Value ?? field.ToString();
+                if (column.Equals(key, StringComparison.OrdinalIgnoreCase)) continue;
+                json.WritePropertyName(column);
+                Write(json, item);
+            }
+            json.WriteEndObject();
+        }
+        json.WriteEndArray();
     }
 
     static void Write(Utf8JsonWriter json, YamlNode node)
@@ -348,13 +446,12 @@ static class Yaml
     /// keeps an id like `007` from turning into a number.
     static void WriteScalar(Utf8JsonWriter json, YamlScalarNode scalar)
     {
-        var text = scalar.Value ?? "";
-        if (scalar.Style is not ScalarStyle.Plain)
-        {
-            json.WriteStringValue(text);
-            return;
-        }
+        if (scalar.Style is ScalarStyle.Plain) WriteInferred(json, scalar.Value ?? "");
+        else json.WriteStringValue(scalar.Value ?? "");
+    }
 
+    static void WriteInferred(Utf8JsonWriter json, string text)
+    {
         switch (text)
         {
             case "" or "~" or "null" or "Null" or "NULL": json.WriteNullValue(); return;
@@ -391,5 +488,62 @@ static class Yaml
             }
             if (first) writer.WriteLine("- {}");
         }
+    }
+
+    /// Rows back out as the mapping entries they were read as. The key column becomes the entry's
+    /// key and is not repeated inside it, which is what makes the file read back as what was written.
+    /// A row whose key is null has no entry to be -- there is no such mapping key -- so it is written
+    /// under the empty one, where it will read back as an empty string rather than silently vanish.
+    public static void WriteKeyed(DuckDBConnection conn, string select, string path, string key,
+                                  LayerFormat format)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT to_json(r) FROM ({select}) r";
+        using var reader = cmd.ExecuteReader();
+        using var stream = File.Create(path);
+
+        if (format == LayerFormat.Json)
+        {
+            using var json = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+            json.WriteStartObject();
+            while (reader.Read())
+            {
+                using var row = JsonDocument.Parse(reader.GetString(0));
+                var (name, fields) = Split(row.RootElement, key);
+                json.WritePropertyName(name.ValueKind == JsonValueKind.String
+                    ? name.GetString() ?? "" : name.GetRawText());
+                json.WriteStartObject();
+                foreach (var field in fields) field.WriteTo(json);
+                json.WriteEndObject();
+            }
+            json.WriteEndObject();
+            return;
+        }
+
+        using var writer = new StreamWriter(stream);
+        while (reader.Read())
+        {
+            using var row = JsonDocument.Parse(reader.GetString(0));
+            var (name, fields) = Split(row.RootElement, key);
+
+            // A string key goes out quoted whatever it looks like: quoted or plain it reads back as
+            // the same string, and quoted it also survives a `007` or a `:` in the text. A number or
+            // a boolean goes out as itself, which is the only way it reads back as one.
+            writer.WriteLine(name.GetRawText() + ":");
+            foreach (var field in fields) writer.WriteLine($"  {field.Name}: {field.Value.GetRawText()}");
+            if (fields.Count == 0) writer.WriteLine("  {}");
+        }
+    }
+
+    /// A row split into the value its key column holds and everything else, matched the way SQL
+    /// matches a column name rather than the way JSON matches a property.
+    static (JsonElement Key, List<JsonProperty> Fields) Split(JsonElement row, string key)
+    {
+        var name = row;
+        List<JsonProperty> fields = [];
+        foreach (var property in row.EnumerateObject())
+            if (property.Name.Equals(key, StringComparison.OrdinalIgnoreCase)) name = property.Value;
+            else fields.Add(property);
+        return (name, fields);
     }
 }

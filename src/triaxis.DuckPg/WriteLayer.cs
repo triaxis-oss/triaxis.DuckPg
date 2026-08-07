@@ -89,12 +89,17 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
     {
         if (Directory is null) return;
 
-        Save(conn, PathOf(table), FormatOf(table), table.Columns.Select(c => c.Name), table.WriteName);
+        // The shape belongs to the file: one read as mapping entries is written back as mapping
+        // entries. The tombstone sidecar is never keyed -- it holds keys and nothing else, so every
+        // entry's value would be an empty mapping.
+        Save(conn, PathOf(table), FormatOf(table), table.Columns.Select(c => c.Name), table.WriteName,
+             table.WriteSource?.KeyedBy is { } keyed && table.Has(keyed) ? keyed : null);
         if (table.Key.Length > 0)
             Save(conn, TombstonePathOf(table), FormatOf(table), table.Key, table.TombstoneName);
     }
 
-    void Save(DuckDBConnection conn, string path, LayerFormat format, IEnumerable<string> columns, string source)
+    void Save(DuckDBConnection conn, string path, LayerFormat format, IEnumerable<string> columns, string source,
+              string? keyedBy = null)
     {
         var select = $"SELECT {string.Join(", ", columns.Select(SqlText.Quote))} FROM {source}";
         if (Scalar(conn, $"SELECT count(*) FROM {source}") == 0)
@@ -103,7 +108,7 @@ sealed class WriteLayer(Config config, ILogger<WriteLayer> logger)
             return;
         }
 
-        Layer.Write(conn, select, path, format);
+        Layer.Write(conn, select, path, format, keyedBy);
         logger.LogDebug("persisted {Path}", path);
     }
 

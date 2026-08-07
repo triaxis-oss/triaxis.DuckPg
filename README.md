@@ -166,11 +166,41 @@ A layer is a directory. What it holds decides how each table is read:
 |---|---|
 | `orders.yaml`, `orders.yml` | table `orders`, materialized through JSON for type inference |
 | `orders.json` | table `orders`, `read_json_auto` |
+| either, rooted in a mapping of mappings | the same table, the mapping keys filling the key column |
 | `orders.parquet` | table `orders`, scanned in place |
 | `orders/**/*.parquet` | table `orders`, one table over every file below, `union_by_name` |
 | `orders/dt=…/*.parquet` | the same, with the partition keys as columns |
 | `db=…/orders.parquet` | table `orders` across every `db=`, with `db` as a column |
 | `.anything/` | ignored — dot-directories are the tool's own |
+
+**A YAML or JSON file may name its rows instead of listing them.** Where a table has a single key
+column, a file whose root is a mapping of mappings is read as one row per entry, with the entry's key
+filling that column:
+
+```yaml
+test1:                  # the same as
+  foo: 2                #   - id: test1
+  bar: 3                #     foo: 2
+test2:                  #     bar: 3
+  foo: 4                #   - id: test2
+  bar: 6                #     foo: 4
+```
+
+with `--key id`, or a key from `tables:` or the dacpac. It is an ordinary layer either way — it
+stacks, shadows and is written back like any other; what it saves is repeating the key on every row
+of a hand-written one. JSON says the same thing as `{"test1": {"foo": 2}, …}`.
+
+Three things decide it, and all three have to hold: the root is a mapping, every value in it is a
+mapping, and the table has exactly *one* key column — a mapping key is one value and cannot be two.
+Otherwise the document is a single row, which is what an object-rooted JSON file has always been. A
+row that also carries the key column inside itself is a second answer to a question the file already
+answered; the entry's key is the one it was organized by, and the inner one is dropped.
+
+A key is typed like any other YAML scalar, so `1:` is a number and `"007":` is text. JSON has no way
+to write a mapping key that is not a string, so there the quoting says nothing and the text is what
+the key is read from — which means a keyed JSON layer cannot hold `007` as text, and a table that
+needs one should be YAML or should say so in a dacpac. Written back, a text key always comes out
+quoted: it reads back as the same string either way, and quoted it also survives a `007`.
 
 A directory named `k=v` is a partition *above* the tables rather than a table: the table is the
 file below it, so `db=one/orders.parquet` and `db=two/orders.parquet` are one `orders` with a `db`

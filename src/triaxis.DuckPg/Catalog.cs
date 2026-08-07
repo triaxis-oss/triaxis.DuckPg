@@ -88,10 +88,16 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {WriteLayer.Schema}");
         if (config.Materialize) Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {BaseSchema}");
 
-        foreach (var (name, sources, writeSource) in Sources())
+        foreach (var (name, sources, declaredWrite) in Sources())
         {
             var settings = config.Table(name);
-            var layers = Materialize(conn, name, sources);
+
+            // Whether a file's rows are mapping entries is a property of the file, but which column
+            // the mapping keys fill is the table's -- so it is decided here, where the key is known,
+            // and carried on the source rather than worked out again wherever one is read.
+            var keyed = MappingKey(name, settings);
+            var layers = Materialize(conn, name, [.. sources.Select(s => Layer.Keyed(s, keyed)!)]);
+            var writeSource = Layer.Keyed(declaredWrite, keyed);
             var describedWrite = writeSource is null ? null
                 : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
 
@@ -600,6 +606,15 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// A partition column joins whatever key is found, because rows are only unique *within* a
     /// partition: every database in a `db=…` lake has its own row 1, and without the partition in
     /// the key one would shadow the other.
+    /// The column a keyed file's mapping keys would fill, or null when the table has no single one.
+    /// Read the same way `KeyFor` reads it but without its guard, since the column a keyed file is
+    /// missing is exactly the one being asked about -- and only when the key is one column, because
+    /// a mapping key is one value and cannot be two.
+    string? MappingKey(string name, TableConfig table) =>
+        (table.Key is { Length: > 0 } configured ? configured
+         : config.DefaultKey is { Length: > 0 } fallback ? fallback
+         : schema.Key(name) ?? []) is [var only] ? only : null;
+
     string[] KeyFor(string name, TableConfig table, List<Column> columns, string[] partitions)
     {
         var key =
