@@ -34,6 +34,9 @@ public class ServeCommand : LoggingCommand
     [Option("--writable", Description = "Accept writes without a write directory; they are lost on exit.")]
     public bool Writable { get; set; }
 
+    [Option("--materialize", Description = "Collapse the layers into real DuckDB tables and serve those; nothing is kept but a delta at shutdown.")]
+    public bool Materialize { get; set; }
+
     [Option("--serialize-transactions", Description = "Let one transaction run at a time, the next waiting for the one in front of it.")]
     public bool SerializeTransactions { get; set; }
 
@@ -95,6 +98,7 @@ public class ServeCommand : LoggingCommand
         if (Write is not null) config.Write = Path.GetFullPath(Write);
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;
+        if (Materialize) config.Materialize = true;
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
         if (Key.Length > 0) config.DefaultKey = Key;

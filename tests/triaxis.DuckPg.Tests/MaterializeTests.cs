@@ -1,0 +1,300 @@
+using Microsoft.Data.SqlClient;
+
+namespace triaxis.DuckPg.Tests;
+
+/// A lake with the layers collapsed: every table evaluated once into a real DuckDB table, which is
+/// then what the sessions read and write. There is no merge to bind on every read, no write branch
+/// to earn and no tombstone to hide anything -- a delete deletes. What it holds is lost on exit,
+/// save for the delta a write directory is given when the lake stops.
+public class MaterializeTests : IDisposable
+{
+    readonly TestLake lake = new TestLake("materialize")
+        .Json("base", "orders", """
+            [{"order_id": 1, "note": "base"}, {"order_id": 2, "note": "base"}, {"order_id": 3, "note": "base"}]
+            """)
+        .Json("top", "orders", """[{"order_id": 2, "note": "shadowed"}]""")
+        .Stack("base", "top")
+        .WriteTo("local")
+        .Materialized()
+        .WithTds();
+
+    public MaterializeTests()
+    {
+        lake.Config.DefaultKey = ["order_id"];
+        lake.Start();
+    }
+
+    public void Dispose() => lake.Dispose();
+
+    SqlConnection Open()
+    {
+        var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        return connection;
+    }
+
+    /// The stack is still the stack -- it is merged once, at build, instead of on every read.
+    [Fact]
+    public void TheLayersAreCollapsedIntoWhatIsPublished()
+    {
+        Assert.Equal(["base", "shadowed", "base"],
+                     lake.Query("SELECT note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// And what is published is a table, not a view: that is the whole point of the mode.
+    [Fact]
+    public void WhatIsPublishedIsATable()
+    {
+        Assert.Equal(["BASE TABLE"], lake.Query(
+            "SELECT table_type FROM information_schema.tables " +
+            "WHERE table_schema = 'lake' AND table_name = 'orders'"));
+    }
+
+    /// A write goes where the reads come from. Nothing is promoted, because there is nothing to
+    /// promote: no branch above the rows and none below them.
+    [Fact]
+    public void AWriteLandsInTheTableItself()
+    {
+        using var connection = Open();
+        new SqlCommand("UPDATE [orders] SET [note] = 'written' WHERE [order_id] = 1", connection)
+            .ExecuteNonQuery();
+        new SqlCommand("INSERT INTO [orders] ([order_id], [note]) VALUES (4, 'new')", connection)
+            .ExecuteNonQuery();
+
+        Assert.Equal(["written", "shadowed", "base", "new"],
+                     lake.Query("SELECT note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// A delete deletes. There is no tombstone table at all, and no row underneath to hide.
+    [Fact]
+    public void ADeleteTakesTheRowRatherThanHidingIt()
+    {
+        using var connection = Open();
+        Assert.Equal(1, new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 2", connection).ExecuteNonQuery());
+
+        Assert.Equal(["1", "3"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+        Assert.Empty(lake.Query(
+            "SELECT table_name FROM information_schema.tables WHERE table_name LIKE '%__del'"));
+    }
+
+    /// A key that moves needs no tombstone either, which is the one place the plan had to change.
+    [Fact]
+    public void AKeyMayMoveWithoutLeavingAnythingBehind()
+    {
+        using var connection = Open();
+        new SqlCommand("UPDATE [orders] SET [order_id] = 9 WHERE [order_id] = 1", connection).ExecuteNonQuery();
+
+        Assert.Equal(["2", "3", "9"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// What the lake was given goes out once, as the layer the write directory always held: the rows
+    /// that are not what the layers said, and the keys that were there and are not.
+    [Fact]
+    public void WhatWasWrittenLeavesAsADeltaWhenTheLakeStops()
+    {
+        using (var connection = Open())
+        {
+            new SqlCommand("UPDATE [orders] SET [note] = 'written' WHERE [order_id] = 1", connection)
+                .ExecuteNonQuery();
+            new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 3", connection).ExecuteNonQuery();
+            new SqlCommand("INSERT INTO [orders] ([order_id], [note]) VALUES (4, 'new')", connection)
+                .ExecuteNonQuery();
+        }
+
+        // Restarting throws away everything in memory: what comes back is what the delta carried.
+        lake.Restart();
+        Assert.Equal(["1=written", "2=shadowed", "4=new"],
+                     lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// Twice is not once. The second run reads the first run's delta back as a layer, so the
+    /// baseline the next delta is measured against must still be the *read* layers alone -- measured
+    /// against a stack that already carried it, a delta shrinks to nothing and the write file is
+    /// emptied of everything the run before it did.
+    [Fact]
+    public void ASecondRunKeepsWhatTheFirstOneWrote()
+    {
+        using (var connection = Open())
+        {
+            new SqlCommand("UPDATE [orders] SET [note] = 'first run' WHERE [order_id] = 1", connection)
+                .ExecuteNonQuery();
+            new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 3", connection).ExecuteNonQuery();
+            new SqlCommand("INSERT INTO [orders] ([order_id], [note]) VALUES (4, 'first run')", connection)
+                .ExecuteNonQuery();
+        }
+
+        lake.Restart();
+        using (var connection = Open())
+            new SqlCommand("INSERT INTO [orders] ([order_id], [note]) VALUES (5, 'second run')", connection)
+                .ExecuteNonQuery();
+
+        lake.Restart();
+        Assert.Equal(["1=first run", "2=shadowed", "4=first run", "5=second run"],
+                     lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// And a row hidden by the first run stays hidden however many times the lake is restarted --
+    /// the tombstone is recomputed each time, so it has to be recomputed against the same baseline.
+    [Fact]
+    public void ADeletedRowDoesNotComeBackOnTheThirdRun()
+    {
+        using (var connection = Open())
+            new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 3", connection).ExecuteNonQuery();
+
+        lake.Restart();
+        Assert.Equal(["1", "2"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+        lake.Restart();
+        Assert.Equal(["1", "2"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// The delta is the write layer's own format, so an ordinary lake reads it as the layer it is.
+    [Fact]
+    public void AndAnOrdinaryLakeReadsThatDeltaBack()
+    {
+        using (var connection = Open())
+            new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 3", connection).ExecuteNonQuery();
+
+        lake.Stop();
+        lake.Config.Materialize = false;
+        lake.Start();
+
+        Assert.Equal(["1", "2"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+}
+
+/// A declared identity draws from a sequence seeded past what the lake already holds, and a
+/// materialized lake holds the previous run's delta -- so the seeding has to see it. These check the
+/// mechanism the layer machinery normally provides and this mode had to arrive at another way.
+public class MaterializedIdentityTests : IDisposable
+{
+    readonly TestLake lake = new TestLake("materialize-identity")
+        .Json("base", "things", """[{"id": 1, "note": "base"}]""")
+        .Stack("base")
+        .WriteTo("local")
+        .Materialized()
+        .WithTds();
+
+    public MaterializedIdentityTests()
+    {
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            [new Dacpac.TableModel("things", [("id", "int"), ("note", "nvarchar")], ["id"], Identity: ["id"])]);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+    }
+
+    public void Dispose() => lake.Dispose();
+
+    int Insert(string note)
+    {
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        return (int)new SqlCommand(
+            $"INSERT INTO [things] ([note]) OUTPUT INSERTED.[id] VALUES ('{note}')", connection).ExecuteScalar()!;
+    }
+
+    /// A key handed out by the run before is one the files now hold, so the next run starts past it
+    /// rather than over it -- which is the whole point of seeding from what is there.
+    [Fact]
+    public void ARestartCarriesOnFromTheKeysAlreadyHandedOut()
+    {
+        Assert.Equal(2, Insert("first run"));
+        Assert.Equal(3, Insert("first run"));
+
+        lake.Restart();
+        Assert.Equal(4, Insert("second run"));
+
+        lake.Restart();
+        Assert.Equal(["1", "2", "3", "4"], lake.Query("SELECT id FROM lake.things ORDER BY id"));
+    }
+}
+
+/// The rules a lake keeps are the catalog's rather than the layers', so collapsing the layers does
+/// not put them down: a reference still refuses, and a cascade still cascades.
+public class MaterializedReferenceTests : IDisposable
+{
+    readonly TestLake lake = new TestLake("materialize-references")
+        .Json("base", "orders", """[{"id": 1, "note": "a"}, {"id": 2, "note": "b"}]""")
+        .Json("base", "lines", """[{"id": 10, "order_id": 1, "qty": 5}, {"id": 11, "order_id": 2, "qty": 1}]""")
+        .Stack("base")
+        .WriteTo("local")
+        .Materialized()
+        .WithTds();
+
+    void Declare(string onDelete)
+    {
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+        [
+            new Dacpac.TableModel("orders", [("id", "int"), ("note", "nvarchar")], ["id"]),
+            new Dacpac.TableModel("lines", [("id", "int"), ("order_id", "int"), ("qty", "int")], ["id"]),
+        ], [],
+        [new Dacpac.ReferenceModel("FK_lines_orders", "lines", ["order_id"], "orders", ["id"], onDelete)]);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+    }
+
+    public void Dispose() => lake.Dispose();
+
+    SqlConnection Open()
+    {
+        var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        return connection;
+    }
+
+    [Fact]
+    public void AReferenceStillRefuses()
+    {
+        Declare("NoAction");
+        using var connection = Open();
+
+        var refused = Assert.Throws<SqlException>(() =>
+            new SqlCommand("DELETE FROM [orders] WHERE [id] = 1", connection).ExecuteNonQuery());
+        Assert.Equal(547, refused.Number);
+        Assert.Equal(["1", "2"], lake.Query("SELECT id FROM lake.orders ORDER BY id"));
+    }
+
+    [Fact]
+    public void ACascadeStillTakesWhatPointed()
+    {
+        Declare("Cascade");
+        using var connection = Open();
+
+        Assert.Equal(1, new SqlCommand("DELETE FROM [orders] WHERE [id] = 1", connection).ExecuteNonQuery());
+
+        Assert.Equal(["2"], lake.Query("SELECT id FROM lake.orders ORDER BY id"));
+        Assert.Equal(["11"], lake.Query("SELECT id FROM lake.lines ORDER BY id"));
+    }
+}
+
+/// What a shared table cannot carry. A filter and a session-variable column are answered per
+/// session, so a mode that hands every session the same table has to say so rather than quietly
+/// stop applying them.
+public class MaterializeRefusalTests
+{
+    [Fact]
+    public void AFilteredTableIsRefusedAtStartup()
+    {
+        using var lake = new TestLake("materialize-filter")
+            .Json("base", "orders", """[{"order_id": 1, "tenant": "a"}]""")
+            .Stack("base")
+            .Materialized();
+        lake.Config.Tables["orders"] = new TableConfig { Filter = "tenant = 'a'" };
+
+        var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("filter", refused.Message);
+        Assert.Contains("orders", refused.Message);
+    }
+
+    [Fact]
+    public void SoIsASessionVariableColumn()
+    {
+        using var lake = new TestLake("materialize-variable")
+            .Json("base", "orders", """[{"order_id": 1}]""")
+            .Stack("base")
+            .Materialized();
+        lake.Config.Columns.Add(new ColumnConfig { Name = "who", Expr = "getvariable('duckpg_user')" });
+
+        var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("session variable", refused.Message);
+    }
+}

@@ -105,6 +105,9 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
 
         await stopping.CancelAsync();
         try { await serving!.WaitAsync(cancellation); } catch (OperationCanceledException) { }
+        // Once nothing is serving, so nothing else is on this connection: a materialised lake keeps
+        // nothing of its own, and this is where what it was given goes out as a layer.
+        catalog.Flush(duck);
         stopping.Dispose();
         stopping = null;
         serving = null;
@@ -133,6 +136,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         {
             await stopping.CancelAsync();
             try { await serving!.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            catalog.Flush(duck);
             stopping.Dispose();
             stopping = null;
         }

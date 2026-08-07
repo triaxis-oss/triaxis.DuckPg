@@ -144,11 +144,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     public void ExitTurn() => turns.Release();
 
     /// Writes a table's write layer back to its file. Called once a write is committed, so a
-    /// rolled-back statement never reaches the disk.
+    /// rolled-back statement never reaches the disk. A materialised lake has no write layer and
+    /// keeps nothing: what it holds goes out once, at shutdown, as a delta.
     public void Persist(string name)
     {
         lock (gate)
-            if (Catalog.Resolve(null, name) is { Writable: true } table)
+            if (Catalog.Resolve(null, name) is { Writable: true, Materialised: false } table)
                 write.Persist(admin, table);
     }
 
@@ -315,7 +316,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // The rewritten row lands in the write layer under the key it already had, where it shadows
         // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
         // the old one behind with nothing above it, and that is what has to be hidden.
-        var moves = table.Key.Any(assignments.ContainsKey);
+        // Nothing lies beneath a materialised row, so a key that moves leaves nothing to hide.
+        var moves = !table.Materialised && table.Key.Any(assignments.ContainsKey);
 
         // With a FROM clause the target's own columns are no longer the only ones in scope, so
         // everything the statement did not assign has to say which table it came from.
@@ -390,7 +392,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         Cascading(table, "duckpg_keys", Keyed(table, scan, qualifier, predicate), cascade, checks, promote);
 
         string[] steps =
-            [Keys(table, scan, qualifier, predicate), .. cascade, Tombstone(table), Evict(table)];
+            [Keys(table, scan, qualifier, predicate), .. cascade,
+             .. table.Materialised ? (string[])[] : [Tombstone(table)], Evict(table)];
         var referenced = checks.ToArray();
 
         // A deleted row is gone by the time anything could read it, so what can be answered for is
@@ -521,7 +524,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
             steps.Add($"CREATE OR REPLACE TEMP TABLE {childKeys} AS SELECT DISTINCT {collected} " +
                       $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {matched}");
-            steps.Add(Tombstone(child, childKeys));
+            if (!child.Materialised) steps.Add(Tombstone(child, childKeys));
             steps.Add(Evict(child, childKeys));
 
             Cascading(child, childKeys,
@@ -559,6 +562,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             List<string> steps = [], promoted = [], tombstoned = [];
             foreach (var (table, tombstones) in tables)
             {
+                if (table.Materialised) continue;
                 if (Catalog.Promoted(table) && (!tombstones || Catalog.Tombstoned(table))) continue;
                 steps.AddRange(Catalog.Promotion(admin, table, tombstones));
                 promoted.Add(table.Name);

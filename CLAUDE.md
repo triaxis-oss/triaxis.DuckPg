@@ -55,6 +55,20 @@ publish a temp-directory convention as API.
   hides one when it moves a key; otherwise the rewritten row shadows what is beneath it on its own.
   A `--cache` copy survives the promotion: `Catalog.Underlay` puts it below the write branch, since
   the copy is the read layers and a write does not touch those.
+- **A materialised lake is the same catalog with the merge paid once.** `Config.Materialize` cuts
+  each table out of its own stack -- `Catalog.Materialise` keeps that stack behind as a view in the
+  `base` schema, unread while the lake serves and the only honest baseline for the delta
+  `Catalog.Flush` writes at shutdown. What makes it fit the existing machinery is `Table.WriteName`
+  answering `QualifiedName`: `Evict` plus the insert of `duckpg_updated` *is* an UPDATE, and `Evict`
+  alone *is* a DELETE, so only the tombstone steps had to go and promotion became a no-op. The merge
+  itself has to be built against `table with { Materialised = false }`, or it would name itself as
+  its own write branch. `Flush` runs once and computes both temp tables before touching either
+  target, since the baseline reads what it is about to replace. What the baseline must *not* include
+  is the previous run's delta: the write layer is rewritten whole, so a delta measured against a
+  stack that already carried it comes out empty and takes the earlier run's writes with it -- and a
+  tombstone, absent from a baseline that applied it, is not written again and the row returns on the
+  run after. So the baseline is the read layers alone while the table is cut from the whole stack;
+  the two views differ, and a lake restarted twice is what tells them apart.
 - **The write layer holds effective state, not a log.** A deleted row leaves the write table and
   gains a tombstone; a re-inserted one comes back with no tombstone bookkeeping. There is no
   per-row sequence number, and adding one back means re-deriving what shadows what.

@@ -73,6 +73,15 @@ sealed class TestLake : IDisposable
     }
 
     /// The TDS front door, which only opens when a test asks for it.
+    /// Every layer collapsed into a real DuckDB table, written to directly. No merge, no write
+    /// branch, no tombstones -- and nothing kept, unless a write directory is there to take the
+    /// delta when the lake stops.
+    public TestLake Materialized()
+    {
+        Config.Materialize = true;
+        return this;
+    }
+
     public TestLake WithTds()
     {
         Config.Tds = "127.0.0.1:0";

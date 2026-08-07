@@ -31,10 +31,16 @@ sealed record Table(
     string[] Key,
     bool Writable,
     LayerSource? WriteSource,
-    string? Filter)
+    string? Filter,
+    bool Materialised = false)
 {
     public string QualifiedName => $"{SqlText.Quote(Schema)}.{SqlText.Quote(Name)}";
-    public string WriteName => $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(Name)}";
+
+    /// A materialised table is written to where it is read from -- there is no branch above it,
+    /// because there is nothing below it either.
+    public string WriteName => Materialised
+        ? QualifiedName
+        : $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(Name)}";
     public string TombstoneName => $"{SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(Name + "__del")}";
 
     public bool Has(string column) => Columns.Any(c => c.Name.Equals(column, StringComparison.OrdinalIgnoreCase));
@@ -66,14 +72,21 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// layers, which no write touches -- so it stays underneath the write branch.
     readonly Dictionary<string, string> copies = new(StringComparer.OrdinalIgnoreCase);
 
+    bool flushed;
+
     /// Schema holding the materialised YAML and JSON layers.
     const string LayerSchema = "layer";
+
+    /// Where a materialised lake keeps the merge it was cut from -- unread while it serves, and the
+    /// baseline the shutdown delta is measured against.
+    public const string BaseSchema = "base";
 
     public void Build(DuckDBConnection conn)
     {
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {SqlText.Quote(config.Schema)}");
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {LayerSchema}");
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {WriteLayer.Schema}");
+        if (config.Materialize) Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {BaseSchema}");
 
         foreach (var (name, sources, writeSource) in Sources())
         {
@@ -92,7 +105,15 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             var table = new Table(config.Schema, name, layers, columns,
                                   Virtuals(name, settings, columns),
                                   KeyFor(name, settings, columns, partitions),
-                                  writable, writeSource, settings.Filter);
+                                  writable || config.Materialize, writeSource, settings.Filter,
+                                  config.Materialize);
+
+            if (table.Materialised)
+            {
+                Materialise(conn, table);
+                Tables[name] = table;
+                continue;
+            }
 
             // A writable table the directory holds nothing for is published as though it were not
             // writable, and grows its write branch when something first writes to it.
@@ -586,6 +607,83 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                   (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
                   + $" AS {SqlText.Quote(c.Name)}")) + $" FROM {Scan(file)}"
             : $"SELECT * FROM {Scan(file)}";
+
+    /// The whole stack, evaluated once into a table the sessions then read and write directly. The
+    /// merge it came from stays behind as a view nothing reads while the lake serves: it costs no
+    /// memory, and it is the only honest baseline for the delta written out at shutdown.
+    ///
+    /// The write directory is a layer like any other here -- a delta a previous run left behind is
+    /// read back in and collapsed with the rest, which is what makes a restart mean anything.
+    void Materialise(DuckDBConnection conn, Table table)
+    {
+        // Merged against the stacked form of the table: a materialised one writes where it reads,
+        // so asking it for its write branch by name would point the merge at itself.
+        var stacked = table with { Materialised = false };
+        var carries = table.Writable && write.Carries(stacked);
+        if (carries) write.Prepare(conn, stacked);
+
+        // The baseline is the read layers and nothing else. Measured against a stack that already
+        // carried the last delta, the next one comes out empty -- and since the write layer is
+        // rewritten whole, that empties it of everything the run before did. A row hidden by a
+        // tombstone goes the same way: absent from a baseline that applied it, it is not hidden
+        // again, and comes back on the run after.
+        Exec(conn, $"CREATE OR REPLACE VIEW {Baseline(table)} AS " +
+                   Merged(stacked, writable: false, tombstones: false));
+
+        // What it serves is that baseline with the previous run's delta on top of it: the whole
+        // stack, evaluated once.
+        Exec(conn, $"CREATE OR REPLACE TABLE {table.QualifiedName} AS " +
+                   Merged(stacked, carries, carries && write.HasTombstones(stacked)));
+
+        // Nothing is earned here: the branch a write would have to make is the table itself.
+        promoted.Add(table.Name);
+        foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
+    }
+
+    /// What the layers said before anything was written to them, for the shutdown delta.
+    static string Baseline(Table table) =>
+        $"{SqlText.Quote(BaseSchema)}.{SqlText.Quote(table.Name)}";
+
+    /// What a materialised lake leaves behind: the rows that are not what the layers said, and the
+    /// keys that were there and are not. Written in the write layer's own format, so the next run --
+    /// materialised or not -- reads it as the layer it is. Nothing is kept without a directory to
+    /// keep it in, which is the ephemeral bargain the mode makes.
+    public void Flush(DuckDBConnection conn)
+    {
+        // Once only: the baseline reads the very tables this replaces, so a second pass would
+        // measure the delta against the delta.
+        if (!config.Materialize || write.Directory is null || flushed) return;
+        flushed = true;
+
+        foreach (var table in Tables.Values.Where(t => t.Writable))
+        {
+            var stacked = table with { Materialised = false };
+            var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
+
+            // Computed before either target is touched: the baseline view reads the very tables the
+            // next two statements replace.
+            Exec(conn, $"CREATE OR REPLACE TEMP TABLE duckpg_delta AS SELECT {columns} " +
+                       $"FROM {table.QualifiedName} EXCEPT SELECT {columns} FROM {Baseline(table)}");
+
+            var keys = string.Join(", ", table.Key.Select(SqlText.Quote));
+            if (table.Key.Length > 0)
+                Exec(conn, $"CREATE OR REPLACE TEMP TABLE duckpg_gone AS SELECT {keys} " +
+                           $"FROM {Baseline(table)} EXCEPT SELECT {keys} FROM {table.QualifiedName}");
+
+            // The branch may already be there, holding the delta a previous run left and this build
+            // read back in -- what goes out is the whole delta, not another one on top of it.
+            foreach (var statement in write.Definition(stacked, ifNotExists: true)) Exec(conn, statement);
+            Exec(conn, $"DELETE FROM {stacked.WriteName}");
+            if (table.Key.Length > 0) Exec(conn, $"DELETE FROM {stacked.TombstoneName}");
+            Exec(conn, $"INSERT INTO {stacked.WriteName} ({columns}) SELECT {columns} FROM duckpg_delta");
+
+
+            if (table.Key.Length > 0)
+                Exec(conn, $"INSERT INTO {stacked.TombstoneName} SELECT * FROM duckpg_gone");
+
+            write.Persist(conn, stacked);
+        }
+    }
 
     string ViewDefinition(Table table, bool writable, bool tombstones) =>
         $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table, writable, tombstones)}";

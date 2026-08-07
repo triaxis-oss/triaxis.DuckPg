@@ -27,6 +27,13 @@ public sealed class Config
     /// Accept writes without a write directory -- they live in memory and are lost on exit.
     public bool Writable { get; set; }
 
+    /// Collapse every layer into a real DuckDB table at build and serve that, rather than a view
+    /// over the layers. There is then no merge to bind on every read, no write branch to earn and no
+    /// tombstone to hide anything: a write is a write, to the table the reads come from. Nothing is
+    /// persisted -- what a materialised lake holds is lost on exit, save for the delta a write
+    /// directory gets on a clean shutdown.
+    public bool Materialize { get; set; }
+
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
     /// after that is invisible to it for as long as it lives -- and it cannot create one itself
@@ -90,6 +97,24 @@ public sealed class Config
 
         if (Dacpac is { Length: > 0 } dacpac && !File.Exists(dacpac))
             throw new DuckPgConfigurationException($"dacpac not found: {dacpac}");
+
+        // A filter and a `getvariable()` column are answered per session, and a table shared by
+        // every session cannot carry either. Refused rather than dropped: a mode that silently
+        // stopped filtering rows would be the worst way to find this out.
+        if (Materialize)
+        {
+            foreach (var (name, table) in Tables)
+                if (table.Filter is { Length: > 0 })
+                    throw new DuckPgConfigurationException(
+                        $"table {name} declares a `filter`, which materialize cannot bake into a " +
+                        "table every session shares -- it is answered per session or not at all");
+
+            foreach (var column in Columns.Concat(Tables.Values.SelectMany(t => t.Columns)))
+                if (column.Expr is { } expr && expr.Contains("getvariable", StringComparison.OrdinalIgnoreCase))
+                    throw new DuckPgConfigurationException(
+                        $"column {column.Name} reads a session variable, which materialize cannot " +
+                        "bake into a table every session shares");
+        }
 
         // A cache inside a layer would be read back as part of the lake on the next build -- every
         // materialised table arriving a second time, as a layer of its own.

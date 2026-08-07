@@ -62,7 +62,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
-`--write-format`, `--writable`, `--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
+`--write-format`, `--writable`, `--materialize`, `--serialize-transactions`, `--schema`, `--key`
+(repeatable), `--dacpac`,
 `--cache` and `--config` each override the file when both are given; argument paths are relative to
 the working directory, file paths to the file. A file named explicitly with `--config` must exist,
 so a typo is an error rather than a silent fallback to defaults.
@@ -270,6 +271,19 @@ from an old one. Virtual columns reject writes.
 
 `--writable` accepts writes with no directory at all; they live in memory and are lost on exit,
 which is what a test wants.
+
+`--materialize` collapses the whole stack into real DuckDB tables at build and serves those. There
+is then no merge to bind on every read, no write branch to earn, and no tombstone to hide anything:
+a write goes to the table the reads come from, and a delete deletes. The write directory is still a
+layer on the way in — a delta a previous run left is read back and collapsed with the rest — but
+nothing is kept while the lake runs. When it stops cleanly, what it holds goes out once as a delta
+in the write layer's own format: the rows that are not what the layers said, and the keys that were
+there and are not. An ordinary lake reads that back as the layer it is.
+
+It is for a test suite that wants a plain database rather than the layer machinery, and for anything
+that would rather pay the merge once than on every query. The cost is memory — every table is
+resident — and that a table cannot carry anything answered per session: a `filter:` or a
+`getvariable()` column is refused at startup rather than quietly stopping.
 
 `--serialize-transactions` lets one transaction run at a time. Two things go wrong without it, and
 neither is something an application written against SQL Server or PostgreSQL has reason to expect.
@@ -576,6 +590,7 @@ variables and the tool's usual override files layer over it for free.
 | `write` | `--write`, `-w` | Directory holding the writable top layer. |
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
+| `materialize` | `--materialize` | Collapse the layers into real tables; a delta goes out at shutdown. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
