@@ -329,9 +329,8 @@ publish a temp-directory convention as API.
   and `Plan.Checks` is what a session runs *before* the plan's steps: a statement outside a
   transaction commits each step as it goes, so a rule enforced after the tombstone would be enforced
   on a row already gone. The keys are selected twice for that -- once by the check, once by the plan
-  -- and only for a table something points at. A cascade is warned about rather than performed, and
-  the insert side is not checked at all: both would be more promise than a stack of files can keep,
-  since what a read layer holds can change between runs.
+  -- and only for a table something points at. The insert side is not checked at all: it would be
+  more promise than a stack of files can keep, since what a read layer holds can change between runs.
 - **A cascade is that same delete, one table down.** `Gateway.Cascading` walks the declared
   references from the table being deleted from, and each level collects its own keys into a
   `duckpg_cascade_n` temp table before hiding them -- read off the level above's temp table, since
@@ -344,10 +343,30 @@ publish a temp-directory convention as API.
   altogether when it is NO ACTION, so reading it by any other name is indistinguishable from a
   schema where nothing cascades: no warning fires, because the fallback *is* the default. `Dacpac`
   in the suite has to write that same encoding, or every cascade test only checks its own spelling.
+  `2` and `3` are SET NULL and SET DEFAULT, and `DacpacFormatTests.ReadsTheDeleteActionsDacFxEncodes`
+  pins all three to the checked-in dacpac SqlPackage built. NO ACTION cannot be pinned at all, since
+  an omitted property and one read by the wrong name look exactly alike.
   What a cascade cannot do is demoted at startup to the refusal a plain reference gets, in
-  `Catalog.Acyclic` and `Uncascadable` -- a child that is not writable or has no key, and a cycle,
+  `Catalog.Acyclic` and `Unperformable` -- a child that is not writable or has no key, and a cycle,
   which SQL Server will not let you declare either. Orphaning the rows is the one answer that is
   wrong whichever way it is reached, so the honest fallback is the refusal rather than doing nothing.
+- **What a reference *does* is decided once, at build, and written onto the reference.** There is one
+  `Catalog.pointing` map from the table pointed at, each entry carrying the resolved action rather
+  than the declared one -- `Referencing`, `Cascading` and `Clearing` are three readings of it. That
+  is what makes a demotion a `reference with { OnDelete = NoAction }` instead of a move between
+  parallel dictionaries, and it is why `Acyclic` rewrites in place: a cascade demoted to a refusal
+  has to stop being reachable by `Reaches` at the same moment it starts being a check.
+- **A clear is an UPDATE, and that is the whole of it.** `ON DELETE SET NULL` and `SET DEFAULT` leave
+  the rows where they are with the pointing columns emptied, so `Gateway.Clearing` builds what
+  `RewriteUpdate` builds -- the rows as the merged view has them, the pointing columns replaced,
+  `Evict` and then an insert into the child's branch. No tombstone, because the key does not move and
+  the rewritten row shadows what is beneath it on its own; no recursion and no checks, because the
+  rows are still there afterwards and nothing below them is orphaned. `SET DEFAULT` is the same
+  expression with `ColumnDefault.Expr` in place of NULL, and NULL again where the column declares no
+  default -- which is what SQL Server does with it. The one thing a cascade may do and a clear may
+  not is point with part of the child's own key: emptying a key column collapses every cleared row
+  onto one key and uncovers the rows they were shadowing, so `Unperformable` demotes it. That case
+  has no equivalent for a cascade, which is why the check is asked only of a clear.
 - **A `bit` is converted for arithmetic, and only where the column resolves to one.** T-SQL makes a
   `bit` an integer to multiply it; DuckDB refuses `BOOLEAN * INTEGER` outright. The cast is written
   by `TSqlWriter.Operand`, which asks `TypeOf` what the column actually is -- `TSqlContext.Tables`

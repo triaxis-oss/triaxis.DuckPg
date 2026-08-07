@@ -78,3 +78,21 @@ CREATE VIEW [dbo].[doubled_orders]
 AS
 SELECT [order_id], [dbo].[Doubled]([order_id]) AS [doubled] FROM [dbo].[orders];
 GO
+
+-- The other two delete actions, so the numbers DacFx encodes them as are read off DacFx's own
+-- output rather than off the test helper, which could spell them wrong in exactly the same way.
+CREATE TABLE [dbo].[notes] (
+    [note_id]  INT NOT NULL,
+    [order_id] INT NULL,
+    CONSTRAINT [PK_notes] PRIMARY KEY CLUSTERED ([note_id] ASC),
+    CONSTRAINT [FK_notes_orders] FOREIGN KEY ([order_id]) REFERENCES [dbo].[orders] ([order_id]) ON DELETE SET NULL
+);
+GO
+
+CREATE TABLE [dbo].[tags] (
+    [tag_id]   INT NOT NULL,
+    [order_id] INT NULL CONSTRAINT [DF_tags_order_id] DEFAULT ((0)),
+    CONSTRAINT [PK_tags] PRIMARY KEY CLUSTERED ([tag_id] ASC),
+    CONSTRAINT [FK_tags_orders] FOREIGN KEY ([order_id]) REFERENCES [dbo].[orders] ([order_id]) ON DELETE SET DEFAULT
+);
+GO

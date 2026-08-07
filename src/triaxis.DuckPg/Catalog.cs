@@ -215,14 +215,13 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     // ---- declared views --------------------------------------------------------------------------
 
-    /// What points at each published table, by the table pointed at. Worked out once the tables are
-    /// known, since a reference this cannot enforce is worth saying so about at startup rather than
-    /// at the first delete -- and a lake made of some of a database's tables has plenty of those.
-    readonly Dictionary<string, List<Reference>> referencing = new(StringComparer.OrdinalIgnoreCase);
-
-    /// And what a delete from each table takes with it, which is the same reference read the other
-    /// way: `ON DELETE CASCADE` says the rows pointing at one that goes go too.
-    readonly Dictionary<string, List<Reference>> cascading = new(StringComparer.OrdinalIgnoreCase);
+    /// What points at each published table, by the table pointed at, each carrying the action a
+    /// delete from that table performs for it. The action is the *resolved* one rather than the
+    /// declared one: what this lake cannot perform is demoted to the refusal a plain reference gets,
+    /// and that is decided once here rather than at every delete. Worked out as soon as the tables
+    /// are known, since a reference this cannot enforce is worth saying so about at startup rather
+    /// than at the first delete -- and a lake made of some of a database's tables has plenty.
+    readonly Dictionary<string, List<Reference>> pointing = new(StringComparer.OrdinalIgnoreCase);
 
     /// The declared scalar functions that were actually published as macros. A call to one of these
     /// is resolved onto the lake; a call to anything else is left as it was written.
@@ -230,96 +229,115 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     public IReadOnlySet<string> Functions => macros;
 
-    /// The references a delete from this table has to answer for.
-    public IReadOnlyList<Reference> Referencing(Table table) =>
-        referencing.GetValueOrDefault(table.Name) ?? [];
+    public const string NoAction = "NoAction";
+    public const string Cascade = "Cascade";
+    public const string SetNull = "SetNull";
+    public const string SetDefault = "SetDefault";
 
-    /// The references a delete from this table performs rather than refuses.
-    public IReadOnlyList<Reference> Cascading(Table table) =>
-        cascading.GetValueOrDefault(table.Name) ?? [];
+    /// What a delete can actually do about a reference. Anything else the schema names is carried
+    /// as itself so it can be warned about by the name it was written with.
+    static readonly HashSet<string> Performed =
+        new(StringComparer.OrdinalIgnoreCase) { NoAction, Cascade, SetNull, SetDefault };
+
+    static bool Does(Reference reference, string action) =>
+        reference.OnDelete.Equals(action, StringComparison.OrdinalIgnoreCase);
+
+    List<Reference> Pointing(Table table) => pointing.GetValueOrDefault(table.Name) ?? [];
+
+    /// The references a delete from this table has to answer for.
+    public IEnumerable<Reference> Referencing(Table table) => Pointing(table).Where(r => Does(r, NoAction));
+
+    /// The references a delete from this table performs by deleting one table down.
+    public IEnumerable<Reference> Cascading(Table table) => Pointing(table).Where(r => Does(r, Cascade));
+
+    /// And the ones it performs by leaving the rows where they are and emptying what pointed.
+    public IEnumerable<Reference> Clearing(Table table) =>
+        Pointing(table).Where(r => Does(r, SetNull) || Does(r, SetDefault));
 
     void Declared()
     {
-        referencing.Clear();
-        cascading.Clear();
+        pointing.Clear();
 
-        foreach (var reference in schema.References)
+        foreach (var declared in schema.References)
         {
             // A lake is usually some of a database's tables, so a reference to or from one it does
             // not publish is ordinary rather than wrong.
-            if (!Tables.TryGetValue(reference.Table, out var child) ||
-                !Tables.TryGetValue(reference.Parent, out var parent)) continue;
+            if (!Tables.TryGetValue(declared.Table, out var child) ||
+                !Tables.TryGetValue(declared.Parent, out var parent)) continue;
 
-            var cascade = reference.OnDelete.Equals("Cascade", StringComparison.OrdinalIgnoreCase);
-            if (!cascade && !reference.OnDelete.Equals("NoAction", StringComparison.OrdinalIgnoreCase))
+            if (!Performed.Contains(declared.OnDelete))
             {
                 logger.LogWarning("{Reference} declares ON DELETE {Action}, which duckpg does not do: " +
                                   "a delete from {Parent} is left to say what it says",
-                                  reference.Name, reference.OnDelete, reference.Parent);
+                                  declared.Name, declared.OnDelete, declared.Parent);
                 continue;
             }
 
             // What a delete collects before the rows go is the table's key, so that is the only
             // thing a reference can be checked against here.
             if (!parent.Key.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).SequenceEqual(
-                    reference.ParentColumns.OrderBy(k => k, StringComparer.OrdinalIgnoreCase),
+                    declared.ParentColumns.OrderBy(k => k, StringComparer.OrdinalIgnoreCase),
                     StringComparer.OrdinalIgnoreCase))
             {
                 logger.LogWarning("{Reference} points at {Columns} of {Parent}, which is not its key: " +
                                   "duckpg checks a reference against the key a delete collects",
-                                  reference.Name, string.Join(", ", reference.ParentColumns), reference.Parent);
+                                  declared.Name, string.Join(", ", declared.ParentColumns), declared.Parent);
                 continue;
             }
 
-            if (reference.Columns.Any(column => !child.Has(column))) continue;
+            if (declared.Columns.Any(column => !child.Has(column))) continue;
 
-            // A cascade is a delete from the child, and a delete needs what any delete needs. Where
-            // it cannot be performed the reference is kept as one that refuses instead: orphaning
-            // the rows is the one answer that is wrong either way.
-            if (cascade && Uncascadable(child) is { } why)
+            // Performing anything at all is a write to the child, and a write needs what any write
+            // needs. Where it cannot be made the reference is kept as one that refuses instead:
+            // orphaning the rows is the one answer that is wrong whichever way it is reached.
+            var reference = declared;
+            if (!Does(reference, NoAction) && Unperformable(reference, child) is { } why)
             {
-                logger.LogWarning("{Reference} declares ON DELETE CASCADE, which duckpg cannot perform: " +
+                logger.LogWarning("{Reference} declares ON DELETE {Action}, which duckpg cannot perform: " +
                                   "{Child} {Why}, so a delete from {Parent} is refused instead",
-                                  reference.Name, child.Name, why, parent.Name);
-                cascade = false;
+                                  reference.Name, reference.OnDelete, child.Name, why, parent.Name);
+                reference = reference with { OnDelete = NoAction };
             }
 
-            Pointing(cascade ? cascading : referencing, parent.Name).Add(reference);
+            Pointing(parent.Name).Add(reference);
         }
 
         Acyclic();
 
-
-        if (referencing.Count > 0)
-            logger.LogDebug("{Count} declared references are enforced on delete",
-                            referencing.Values.Sum(r => r.Count));
-        if (cascading.Count > 0)
-            logger.LogDebug("{Count} declared references cascade on delete",
-                            cascading.Values.Sum(r => r.Count));
+        foreach (var group in pointing.Values.SelectMany(references => references)
+                     .GroupBy(reference => reference.OnDelete, StringComparer.OrdinalIgnoreCase))
+            logger.LogDebug("{Count} declared references answer ON DELETE {Action}", group.Count(), group.Key);
     }
 
-    static List<Reference> Pointing(Dictionary<string, List<Reference>> at, string table) =>
-        at.TryGetValue(table, out var pointing) ? pointing : at[table] = [];
+    List<Reference> Pointing(string table) =>
+        pointing.TryGetValue(table, out var references) ? references : pointing[table] = [];
 
-    static string? Uncascadable(Table child) =>
+    /// Why a reference's declared action cannot be carried out, or null when it can. A cascade
+    /// deletes the child rows and a clear rewrites them; either way something has to be written to
+    /// the child, and shadowing a row in a layer below it takes a key.
+    static string? Unperformable(Reference reference, Table child) =>
         !child.Writable ? "is not writable"
-        : child.Key.Length == 0 ? "has no key, and a cascade has to hide the rows it takes"
+        : child.Key.Length == 0 ? "has no key, and the rows have to shadow what is beneath them"
+        : Does(reference, Cascade) ? null
+        // Emptying a key column would collapse every cleared row onto one key and leave the rows
+        // they used to shadow uncovered -- a move, not a rewrite, and not one a caller asked for.
+        : reference.Columns.Intersect(child.Key, StringComparer.OrdinalIgnoreCase).Any()
+            ? $"points with {string.Join(", ", reference.Columns.Intersect(child.Key, StringComparer.OrdinalIgnoreCase))}, which is part of its own key"
         : null;
 
     /// A cascade that could reach the table it started from would not end. SQL Server refuses to
     /// declare one at all; this demotes it to the refusal a plain reference gets, which is the same
-    /// answer arrived at later.
+    /// answer arrived at later. A clear cannot loop: the rows it touches stay where they are.
     void Acyclic()
     {
-        foreach (var (parent, references) in cascading.ToArray())
-            foreach (var reference in references.ToArray())
-                if (Reaches(reference.Table, parent))
+        foreach (var (parent, references) in pointing)
+            for (var i = 0; i < references.Count; i++)
+                if (Does(references[i], Cascade) && Reaches(references[i].Table, parent))
                 {
                     logger.LogWarning("{Reference} cascades from {Parent} back to itself, which cannot " +
                                       "terminate: a delete from {Parent} is refused instead",
-                                      reference.Name, parent, parent);
-                    references.Remove(reference);
-                    Pointing(referencing, parent).Add(reference);
+                                      references[i].Name, parent, parent);
+                    references[i] = references[i] with { OnDelete = NoAction };
                 }
     }
 
@@ -331,8 +349,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         {
             if (table.Equals(to, StringComparison.OrdinalIgnoreCase)) return true;
             if (!seen.Add(table)) continue;
-            foreach (var reference in cascading.GetValueOrDefault(table) ?? [])
-                pending.Push(reference.Table);
+            foreach (var reference in pointing.GetValueOrDefault(table) ?? [])
+                if (Does(reference, Cascade)) pending.Push(reference.Table);
         }
         return false;
     }

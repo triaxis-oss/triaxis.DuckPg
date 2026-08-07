@@ -447,8 +447,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         foreach (var reference in Catalog.Referencing(table))
         {
             var child = Catalog.Tables[reference.Table];
-            var matched = string.Join(" AND ", reference.Columns.Zip(reference.ParentColumns)
-                .Select(pair => $"c.{SqlText.Quote(pair.First)} = k.{SqlText.Quote(pair.Second)}"));
+            var matched = Matching(reference);
 
             // A table pointing at itself would find the rows going as rows still there, so the ones
             // going are taken out of the question.
@@ -521,8 +520,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         foreach (var reference in Catalog.Cascading(table))
         {
             var child = Catalog.Tables[reference.Table];
-            var matched = string.Join(" AND ", reference.Columns.Zip(reference.ParentColumns)
-                .Select(pair => $"c.{SqlText.Quote(pair.First)} = k.{SqlText.Quote(pair.Second)}"));
+            var matched = Matching(reference);
             var collected = string.Join(", ", child.Key.Select(k => "c." + SqlText.Quote(k)));
 
             // One per level, and a level adds exactly one table to promote -- a cascade that reaches
@@ -539,7 +537,53 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                       $"SELECT DISTINCT {collected} FROM {child.QualifiedName} AS c, ({keyed}) AS k WHERE {matched}",
                       steps, checks, promote);
         }
+
+        Clearing(table, keys, steps, promote);
     }
+
+    /// A declared `ON DELETE SET NULL` or `SET DEFAULT` performed as what it means: the rows pointing
+    /// at one that goes stay where they are, with what pointed emptied. That is an UPDATE, so it is
+    /// built like one -- the rows as the merged view has them, with the pointing columns replaced,
+    /// written into the child's branch over the copies they replace.
+    ///
+    /// Nothing recurses and nothing is checked: the rows are still there afterwards, so nothing
+    /// below them is orphaned and nothing further down has to answer for them. Nor is a tombstone
+    /// needed -- the rewritten row keeps its key and shadows what is beneath it on its own, which is
+    /// why a reference pointing with its own key is refused at build rather than cleared here.
+    void Clearing(Table table, string keys, List<string> steps, List<(Table Table, bool Tombstones)> promote)
+    {
+        foreach (var reference in Catalog.Clearing(table))
+        {
+            var child = Catalog.Tables[reference.Table];
+            var projection = string.Join(", ", child.Columns.Select(c =>
+                reference.Columns.Contains(c.Name, StringComparer.OrdinalIgnoreCase)
+                    ? $"{Cleared(reference, c)} AS {SqlText.Quote(c.Name)}"
+                    : "c." + SqlText.Quote(c.Name)));
+            var columns = string.Join(", ", child.Columns.Select(c => SqlText.Quote(c.Name)));
+
+            var cleared = $"duckpg_cleared_{promote.Count}";
+            promote.Add((child, false));
+
+            steps.Add($"CREATE OR REPLACE TEMP TABLE {cleared} AS SELECT {projection} " +
+                      $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {Matching(reference)}");
+            steps.Add(Evict(child, cleared));
+            steps.Add($"INSERT INTO {child.WriteName} ({columns}) SELECT {columns} FROM {cleared}");
+        }
+    }
+
+    /// What a cleared column is set to. `SET DEFAULT` means the column's declared default, and NULL
+    /// where it has none -- which is what SQL Server does with it too, and what makes `SET NULL` the
+    /// same expression with the question not asked.
+    static string Cleared(Reference reference, Column column) =>
+        column.Default is { Expr: var expr }
+        && reference.OnDelete.Equals(Catalog.SetDefault, StringComparison.OrdinalIgnoreCase)
+            ? $"CAST({expr} AS {column.Type})"
+            : "NULL";
+
+    /// A child row pointing at a parent key the delete collected.
+    static string Matching(Reference reference) =>
+        string.Join(" AND ", reference.Columns.Zip(reference.ParentColumns)
+            .Select(pair => $"c.{SqlText.Quote(pair.First)} = k.{SqlText.Quote(pair.Second)}"));
 
     static Dictionary<string, string> ParseAssignments(string setClause)
     {

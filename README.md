@@ -461,11 +461,21 @@ reach back to where it started, which SQL Server refuses to declare at all — t
 as one that refuses instead, and the reason is logged at startup. Orphaning the rows is the one
 answer that is wrong either way.
 
-What is not done: the insert side is unchecked (a row may name a parent that is not there),
-`ON DELETE SET NULL` and `SET DEFAULT` are warned about at startup rather than performed, and a
-reference to columns that are not the table's key is skipped — a delete collects the key, so that is
-what a reference can be checked against. Nothing is enforced over files another process edits
-between runs; `duckpg` sees what its own writes do.
+**`ON DELETE SET NULL` and `SET DEFAULT` are performed too**, as what they mean: the rows that
+pointed stay where they are, with the pointing columns emptied — to NULL, or to the column's declared
+default where it has one, which is what SQL Server does with a `SET DEFAULT` that has none. That is
+an update rather than a delete, so nothing is hidden and nothing recurses: the rows are still there
+afterwards, and nothing below them is orphaned. A clear reaches below a cascade like anything else in
+the chain. It has the same requirements a cascade has — a child this lake will write to, and a key to
+shadow the rewritten row with — plus one of its own: a reference pointing with part of the child's
+*own* key cannot be cleared, since emptying a key column would collapse every cleared row onto one
+key. Where it cannot be performed the reference is kept as one that refuses, and the reason is
+logged at startup.
+
+What is not done: the insert side is unchecked (a row may name a parent that is not there, and a
+`SET DEFAULT` may write one), and a reference to columns that are not the table's key is skipped — a
+delete collects the key, so that is what a reference can be checked against. Nothing is enforced over
+files another process edits between runs; `duckpg` sees what its own writes do.
 
 **A declared scalar function is published as a macro.** A dacpac's `SqlScalarFunction` becomes a
 DuckDB macro beside the tables, so `[dbo].[Doubled]([order_id])` resolves onto the lake exactly as a

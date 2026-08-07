@@ -156,6 +156,22 @@ public class DacpacFormatTests : IDisposable
         }
     }
 
+    /// The delete actions read off DacFx's own output, not this suite's writer. `Dacpac.cs` and the
+    /// reader can agree on a wrong encoding forever -- which is exactly what happened to the name of
+    /// the property carrying it -- so the numbers are pinned to the checked-in dacpac SqlPackage
+    /// built. NO ACTION cannot be pinned here at all: DacFx omits the property for it, so an
+    /// absent one and a property read by the wrong name look exactly alike.
+    [Fact]
+    public void ReadsTheDeleteActionsDacFxEncodes()
+    {
+        var schema = new DacpacSchema(
+            new Config { Dacpac = Path.Combine(AppContext.BaseDirectory, "Schema", "sample.dacpac") },
+            warnings);
+
+        Assert.Equal(["FK_lines_orders=Cascade", "FK_notes_orders=SetNull", "FK_tags_orders=SetDefault"],
+                     schema.References.Select(r => $"{r.Name}={r.OnDelete}").Order());
+    }
+
     [Fact]
     public void ReadsTheColumnsAndTheKey()
     {
