@@ -311,6 +311,20 @@ publish a temp-directory convention as API.
   `OrderingTests` is the whole guarantee: every shape asked of both paths and compared, nulls and ties
   included. `OrderingUseTests` reads what was actually sent, since that comparison passes just as well
   when the fast path never fires.
+- **A value never crosses into `object` on the row path, and what makes that possible is that the
+  decision is per column rather than per value.** Both writers used to switch on the runtime type of
+  a boxed value -- `TdsTypes.WriteValue(object)` and `PgTypes.WriteText`/`WriteBinary` -- which is a
+  box a row a column, and 24 bytes each. But the TDS token, the PostgreSQL OID *and* the CLR type the
+  reader hands a column back in are all fixed by one thing, the column's DuckDB type, so the pair is
+  known before the first row: `TdsField.For` and `PgField.For` choose once at COLMETADATA and
+  RowDescription time and the row loop calls what they chose. `Ints<T>` covers every integer in one
+  class because `IBinaryInteger` makes the widening to the declared length a typed conversion rather
+  than `Convert.ToInt64`, and `Written<T>` covers everything PostgreSQL renders as text because
+  `IUtf8SpanFormattable` writes it straight into the message. Measured over the suite, boxed value
+  types fell from ~30 MB to 4.9 MB and nothing is left under either row writer -- what remains is
+  Npgsql and SqlClient boxing on the *client* side of the tests. A reference does not box, which is
+  why a string and a blob are typed only where it saves a type test, and `Objects` keeps the old
+  behaviour for anything with no pair: read as it comes, converted from whatever it turns out to be.
 - **A view is bound on every execution, not once when the lake is built.** Everything above is why:
   every expression in a view definition is paid for by every query touching it. Hence no cast to the
   type a layer already has, no merge wrapper around a table only one layer carries, `--cache` writing

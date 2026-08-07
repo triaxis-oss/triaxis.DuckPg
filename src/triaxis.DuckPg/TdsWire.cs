@@ -66,6 +66,20 @@ sealed class TdsMsg
 
     public TdsMsg UsVarchar(string s) => U16(s.Length).Raw(Encoding.Unicode.GetBytes(s));
 
+    public TdsMsg F32(float v)
+    {
+        Span<byte> b = stackalloc byte[4];
+        BinaryPrimitives.WriteSingleLittleEndian(b, v);
+        return Raw(b);
+    }
+
+    public TdsMsg F64(double v)
+    {
+        Span<byte> b = stackalloc byte[8];
+        BinaryPrimitives.WriteDoubleLittleEndian(b, v);
+        return Raw(b);
+    }
+
     public TdsMsg Raw(ReadOnlySpan<byte> s) { buf.Write(s); return this; }
 
     public void Clear() => buf.SetLength(0);

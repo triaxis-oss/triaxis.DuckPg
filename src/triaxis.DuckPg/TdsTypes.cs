@@ -123,13 +123,18 @@ static class TdsTypes
 
     /// <paramref name="payload"/> is what one packet holds: a MAX value is chunked to it, so no
     /// chunk of it crosses a packet boundary.
+    public static void WriteNull(TdsMsg msg, TdsColumn column)
+    {
+        if (column.Token is NVarChar or VarBinary or Char or VarChar && column.Length == Max) msg.I64(-1);
+        else if (column.Token is NVarChar or VarBinary or Char or VarChar) msg.U16(Max);
+        else msg.U8(0);
+    }
+
     public static void WriteValue(TdsMsg msg, TdsColumn column, object? value, int payload)
     {
         if (value is null or DBNull)
         {
-            if (column.Token is NVarChar or VarBinary or Char or VarChar && column.Length == Max) msg.I64(-1);
-            else if (column.Token is NVarChar or VarBinary or Char or VarChar) msg.U16(Max);
-            else msg.U8(0);
+            WriteNull(msg, column);
             return;
         }
 
@@ -144,11 +149,11 @@ static class TdsTypes
                 return;
 
             case FloatN when column.Length == 4:
-                msg.U8(4).Raw(BitConverter.GetBytes(Convert.ToSingle(value, CultureInfo.InvariantCulture)));
+                msg.U8(4).F32(Convert.ToSingle(value, CultureInfo.InvariantCulture));
                 return;
 
             case FloatN:
-                msg.U8(8).Raw(BitConverter.GetBytes(Convert.ToDouble(value, CultureInfo.InvariantCulture)));
+                msg.U8(8).F64(Convert.ToDouble(value, CultureInfo.InvariantCulture));
                 return;
 
             case DecimalN or NumericN:
@@ -160,7 +165,7 @@ static class TdsTypes
                 return;
 
             case Date:
-                msg.U8(3).Raw(Days(AsDateTime(value)));
+                WriteDate(msg, DateOnly.FromDateTime(AsDateTime(value)));
                 return;
 
             case Time:
@@ -185,7 +190,7 @@ static class TdsTypes
         }
     }
 
-    static void WriteInteger(TdsMsg msg, int length, long value)
+    public static void WriteInteger(TdsMsg msg, int length, long value)
     {
         Span<byte> b = stackalloc byte[8];
         BinaryPrimitives.WriteInt64LittleEndian(b, value);
@@ -196,10 +201,17 @@ static class TdsTypes
     /// the precision the column declared -- so the value has to be shifted, not just copied.
     /// A HUGEINT arrives as a BigInteger and can be wider than a decimal, so it goes out as the
     /// integer it already is rather than through one it would not fit in.
-    static void WriteDecimal(TdsMsg msg, TdsColumn column, object value)
-    {
-        var integer = value as BigInteger? ?? Scaled(Convert.ToDecimal(value, CultureInfo.InvariantCulture), column.Scale);
+    static void WriteDecimal(TdsMsg msg, TdsColumn column, object value) =>
+        WriteInteger(msg, column, value as BigInteger? ??
+            Scaled(Convert.ToDecimal(value, CultureInfo.InvariantCulture), column.Scale));
 
+    public static void WriteDecimal(TdsMsg msg, TdsColumn column, decimal value) =>
+        WriteInteger(msg, column, Scaled(value, column.Scale));
+
+    /// A decimal on the wire is a sign byte and a little-endian magnitude, already scaled by what
+    /// the column declared -- so a HUGEINT, declared DECIMAL(38,0), is written as the integer it is.
+    public static void WriteInteger(TdsMsg msg, TdsColumn column, BigInteger integer)
+    {
         var magnitude = BigInteger.Abs(integer).ToByteArray(isUnsigned: true, isBigEndian: false);
         var payload = new byte[column.Length - 1];
         magnitude.AsSpan(0, Math.Min(magnitude.Length, payload.Length)).CopyTo(payload);
@@ -213,7 +225,10 @@ static class TdsTypes
         return new BigInteger(decimal.Truncate(value));
     }
 
-    static void WriteTime(TdsMsg msg, TimeSpan time)
+    public static void WriteDate(TdsMsg msg, DateOnly value) =>
+        msg.U8(3).Raw(Days(value.ToDateTime(TimeOnly.MinValue)));
+
+    public static void WriteTime(TdsMsg msg, TimeSpan time)
     {
         var length = TimeLength(FractionScale);
         Span<byte> b = stackalloc byte[8];
@@ -221,7 +236,7 @@ static class TdsTypes
         msg.U8(length).Raw(b[..length]);
     }
 
-    static void WriteDateTime2(TdsMsg msg, DateTime value)
+    public static void WriteDateTime2(TdsMsg msg, DateTime value)
     {
         var length = TimeLength(FractionScale);
         Span<byte> b = stackalloc byte[8];
@@ -229,14 +244,15 @@ static class TdsTypes
         msg.U8(length + 3).Raw(b[..length]).Raw(Days(value));
     }
 
-    static void WriteDateTimeOffset(TdsMsg msg, object value)
+    static void WriteDateTimeOffset(TdsMsg msg, object value) => WriteDateTimeOffset(msg, value switch
     {
-        var offset = value switch
-        {
-            DateTimeOffset dto => dto,
-            DateTime dt => new DateTimeOffset(dt, TimeSpan.Zero),
-            _ => new DateTimeOffset(AsDateTime(value), TimeSpan.Zero),
-        };
+        DateTimeOffset dto => dto,
+        DateTime dt => new DateTimeOffset(dt, TimeSpan.Zero),
+        _ => new DateTimeOffset(AsDateTime(value), TimeSpan.Zero),
+    });
+
+    public static void WriteDateTimeOffset(TdsMsg msg, DateTimeOffset offset)
+    {
         var utc = offset.UtcDateTime;
         var length = TimeLength(FractionScale);
 
@@ -254,7 +270,7 @@ static class TdsTypes
     /// boundary loses it its place there -- it then reads response bytes as the next length, which
     /// surfaces much later and looks like anything but this. SQL Server itself never emits one,
     /// because it fills a packet and starts a chunk in the next.
-    static void WritePlp(TdsMsg msg, byte[] value, int payload)
+    public static void WritePlp(TdsMsg msg, byte[] value, int payload)
     {
         msg.I64(value.Length);
 

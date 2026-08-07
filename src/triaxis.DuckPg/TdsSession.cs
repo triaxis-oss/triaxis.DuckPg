@@ -419,6 +419,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     long Rows(TdsMsg msg, IRows reader)
     {
         var columns = new TdsColumn[reader.FieldCount];
+        var fields = new TdsField[reader.FieldCount];
         System.Data.DataTable? schema = null;
         msg.U8(TdsToken.ColMetadata).U16(reader.FieldCount);
 
@@ -436,6 +437,11 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                         Convert.ToInt32(schema.Rows[i]["NumericPrecision"]),
                         Convert.ToInt32(schema.Rows[i]["NumericScale"]));
             }
+            // How a column's values are written is decided here rather than per row: the token and
+            // the CLR the reader hands it back in are both fixed by its DuckDB type, so the value
+            // can be read in its own type instead of going out through an `object`.
+            fields[i] = TdsField.For(reader.GetFieldType(i), columns[i]);
+
             msg.I32(0).U16(0x0001); // no user type; nullable
             TdsTypes.WriteTypeInfo(msg, columns[i]);
             msg.BVarchar(Named(reader.GetName(i)));
@@ -461,7 +467,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             row.Clear();
             row.U8(TdsToken.Row);
             for (var i = 0; i < reader.FieldCount; i++)
-                TdsTypes.WriteValue(row, columns[i], reader.IsDBNull(i) ? null : reader.GetValue(i), wire.Payload);
+                fields[i].Write(row, columns[i], reader, i, wire.Payload);
 
             // A row cut across the seam between two packets loses a client replaying a split read
             // its place, so one that does not fit ends the packet here and starts the next.

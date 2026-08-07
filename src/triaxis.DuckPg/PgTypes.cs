@@ -205,10 +205,18 @@ static class PgTypes
     /// has no point to split at -- both come down to digits and a sign.
     static void WriteNumeric(Msg msg, object value)
     {
-        var negative = value is BigInteger big ? big.Sign < 0 : Convert.ToDecimal(value) < 0;
-        var text = value is BigInteger integer
-            ? BigInteger.Abs(integer).ToString(CultureInfo.InvariantCulture)
-            : Math.Abs(Convert.ToDecimal(value)).ToString(CultureInfo.InvariantCulture);
+        if (value is BigInteger big) WriteNumeric(msg, big);
+        else WriteNumeric(msg, Convert.ToDecimal(value, CultureInfo.InvariantCulture));
+    }
+
+    public static void WriteNumeric(Msg msg, decimal value) =>
+        WriteNumeric(msg, value < 0, Math.Abs(value).ToString(CultureInfo.InvariantCulture));
+
+    public static void WriteNumeric(Msg msg, BigInteger value) =>
+        WriteNumeric(msg, value.Sign < 0, BigInteger.Abs(value).ToString(CultureInfo.InvariantCulture));
+
+    static void WriteNumeric(Msg msg, bool negative, string text)
+    {
         var point = text.IndexOf('.');
         var whole = point < 0 ? text : text[..point];
         var fraction = point < 0 ? "" : text[(point + 1)..];
@@ -248,9 +256,9 @@ static class PgTypes
         return sign == 0x4000 ? -value : value;
     }
 
-    static readonly DateTime PgEpoch = new(2000, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
+    public static readonly DateTime PgEpoch = new(2000, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
 
-    const string TimestampFormat = "yyyy-MM-dd HH:mm:ss.FFFFFF", DateFormat = "yyyy-MM-dd",
+    public const string TimestampFormat = "yyyy-MM-dd HH:mm:ss.FFFFFF", DateFormat = "yyyy-MM-dd",
                  TimeFormat = "HH:mm:ss.FFFFFF";
 
     static string FormatInterval(TimeSpan ts) =>
@@ -343,7 +351,7 @@ static class PgTypes
         json.Append('"');
     }
 
-    static byte[] ReadAll(Stream s)
+    public static byte[] ReadAll(Stream s)
     {
         using var ms = new MemoryStream();
         s.CopyTo(ms);

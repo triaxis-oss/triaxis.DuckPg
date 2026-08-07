@@ -23,6 +23,11 @@ interface IRows : IDisposable
     bool Read();
     bool IsDBNull(int ordinal);
     object GetValue(int ordinal);
+
+    /// The CLR type a column comes back as, and a read of it in that type. Together they are what
+    /// lets a protocol pick how to write a column once and then never put a value in an `object`.
+    Type GetFieldType(int ordinal);
+    T Get<T>(int ordinal);
 }
 
 /// A reader as it comes, which is what every statement but a reordered one uses.
@@ -35,6 +40,8 @@ sealed class ReaderRows(DbDataReader reader) : IRows
     public bool Read() => reader.Read();
     public bool IsDBNull(int ordinal) => reader.IsDBNull(ordinal);
     public object GetValue(int ordinal) => reader.GetValue(ordinal);
+    public Type GetFieldType(int ordinal) => reader.GetFieldType(ordinal);
+    public T Get<T>(int ordinal) => reader.GetFieldValue<T>(ordinal);
     public void Dispose() { }
 }
 
@@ -51,6 +58,7 @@ sealed class SortedRows : IRows
     readonly IValues values;
     readonly string[] names;
     readonly string[] types;
+    readonly Type[] fields;
     readonly Sorted[] keys;
 
     /// Rented, so `count` rather than `order.Length` is how many rows there are -- a pool hands back
@@ -59,32 +67,34 @@ sealed class SortedRows : IRows
     readonly int count;
     int at = -1;
 
-    SortedRows(DbDataReader reader, IValues values, string[] names, string[] types,
+    SortedRows(DbDataReader reader, IValues values, string[] names, string[] types, Type[] fields,
                Sorted[] keys, int[] order, int count) =>
-        (this.reader, this.values, this.names, this.types, this.keys, this.order, this.count) =
-        (reader, values, names, types, keys, order, count);
+        (this.reader, this.values, this.names, this.types, this.fields, this.keys, this.order, this.count) =
+        (reader, values, names, types, fields, keys, order, count);
 
     public static SortedRows Of(DbDataReader reader, Reorder reorder)
     {
         var count = reader.FieldCount;
         var names = new string[count];
         var types = new string[count];
+        var fields = new Type[count];
         for (var i = 0; i < count; i++)
         {
             names[i] = reader.GetName(i);
             types[i] = reader.GetDataTypeName(i);
+            fields[i] = reader.GetFieldType(i);
         }
 
         var keys = new Sorted[reorder.Keys.Length];
         for (var i = 0; i < keys.Length; i++)
-            keys[i] = Sorted.For(reader.GetFieldType(reorder.Keys[i]), reorder.Rows);
+            keys[i] = Sorted.For(fields[reorder.Keys[i]], reorder.Rows);
 
         var values = Values.Of(reader, reorder.Rows);
         for (var i = 0; i < keys.Length; i++) keys[i].Fill(values, reorder.Keys[i]);
 
         var order = Order(values, keys, reorder);
         var limit = reorder.Limit is { } take ? Math.Min(take, values.Rows) : values.Rows;
-        return new SortedRows(reader, values, names, types, keys, order, limit);
+        return new SortedRows(reader, values, names, types, fields, keys, order, limit);
     }
 
     /// Which position goes out where. The rows themselves never move: sorting an `int[]` touches one
@@ -123,6 +133,8 @@ sealed class SortedRows : IRows
     public bool Read() => ++at < count;
     public bool IsDBNull(int ordinal) => values.IsNull(ordinal, order[at]);
     public object GetValue(int ordinal) => values.Value(ordinal, order[at]) ?? DBNull.Value;
+    public Type GetFieldType(int ordinal) => fields[ordinal];
+    public T Get<T>(int ordinal) => values.Key<T>(ordinal, order[at]);
 
     public void Dispose()
     {

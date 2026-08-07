@@ -557,6 +557,14 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     {
         var sent = 0;
         var row = new Msg();
+
+        // How each column is written is decided once here: the OID and the CLR type the reader hands
+        // it back in are both fixed by its DuckDB type, so a value goes out in its own type rather
+        // than through an `object` -- which on a wide result is a box a row a column.
+        var fields = new PgField[columns.Length];
+        for (var i = 0; i < columns.Length; i++)
+            fields[i] = PgField.For(reader.GetFieldType(i), columns[i].Oid, columns[i].Binary);
+
         while (reader.Read())
         {
             row.Clear();
@@ -565,9 +573,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
             {
                 if (reader.IsDBNull(i)) { row.I32(-1); continue; }
                 var at = row.BeginField();
-                var value = reader.GetValue(i);
-                if (columns[i].Binary) PgTypes.WriteBinary(row, columns[i].Oid, value);
-                else PgTypes.WriteText(row, value);
+                fields[i].Write(row, reader, i);
                 row.EndField(at);
             }
             wire.Send('D', row);
