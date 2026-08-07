@@ -27,6 +27,13 @@ sealed record LayerSource(int Seq, LayerFormat Format, string Path, string[] Par
     public bool HasFileName => !Converted;
 }
 
+/// What one non-parquet layer file's root turned out to be. Read once, because it answers two
+/// questions about the same parse: how the file's rows are laid out, and whether that layout is one
+/// that publishes something nobody meant. `Wraps` names the single key a sequence of mappings sits
+/// under -- a file that publishes as one row of one list, and the shape a hand-written layer is
+/// most often wrong in.
+sealed record YamlShape(bool Keyed = false, string? Wraps = null, int Wrapped = 0);
+
 /// Reads layer directories: what tables they hold, and their rows into DuckDB.
 static class Layer
 {
@@ -145,17 +152,24 @@ static class Layer
         $"({SqlText.Literal(glob.Replace('\\', '/'))}, union_by_name=true, filename=true, " +
         $"hive_partitioning={(hive ? "true" : "false")})";
 
+    /// Each of a source's files with the root it turned out to have. Parquet carries its own shape
+    /// and is never in question; everything else is decided by looking at the files, and the reading
+    /// is done here rather than where each answer is needed so that one parse answers both. It is
+    /// paid whether or not a key is configured, which the keyed reading alone was not: a file is the
+    /// wrong shape either way, and that is what the parse is for now.
+    public static List<(string File, YamlShape Shape)> Shapes(LayerSource? source) =>
+        source is null || source.Format == LayerFormat.Parquet ? []
+            : [.. Yaml.Expand(source.Path).Select(file => (file, Yaml.Shape(file)))];
+
     /// The source as it should be read given the key the table would take its mapping keys into --
     /// unchanged where the files are ordinary sequences of rows, or where the table has no single
     /// column for a mapping key to fill. A mapping key is one value, so a composite key cannot come
     /// out of one and the question is not asked.
     ///
-    /// Parquet carries its own shape and is never in question. Everything else is decided by looking
-    /// at the files: a source whose files disagree is converted whole, and each file is then read as
-    /// whatever it is.
-    public static LayerSource? Keyed(LayerSource? source, string? key) =>
-        source is null || key is null || source.Format == LayerFormat.Parquet
-        || !Yaml.Expand(source.Path).Any(Yaml.IsKeyed)
+    /// A source whose files disagree is converted whole, and each file is then read as whatever it is.
+    public static LayerSource? Keyed(LayerSource? source, string? key,
+                                     List<(string File, YamlShape Shape)> shapes) =>
+        source is null || key is null || !shapes.Any(s => s.Shape.Keyed)
             ? source
             : source with { KeyedBy = key };
 
@@ -182,7 +196,12 @@ static class Layer
 
     /// Non-parquet layers are materialized once, so a query neither re-parses the file nor pays
     /// inference again. Parquet is scanned in place -- that is what the format is for.
-    public static List<Column> Materialize(DuckDBConnection conn, string target, LayerSource source)
+    ///
+    /// The rows come back with the columns because they are what the layer turned out to hold, and
+    /// counting a table already in memory costs nothing -- which is only true here, and is why a
+    /// parquet layer is not counted at all.
+    public static (List<Column> Columns, long Rows) Materialize(DuckDBConnection conn, string target,
+                                                                LayerSource source)
     {
         List<Column> columns = [];
         Read(source, glob =>
@@ -193,7 +212,10 @@ static class Layer
             Exec(conn, $"CREATE OR REPLACE TABLE {target} AS SELECT {string.Join(", ", projection)} " +
                        $"FROM {Query(source, glob, source.Hive)}");
         });
-        return columns;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT count(*) FROM {target}";
+        return (columns, Convert.ToInt64(cmd.ExecuteScalar()));
     }
 
     public static List<Column> Columns(DuckDBConnection conn, LayerSource source)
@@ -285,14 +307,22 @@ static class Yaml
         return Path.Combine(scratch, Path.GetRelativePath(root, glob) + ".json");
     }
 
-    /// A file whose rows are the entries of one mapping -- the row's key as the entry's key, the rest
-    /// of the row as its value -- rather than a sequence of rows. Every value has to be a mapping for
-    /// that reading to hold: one that is not means the document is a single row whose columns happen
-    /// to include a nested one, which is what an object-rooted JSON file has always been.
+    /// What a file's root is, as far as anything above this needs to know.
+    ///
+    /// `Keyed` is a file whose rows are the entries of one mapping -- the row's key as the entry's
+    /// key, the rest of the row as its value -- rather than a sequence of rows. Every value has to be
+    /// a mapping for that reading to hold: one that is not means the document is a single row whose
+    /// columns happen to include a nested one, which is what an object-rooted JSON file has always
+    /// been.
+    ///
+    /// `Wraps` is that same single row in the one shape that is almost never meant: exactly one key,
+    /// holding the sequence of mappings whoever wrote the file was writing as the rows. It is read
+    /// here rather than guessed at later, and nothing is done about it but say so -- unwrapping it
+    /// would answer a file that really does carry one list column with rows it does not have.
     ///
     /// A sequence root is the ordinary shape and is ruled out on the first character, so the parse is
-    /// only paid by a file that might actually be keyed.
-    public static bool IsKeyed(string path)
+    /// only paid by a file that might actually be one of these.
+    public static YamlShape Shape(string path)
     {
         using (var peek = File.OpenText(path))
             for (int c; (c = peek.Read()) >= 0;)
@@ -301,15 +331,23 @@ static class Yaml
                 // `-` opens a YAML sequence entry, but `---` opens a document -- and that document
                 // may still be a mapping.
                 if (c == '[' || (c == '-' && peek.Peek() is var next && (next < 0 || char.IsWhiteSpace((char)next))))
-                    return false;
+                    return new YamlShape();
                 break;
             }
 
         var yaml = new YamlStream();
         using (var text = File.OpenText(path)) yaml.Load(text);
-        return yaml.Documents is [{ RootNode: YamlMappingNode root }, ..]
-               && root.Children.Count > 0
-               && root.Children.Values.All(value => value is YamlMappingNode);
+        if (yaml.Documents is not [{ RootNode: YamlMappingNode root }, ..] || root.Children.Count == 0)
+            return new YamlShape();
+
+        if (root.Children.Values.All(value => value is YamlMappingNode)) return new YamlShape(Keyed: true);
+        if (root.Children.Count != 1) return new YamlShape();
+
+        var (name, value) = root.Children.First();
+        return value is YamlSequenceNode rows && rows.Children.Count > 0
+               && rows.Children.All(row => row is YamlMappingNode)
+            ? new YamlShape(Wraps: (name as YamlScalarNode)?.Value ?? name.ToString(), Wrapped: rows.Children.Count)
+            : new YamlShape();
     }
 
     public static void Discard(string converted)

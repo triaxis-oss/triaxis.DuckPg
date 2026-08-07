@@ -125,7 +125,8 @@ public class ServeCommand : LoggingCommand
         foreach (var table in lake.Catalog.Tables.Values)
             Logger.LogInformation("{Schema}.{Table} <- {Layers}{Writable}{Virtual}",
                 table.Schema, table.Name,
-                table.Layers.Count == 0 ? "(declared only)" : string.Join(" | ", table.Layers.Select(l => l.Source.Path)),
+                table.Layers.Count == 0 ? "(declared only)"
+                    : string.Join(" | ", table.Layers.Select(l => $"{l.Source.Path} {l.Shape}")),
                 table.Writable ? " [writable]" : "",
                 table.Virtuals.Count > 0 ? " +" + string.Join(",", table.Virtuals.Select(v => v.Name)) : "");
 

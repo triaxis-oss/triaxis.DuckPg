@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Npgsql;
 
 namespace triaxis.DuckPg.Tests;
@@ -111,11 +112,19 @@ sealed class TestLake : IDisposable
     /// say. Called before the services duckpg registers, so it can replace any of them.
     public Action<IServiceCollection>? Services { get; set; }
 
+    /// What the lake said while it was starting, most recent start only. A warning is the whole of
+    /// what some mistakes get -- the lake still publishes what it was always going to publish -- so
+    /// a test has to be able to read one back.
+    public List<string> Logged { get; } = [];
+
     public TestLake Start()
     {
+        Logged.Clear();
+
         var services = new ServiceCollection();
         Services?.Invoke(services);
         services.AddDuckPg(Config);
+        services.AddLogging(builder => builder.AddProvider(new Capture(Logged)));
 
         provider = services.BuildServiceProvider();
         lake = provider.GetRequiredService<Lake>();
@@ -207,5 +216,21 @@ sealed class TestLake : IDisposable
     {
         Stop();
         try { Directory.Delete(Root, recursive: true); } catch (IOException) { }
+    }
+
+    /// Every message the lake logs, rendered, into a list a test can read.
+    sealed class Capture(List<string> messages) : ILoggerProvider, ILogger
+    {
+        public ILogger CreateLogger(string category) => this;
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel level) => true;
+
+        public void Log<TState>(LogLevel level, EventId id, TState state, Exception? error,
+                                Func<TState, Exception?, string> message)
+        {
+            lock (messages) messages.Add($"{level}: {message(state, error)}");
+        }
+
+        public void Dispose() { }
     }
 }
