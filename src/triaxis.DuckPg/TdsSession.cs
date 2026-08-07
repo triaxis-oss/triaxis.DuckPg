@@ -239,7 +239,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     {
         var context = new TSqlContext(gateway.Config.Schema, Variables(),
             (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"],
-            gateway.Catalog.Types, gateway.Catalog.Functions);
+            gateway.Catalog.Types, gateway.Catalog.Functions, false,
+            gateway.Config.SortSmallTables ? gateway.Catalog.Rows : null);
         var statements = TSqlTranslator.Translate(sql, context);
 
         if (statements.Count == 0)
@@ -251,17 +252,19 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         for (var i = 0; i < statements.Count; i++)
         {
             var last = i == statements.Count - 1;
-            var plan = gateway.Translate(statements[i]);
-            Execute(msg, plan, parameters, last ? doneToken : TdsToken.DoneInProc, last);
+            var plan = gateway.Translate(statements[i].Sql);
+            Execute(msg, plan, parameters, last ? doneToken : TdsToken.DoneInProc, last,
+                    statements[i].Reorder);
         }
     }
 
-    void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last)
+    void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last,
+                 Reorder? reorder = null)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
         try
         {
-            Perform(msg, plan, parameters, doneToken, last);
+            Perform(msg, plan, parameters, doneToken, last, reorder);
         }
         finally
         {
@@ -278,7 +281,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         gateway.ExitTurn();
     }
 
-    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last)
+    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken,
+                 bool last, Reorder? reorder)
     {
         Checked(plan, parameters);
 
@@ -301,7 +305,14 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
                 using var command = Command(plan.Steps[^1], parameters);
                 using var reader = Execute(command);
-                var rows = Rows(msg, reader);
+
+                // The ordering and the limit were taken off the statement before it was sent, so
+                // they are applied to what came back -- and only ever for a table the catalog
+                // counted small, which is what bounds how much is held to do it.
+                using var result = reorder is null ? new ReaderRows(reader)
+                                                  : (IRows)SortedRows.Of(reader, reorder);
+                var rows = Rows(msg, result);
+                gateway.Grew(plan, (int)rows);
                 if (plan.Steps.Length > 1) Persist(plan);
 
                 rowCount = rows;
@@ -323,6 +334,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                     using var command = Command(query, parameters);
                     affected = Convert.ToInt32(command.ExecuteScalar());
                 }
+
+                gateway.Grew(plan, affected);
 
                 logger.LogDebug("{Tag} {Affected} in {Elapsed:0.0} ms",
                     plan.Tag, affected, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
@@ -403,7 +416,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// one byte. Cut where SQL Server cuts.
     static string Named(string name) => name.Length <= 128 ? name : name[..128];
 
-    long Rows(TdsMsg msg, DbDataReader reader)
+    long Rows(TdsMsg msg, IRows reader)
     {
         var columns = new TdsColumn[reader.FieldCount];
         System.Data.DataTable? schema = null;
@@ -417,7 +430,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             // too and has neither, so the shape it was described with stands.
             if (columns[i].Token == TdsTypes.DecimalN)
             {
-                schema ??= reader.GetSchemaTable();
+                schema ??= reader.Schema;
                 if (schema!.Rows[i]["NumericPrecision"] is not DBNull)
                     columns[i] = TdsTypes.Decimal(
                         Convert.ToInt32(schema.Rows[i]["NumericPrecision"]),

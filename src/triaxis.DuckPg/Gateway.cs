@@ -154,6 +154,17 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// Writes a table's write layer back to its file. Called once a write is committed, so a
     /// rolled-back statement never reaches the disk. A materialized lake has no write layer and
     /// keeps nothing: what it holds goes out once, at shutdown, as a delta.
+    /// What an insert added, told to the catalog so a table that outgrows `FastOrder.Small` stops
+    /// being sorted here. Only an insert: a materialized table's UPDATE is an evict and a re-insert
+    /// of the same rows and its DELETE only removes, so counting either would push a table nothing
+    /// grew past the threshold and cost it the fast path for the life of the process.
+    public void Grew(Plan plan, int rows)
+    {
+        if (plan.Tag != "INSERT" || plan.Dirty is not { Length: > 0 } dirty) return;
+        lock (gate)
+            foreach (var table in dirty) Catalog.Grew(table, rows);
+    }
+
     public void Persist(string name)
     {
         lock (gate)

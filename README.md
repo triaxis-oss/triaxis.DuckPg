@@ -63,7 +63,7 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
 `--write-format`, `--writable`, `--materialize`, `--store`, `--store-mode`,
-`--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
+`--no-sort-small-tables`, `--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
 `--cache` and `--config` each override the file when both are given; argument paths are relative to
 the working directory, file paths to the file. A file named explicitly with `--config` must exist,
 so a typo is an error rather than a silent fallback to defaults.
@@ -692,6 +692,7 @@ variables and the tool's usual override files layer over it for free.
 | `materialize` | `--materialize` | Collapse the layers into real tables; a delta goes out at shutdown. |
 | `store` | `--store` | DuckDB database file a materialized lake's tables live in, rather than memory. |
 | `storeMode` | `--store-mode` | `Keep` (default): the file is the state. `Spill`: only where the tables live. |
+| `sortSmallTables` | `--no-sort-small-tables` | Sort and limit a small materialized table's rows here rather than in DuckDB. On by default; the flag turns it off. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |

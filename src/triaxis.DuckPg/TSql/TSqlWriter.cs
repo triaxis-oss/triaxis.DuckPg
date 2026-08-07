@@ -19,7 +19,11 @@ sealed record TSqlContext(
     IReadOnlySet<string>? Functions = null,
     /// Set while rendering one of those macros' own bodies, where `@parameter` is the macro's
     /// parameter -- an identifier -- rather than a value the caller bound.
-    bool Macro = false);
+    bool Macro = false,
+    /// How many rows a table holds, for the tables held as tables and small enough to sort here
+    /// rather than in DuckDB. Null where nothing is offered that, which is every lake but a
+    /// materialized one.
+    Func<string, long?>? Small = null);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.

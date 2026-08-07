@@ -19,7 +19,7 @@ public class TSqlTests
             new HashSet<string>(parameters, StringComparer.OrdinalIgnoreCase),
             "sa");
 
-        return string.Join("; ", TSqlTranslator.Translate(sql, context));
+        return string.Join("; ", TSqlTranslator.Translate(sql, context).Select(t => t.Sql));
     }
 
     [Theory]
@@ -91,7 +91,7 @@ public class TSqlTests
                     { ["flag"] = "BOOLEAN", ["n"] = "INTEGER", ["amount"] = "DECIMAL(18,2)" },
                 ["u"] = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                     { ["flag"] = "INTEGER", ["id"] = "INTEGER" },
-            })));
+            })).Select(t => t.Sql));
 
         Assert.Equal("""SELECT "n" * CAST("flag" AS INTEGER) FROM "lake"."t" """.Trim(),
             Translated("SELECT n * flag FROM t"));

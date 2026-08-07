@@ -45,6 +45,20 @@ public sealed class Config
     /// and discarding it silently would be the worse surprise.
     public StoreMode StoreMode { get; set; } = StoreMode.Keep;
 
+    /// Sort and limit a small materialized table's rows here rather than in DuckDB. DuckDB's sort
+    /// costs what a row is *wide* rather than what a table is long -- ~1.3 ms plus ~50 µs a column,
+    /// unchanged between twelve rows and twelve hundred -- so on the table an ORM keeps asking about
+    /// it is most of the query. Only where the table is held as a table and was counted small when it
+    /// was built, since the statement goes out without its `TOP` and there is no falling back once it
+    /// has. Everything else is left exactly as it was.
+    ///
+    /// On, because what it can get wrong is how fast the answer comes rather than what the answer is:
+    /// a bound that is too low sends the statement without its limit and a result too big to address
+    /// in place is read out instead, which is slower and still right. The one thing it decides
+    /// differently from DuckDB is which of two rows tied on the sort key comes first, and SQL leaves
+    /// that unspecified in both.
+    public bool SortSmallTables { get; set; } = true;
+
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
     /// after that is invisible to it for as long as it lives -- and it cannot create one itself

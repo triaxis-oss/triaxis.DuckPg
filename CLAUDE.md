@@ -32,6 +32,7 @@ publish a temp-directory convention as API.
 | `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
 | `HostFunctions.cs` | The SQL Server functions answered in .NET: `pwdencrypt`, `pwdcompare`, `CONVERT` styles. |
 | `SqlText.cs` | Enough SQL scanning to find top-level keywords without a parser. |
+| `SortedRows.cs` | `IRows`, and a result held and sorted here rather than by DuckDB. |
 | `DuckDbLibrary.cs` | Finding the machine's DuckDB, and the AOT dependencies DuckDB.NET needs. |
 | `DuckDbDownload.cs` | Fetching that library from DuckDB's releases, when asked and only then. |
 
@@ -227,6 +228,89 @@ publish a temp-directory convention as API.
   `DuckDBDataReader`'s internal constructor through `UnsafeAccessor` to stay AOT-clean, and the
   measurements showing 2.5x against a table and 2.8x against a merge view -- was built and taken back
   out; it is not in the tree. What it cannot do is be correct.
+- **A sort costs what a row is wide, not what a table is long, and that is what `SortSmallTables`
+  takes back.** Measured: adding `ORDER BY` to a 68-column statement costs ~3.9 ms at twelve rows and
+  ~3.6 ms at twelve hundred -- flat in rows, ~1.3 ms fixed plus ~50 µs a column -- because DuckDB's
+  sort operator carries the whole payload. On the table an ORM keeps asking about, that is most of
+  the query. `FastOrder.Of` takes the `ORDER BY` and the `TOP` off the *tree*, `SortedRows` applies
+  them to what came back, and what DuckDB is asked for is the filtered scan.
+- **What `SortedRows` holds is an `int[]` of positions and the sort keys, and nothing else.** A
+  materialized DuckDB result is already columnar and already in memory, so the rows do not have to be
+  taken out of it to be reordered -- `Chunk` reads a value straight out of the vector by position when
+  the row is written, which is why the *width* of a table costs nothing: a hundred columns nobody
+  sorts by are never touched until the rows that survived the limit go out. Holding them instead was
+  measured at 27% of everything this allocated and turned `get the last few` -- rows arriving in the
+  reverse of the asked-for order, so every one displaces the last -- into reading the whole table:
+  1.6x at a thousand rows and a hundred columns against 3.1x now. Sort keys *are* held, in an array of
+  their own type, because reading a value out of a vector costs ~30 ns whichever way it is asked for
+  and a sort asks for each one about `log n` times; ~30 ns is the driver's decode, not the access, so
+  a boxed read costs the same as a typed one and only the caching matters. Measured against DuckDB
+  doing the whole statement:
+
+  | | 1 column | 10 columns | 100 columns |
+  |---|---|---|---|
+  | `TOP 1`, 10 rows | 3.6x | 3.8x | 3.5x |
+  | `TOP 1`, 1000 rows | 3.3x | 3.5x | 3.1x |
+  | `TOP 1`, 2048 rows | 3.2x | 2.9x | 2.7x |
+  | `ORDER BY` alone, 1000 rows | 1.6x | 1.7x | 1.6x |
+  | `ORDER BY` alone, 2048 rows | 1.5x | 1.5x | 1.3x |
+
+  What is left is rented: the positions and the sort keys come from `ArrayPool` and go back on
+  dispose, which is why `IRows` is disposable at all. A pooled array is longer than it was asked for
+  -- hence `count` rather than `order.Length`, and a span sorted over the part that holds the result
+  -- and it is not cleared, which is safe only because every slot up to that length is written before
+  it is read. Keys are returned cleared, since one may be a reference and the pool outlives the
+  result. Profiled over the matrix, this path allocated ~410 MB of 1396 before and ~12 MB of 963
+  after, all of the remainder being metadata a statement needs once.
+
+- **`FastOrder.Small` is 2048 because a data chunk is**, and one chunk is what can be addressed in
+  place. Past it the reader keeps only the chunk it is on, the rows have to be copied out, and it is a
+  cliff rather than a slope: 2.9x at 2048 rows and 0.3x at 4096, both at a hundred columns. So the
+  count is asked of the *result* before a row is read -- `Values.Of` picks `Chunk` or `Copy` while
+  nothing has been consumed, which is the only moment the choice can still be made. `Copy` exists for
+  a result that is split for some other reason; a scan wide enough to run in parallel returns 41
+  chunks for a thousand rows, and no table this path is taken for is anywhere near that.
+- **The vectors are reached by reflection, and that is not the AOT problem it sounds like.** The
+  field is `VectorDataReaderBase[]` -- an internal element type, which `UnsafeAccessor` cannot name
+  and .NET 10's `UnsafeAccessorType` refuses for an array. A literal `typeof` with a literal field
+  name is a shape ILLink resolves and keeps the field for, so it builds clean under `IsAotCompatible`
+  with warnings as errors; the repo's rule is against reflection-based *serialization*, which this is
+  not. What it has to survive is the driver renaming the field, so a miss falls back to `Copy` instead
+  of throwing, and `ChunkTests` pins both branches -- a rename would otherwise cost the whole point of
+  the path and pass every other test. The rest is public: `DuckDBResultChunkCount` and `DuckDBResult`
+  are, and `IDuckDBDataReader` -- with `IsValid(offset)` and `GetValue<T>(offset)` -- is the interface
+  those internal readers implement.
+- **It is on, and the opt-out is `--no-sort-small-tables`.** What it can get wrong is how fast the
+  answer comes rather than what the answer is: every way the bounds can be wrong degrades to a whole
+  scan answered out of `Copy`, which is slower and still right. The one thing it decides differently
+  from DuckDB is which of two rows tied on the sort key comes first -- both sorts are unstable and
+  SQL leaves it unspecified either way. That is also why the suite is worth more than it looks: with
+  the default on, every materialized-lake test in it runs through this path rather than around it.
+- **Three things bound the path.** The table has to be **materialized and counted small at build**,
+  since the statement goes out without its `TOP` and there is no falling back once it has: guessing a
+  size and retrying would fetch the whole table on `get the last few`, which is the shape that matters
+  most. The count is taken once when the table is built and grown by what an insert says it wrote --
+  and *only* by an insert: a materialized table's UPDATE is an evict and a re-insert of the same rows
+  and its DELETE only removes, so counting either would push a table nothing grew past the threshold
+  and cost it the fast path for the life of the process. `Gateway.Grew` is where both sessions say so,
+  and a count that is never told is the worst failure this has: the table still qualifies, the whole
+  scan still goes out without its limit, and past 2048 rows `Copy` answers -- measured by someone
+  else as 3x *slower* than leaving it off, which is exactly what the number says it should be.
+  And the sort key has to be a **number or an instant**: text is a collation DuckDB owns and
+  `string.CompareTo` is not it, so text is left where it works. Nulls sort last either direction,
+  which is DuckDB's `default_null_order` rather than SQL Server's -- the lake renders the clause
+  through today, so DuckDB is what this has to agree with.
+- **A number is not always ordered the same in both, and NaN is where they part.** DuckDB sorts it
+  as the largest value there is -- ahead of infinity, behind only a null, and flipping with the
+  direction the way any other value does. .NET's `CompareTo` puts it *below* negative infinity. So
+  `Real<T>` orders the two float types itself and `Sorted<T>.Order` is virtual for it. What makes
+  this the kind of thing `OrderingTests` cannot catch is that no layer file can hold a NaN, so
+  `SortKeyTests` asks DuckDB for the order of a list holding one and compares the key against it.
+  `-0.0` is the case that looked the same and is not a problem: DuckDB reads it equal to `0.0` and
+  `CompareTo` answers 0 as well, so nothing has to be done about it.
+  `OrderingTests` is the whole guarantee: every shape asked of both paths and compared, nulls and ties
+  included. `OrderingUseTests` reads what was actually sent, since that comparison passes just as well
+  when the fast path never fires.
 - **A view is bound on every execution, not once when the lake is built.** Everything above is why:
   every expression in a view definition is paid for by every query touching it. Hence no cast to the
   type a layer already has, no merge wrapper around a table only one layer carries, `--cache` writing

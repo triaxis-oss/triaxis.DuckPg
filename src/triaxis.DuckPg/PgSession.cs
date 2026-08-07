@@ -420,6 +420,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
                     SendRowDescription(reader, columns);
                     total = Stream(reader, 0, columns);
                 } while (reader.NextResult());
+                gateway.Grew(plan, total);
                 wire.Send('C', new Msg().Str($"SELECT {total}"));
                 return;
             }
@@ -438,6 +439,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
                     using var command = Command(query, arguments);
                     affected = Convert.ToInt32(command.ExecuteScalar());
                 }
+                gateway.Grew(plan, affected);
                 logger.LogDebug("{Tag} {Affected} in {Elapsed:0.0} ms",
                     plan.Tag, affected, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
                 transactionStatus = plan.Tag switch

@@ -72,6 +72,13 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// layers, which no write touches -- so it stays underneath the write branch.
     readonly Dictionary<string, string> copies = new(StringComparer.OrdinalIgnoreCase);
 
+    /// How many rows each materialized table holds, as an upper bound. Taken once when the table is
+    /// built and grown by what an insert says it added -- nothing else makes a table bigger, so the
+    /// bound stays true for the life of the process without ever costing a query. Only materialized
+    /// tables are counted: on a merge view `count(*)` is the whole merge, which is more than the
+    /// question is worth.
+    readonly Dictionary<string, long> rows = new(StringComparer.OrdinalIgnoreCase);
+
     bool flushed;
 
     /// Schema holding the materialized YAML and JSON layers.
@@ -147,10 +154,21 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     public void Rebuild(DuckDBConnection conn)
     {
         Tables.Clear();
+        rows.Clear();
         promoted.Clear();
         tombstoned.Clear();
         copies.Clear();
         Build(conn);
+    }
+
+    /// The upper bound on a materialized table's rows, or null for anything not counted.
+    public long? Rows(string name) => rows.TryGetValue(name, out var bound) ? bound : null;
+
+    /// What an insert said it wrote. Only ever grows the bound, so it stays an upper bound even
+    /// where the count is not exact.
+    public void Grew(string name, int added)
+    {
+        if (added > 0 && rows.TryGetValue(name, out var bound)) rows[name] = bound + added;
     }
 
     public Table? Resolve(string? schema, string name) =>
@@ -476,7 +494,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                         throw new InvalidOperationException($"a view is one query, not {translated.Count}");
 
                     Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} " +
-                                  $"AS {translated[0]}");
+                                  $"AS {translated[0].Sql}");
                     pending.Remove(name);
                     published++;
                 }
@@ -762,6 +780,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                     "schema, and rebuilding it here would discard what has been written to it");
 
             promoted.Add(table.Name);
+            rows[table.Name] = Count(conn, table);
             foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             return;
         }
@@ -781,6 +800,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
         // Nothing is earned here: the branch a write would have to make is the table itself.
         promoted.Add(table.Name);
+        rows[table.Name] = Count(conn, table);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
     }
 
@@ -789,6 +809,13 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// the file already carries, and whether a delta is written at shutdown -- and they have to be
     /// the same answer, or the run either loses its writes or writes them down twice.
     bool Keeping => config.Store is { Length: > 0 } && config.StoreMode == StoreMode.Keep;
+
+    static long Count(DuckDBConnection conn, Table table)
+    {
+        using var command = conn.CreateCommand();
+        command.CommandText = $"SELECT count(*) FROM {table.QualifiedName}";
+        return Convert.ToInt64(command.ExecuteScalar());
+    }
 
     /// The columns a store already holds for a table, in order, or nothing when it holds no such
     /// table. A view is not a table: a store written by a build that is no longer this one may carry
