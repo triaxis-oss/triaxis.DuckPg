@@ -63,7 +63,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
 `--write-format`, `--writable`, `--materialize`, `--store`, `--store-mode`,
-`--no-sort-small-tables`, `--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
+`--no-sort-small-tables`, `--no-check-keys`, `--serialize-transactions`, `--schema`,
+`--key` (repeatable), `--dacpac`,
 `--cache` and `--config` each override the file when both are given; argument paths are relative to
 the working directory, file paths to the file. A file named explicitly with `--config` must exist,
 so a typo is an error rather than a silent fallback to defaults.
@@ -282,13 +283,27 @@ sits under `/data/tenant=acme/` does not grow a stray `tenant` column.
 `--write ./local` (or `write:` in the file) makes one directory the topmost layer and the only one
 that accepts writes:
 
-- `INSERT` appends to the write layer.
+- `INSERT` appends to the write layer, and refuses a key the table already publishes — whichever
+  layer holds it, and whether or not the write layer has a copy of its own. So does one statement
+  carrying the same key twice. The check is over the *merged view*, like a reference's, and it runs
+  before any row lands; a key the lake generates is not checked, since it cannot collide with one it
+  generated before.
 - `DELETE` removes the row from the write layer and records its key in `local/.deleted/<table>`,
   which hides that row in every layer below.
 - `UPDATE` computes the new rows first, then replaces them in the write layer, where they shadow
   whatever is beneath. Only an update that *moves* a row's key leaves the old key behind with
   nothing above it, and only that one records a tombstone. A `FROM` clause joins the target to
-  somewhere else for its new values, which is also what a matched-only `MERGE` becomes.
+  somewhere else for its new values, which is also what a matched-only `MERGE` becomes. A key moved
+  onto one the lake already publishes is refused, as is a join that matches a row twice — both would
+  leave two rows under one key. A key that moves onto one this same statement is taking away is not:
+  `SET id = id + 1` over a whole table shifts it.
+
+Keeping that rule costs one scan of what the table publishes, per insert and per key-moving update —
+on a layered lake that is the merge, and there is no index over a merge, so it is most of what a
+write costs. `--no-check-keys` gives it back to a lake whose writers are known to be sending fresh
+keys, a bulk load out of a trusted source above all; what returns with it is the old behaviour, which
+is not even the same in both modes — layered, the written row shadows the one below it, and
+materialized, both stay. Reads, deletes and ordinary updates never paid it either way.
 
 A write is persisted as soon as DuckDB commits it — immediately for a bare statement, at `COMMIT`
 for one inside a transaction, and never for one that is rolled back. Restarting the gateway reads
@@ -722,6 +737,7 @@ variables and the tool's usual override files layer over it for free.
 | `store` | `--store` | DuckDB database file a materialized lake's tables live in, rather than memory. |
 | `storeMode` | `--store-mode` | `Keep` (default): the file is the state. `Spill`: only where the tables live. |
 | `sortSmallTables` | `--no-sort-small-tables` | Sort and limit a small materialized table's rows here rather than in DuckDB. On by default; the flag turns it off. |
+| `checkKeys` | `--no-check-keys` | Refuse a write that would put two rows under one declared key. On by default; the flag turns it off. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |

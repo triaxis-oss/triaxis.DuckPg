@@ -11,7 +11,7 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// A query that must find nothing, and what to say when it does. What a check stands for is a rule
 /// the layers keep rather than DuckDB: a constraint over the merged view is not one a table can
 /// declare, since the row it protects may live in any layer.
-sealed record Check(string Sql, string Message);
+sealed record Check(string Sql, string Message, string SqlState);
 
 sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string[]? Dirty = null,
                    string[]? Promoted = null, string[]? Tombstoned = null, Check[]? Checks = null)
@@ -209,26 +209,91 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         else
             RejectVirtual(table, columnList, "INSERT");
 
-        if (SqlText.FindKeyword(rest, "RETURNING") is var returning && returning > 0)
-            return RewriteReturning(table, columnList!, rest, returning);
+        // The names the rows arrive under, whether the statement gave them or the table did -- which
+        // is what says whether the key is among them.
+        List<string> columns = columnList ?? [.. table.Columns.Select(c => c.Name)];
+        var returning = SqlText.FindKeyword(rest, "RETURNING");
+
+        // Only where the statement carries every key column: a key the store generates cannot
+        // collide with one it generated before, and one the statement leaves out is not there to
+        // compare.
+        var duplicates = table.Key.All(k => columns.Contains(k, StringComparer.OrdinalIgnoreCase))
+            ? Duplicates(table, $"SELECT {KeyList(table)} FROM {Source(columns, returning > 0 ? rest[..returning] : rest)}")
+            : [];
+
+        if (returning > 0)
+            return RewriteReturning(table, columns, rest, returning, duplicates);
 
         // A declared identity the statement leaves out is filled where every other value comes
         // from -- in the rows being written, so the same statement decides it and writes it.
-        if (columnList is not null && Generated(table, columnList) is { Count: > 0 } generated)
+        if (Generated(table, columns) is { Count: > 0 } generated)
         {
             var source = rest[(MatchingParen(rest) + 1)..].Trim();
-            rest = $"({string.Join(", ", columnList.Select(SqlText.Quote).Concat(Quoted(generated)))}) " +
+            rest = $"({string.Join(", ", columns.Select(SqlText.Quote).Concat(Quoted(generated)))}) " +
                    $"SELECT *, {string.Join(", ", NextValues(table, generated))} FROM ({source}) AS \"_rows\"";
         }
 
-        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}") with { Dirty = [table.Name] });
+        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}")
+            with { Dirty = [table.Name], Checks = duplicates });
     }
+
+    /// A declared key is a rule about rows that may live in any layer, so it is kept here rather than
+    /// by DuckDB. The write branch's own PRIMARY KEY sees only what this process wrote -- a key a
+    /// file below already holds is one it lets through, and the row then quietly shadows the file's
+    /// instead of being refused. A materialized table carries no constraint at all: it is built as a
+    /// copy of the merge, and `CREATE TABLE AS` keeps no key. So both halves are asked of the rows
+    /// a statement is about to write: a key the table already publishes, and one the rows repeat
+    /// among themselves.
+    ///
+    /// `keys` produces the key each row will land under, and -- where the statement replaces rows as
+    /// it writes them, which an UPDATE does -- the key each is taking away beside it. A row landing
+    /// on a key that is going is landing on nothing; without that half, a key that merely stayed
+    /// where it was would read as a collision with the row it belongs to.
+    ///
+    /// A semi join rather than a correlated EXISTS, and the source read once into a materialized CTE:
+    /// what this costs is then one scan of what the table publishes, which for a layered lake is the
+    /// merge and is the floor. Measured on a two-layer 25k-row lake: 6.95 ms for the insert form
+    /// against 6.45 for a bare `count(*)` over the same view, where a correlated EXISTS cost 7.62;
+    /// and 10.87 for the update form against 15.89 for the same question asked with three scans.
+    Check[] Duplicates(Table table, string keys, bool replacing = false)
+    {
+        if (table.Key.Length == 0 || !Config.CheckKeys) return [];
+
+        var matched = string.Join(" AND ", table.Key.Select(k =>
+            $"t.{SqlText.Quote(k)} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"));
+        var kept = replacing
+            ? $" ANTI JOIN (SELECT {string.Join(", ", table.Key.Select(k => SqlText.Quote(Was(k))))} " +
+              "FROM \"_keys\") AS o ON " +
+              string.Join(" AND ", table.Key.Select(k =>
+                  $"o.{SqlText.Quote(Was(k))} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"))
+            : "";
+
+        return [new Check(
+            $"WITH \"_keys\" AS MATERIALIZED ({keys}) " +
+            $"SELECT 1 FROM (SELECT {KeyList(table)}, count(*) AS \"_count\" FROM \"_keys\" " +
+            $"GROUP BY {KeyList(table)}) AS r WHERE r.\"_count\" > 1 " +
+            $"UNION ALL SELECT 1 FROM \"_keys\" AS r " +
+            $"SEMI JOIN {table.QualifiedName} AS t ON {matched}{kept} LIMIT 1",
+            $"Violation of PRIMARY KEY constraint on \"{table.Name}\". Cannot insert duplicate key in object " +
+            $"\"{Config.Schema}.{table.Name}\".",
+            "23505")];
+    }
+
+    static string KeyList(Table table) => string.Join(", ", table.Key.Select(SqlText.Quote));
+
+    /// What a key was before the statement moved it, kept beside what it becomes.
+    static string Was(string key) => "_was_" + key;
+
+    /// The rows an insert lists or selects, as a source of its own -- under the names its column
+    /// list gives them, which is what lets the key be read out of it.
+    static string Source(List<string> columns, string rows) =>
+        $"({rows[(MatchingParen(rows) + 1)..].Trim()}) AS \"_rows\" ({string.Join(", ", columns.Select(SqlText.Quote))})";
 
     /// An insert that is asked what it wrote -- `OUTPUT INSERTED.<key>`, which is how EF Core gets a
     /// store-generated key back. The rows are materialized first, so what the store generates is
     /// decided once and can be both written down and answered from; the answer is the last step,
     /// which is what makes this a plan that returns rows with a write in front of it.
-    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning)
+    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning, Check[] duplicates)
     {
         var select = rest[(MatchingParen(rest) + 1)..returning];
         var from = SqlText.FindKeyword(select, "FROM");
@@ -275,7 +340,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $" {source}",
             $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written",
             $"SELECT {answered} FROM duckpg_written"],
-            "INSERT") with { Dirty = [table.Name] });
+            "INSERT") with { Dirty = [table.Name], Checks = duplicates });
     }
 
     /// The declared identities a statement does not name, and so leaves to the store.
@@ -332,11 +397,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         RejectVirtual(table, assignments.Keys, "UPDATE");
 
+        var moves = table.Key.Any(assignments.ContainsKey);
+
         // The rewritten row lands in the write layer under the key it already had, where it shadows
         // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
         // the old one behind with nothing above it, and that is what has to be hidden.
         // Nothing lies beneath a materialized row, so a key that moves leaves nothing to hide.
-        var moves = !table.Materialized && table.Key.Any(assignments.ContainsKey);
+        var tombstones = moves && !table.Materialized;
 
         // With a FROM clause the target's own columns are no longer the only ones in scope, so
         // everything the statement did not assign has to say which table it came from.
@@ -352,12 +419,27 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 : qualifier + SqlText.Quote(c.Name)));
         var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
 
+        // A key that moves may land on one the lake already publishes, and a join around the target
+        // may produce the same row twice -- both write two rows under one key, which the write
+        // branch's own PRIMARY KEY catches and a materialized table does not. Where each row lands
+        // and what it is taking away are read together, so the scan behind them is paid for once.
+        // An update that neither moves a key nor joins cannot make a duplicate, since what it reads
+        // is the merged view and the merged view is already keyed.
+        var duplicates = moves || from >= 0
+            ? Duplicates(table,
+                         $"SELECT {Moved(table, assignments, qualifier)}, " +
+                         string.Join(", ", table.Key.Select(k =>
+                             $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}")) +
+                         $" FROM {scan} WHERE {predicate}",
+                         replacing: true)
+            : [];
+
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
         string[] steps = [
             Keys(table, scan, qualifier, predicate),
             $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
-            .. moves ? (string[])[Tombstone(table)] : [],
+            .. tombstones ? (string[])[Tombstone(table)] : [],
             Evict(table),
             $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"];
 
@@ -366,10 +448,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (answered is not null)
             return Promoting(table, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_updated"], "UPDATE")
-                with { Dirty = [table.Name] }, tombstones: moves);
+                with { Dirty = [table.Name], Checks = duplicates }, tombstones);
 
         return Promoting(table, Plan.Count("UPDATE", steps)
-            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name] }, tombstones: moves);
+            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name], Checks = duplicates },
+            tombstones);
     }
 
     Plan RewriteDelete(string sql)
@@ -471,9 +554,17 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 $"SELECT 1 FROM {child.QualifiedName} AS c, ({keys}) AS k WHERE {matched}{others} LIMIT 1",
                 $"The DELETE statement conflicted with the REFERENCE constraint \"{reference.Name}\". " +
                 $"The conflict occurred in database \"{Config.Schema}\", table \"{reference.Table}\", " +
-                $"column '{reference.Columns[0]}'.");
+                $"column '{reference.Columns[0]}'.",
+                "23503");
         }
     }
+
+    /// The key each row will carry once the update has run: what the statement assigns to it, or
+    /// what it already had where the statement leaves it alone.
+    static string Moved(Table table, Dictionary<string, string> assignments, string qualifier) =>
+        string.Join(", ", table.Key.Select(k => assignments.TryGetValue(k, out var assigned)
+            ? $"({assigned}) AS {SqlText.Quote(k)}"
+            : qualifier + SqlText.Quote(k)));
 
     /// The keys a statement touches, taken from the merged view before anything moves.
     static string Keys(Table table, string scan, string qualifier, string predicate) =>
