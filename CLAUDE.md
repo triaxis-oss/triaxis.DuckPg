@@ -114,12 +114,80 @@ publish a temp-directory convention as API.
   case, not in a string replacement — this is why `'a' + b` concatenates and `1 + 2` adds.
 - **A statement the parser does not cover is refused**, with the position. Passing unknown text
   through to DuckDB moves the failure somewhere harder to read.
-- **A view is bound on every execution, not once when the lake is built.** DuckDB re-plans even a
-  prepared statement -- measured, `Prepare()` costs 0.06 ms and changes nothing -- so every
-  expression in a view definition is paid for by every query touching it, and on a wide table that
-  is most of what a small query costs. Hence: no cast to the type a layer already has, no merge
-  wrapper around a table only one layer carries, and `--cache` writing a merged table out once as
-  parquet. A plan cache above DuckDB would cache an object that re-plans anyway.
+- **The merge is what costs, and materializing it is the whole lever.** The same statement --
+  60 columns, filtered to one row, 60000 rows either way -- against a plain table and against the
+  three-layer merge view a layered lake publishes. Medians over 100 calls, warmed:
+
+  | | table | merge view |
+  |---|---|---|
+  | prepare a handle, nothing else | 0.79 | 3.77 |
+  | handle reused, no parameters | 0.88 | 1.84 |
+  | handle reused, a value bound each call | 1.54 | 6.10 |
+  | fresh handle: prepare + bind + execute | 1.94 | 7.53 |
+  | ADO, new command, parameter bound | **2.25** | **8.25** |
+  | ADO, new command, value as a literal | 1.76 | 6.24 |
+
+  So `Config.Materialize` is worth 3.7x on the shape a small ORM query takes, and nothing else here
+  comes close: planning falls from 3.77 ms to 0.79 because almost all of it *was* the merge. Where
+  performance matters, that is the answer, and the rest of this bullet is about the ~2.25 ms left.
+- **What is left after materializing is not worth much.** Of that 2.25 ms, roughly 0.8 is planning,
+  0.9 is execution and ~0.5 is the parameter. A plan cache -- one `duckdb_prepare` handle kept per
+  session, which is what `NativeMethods.PreparedStatements` is for -- saves 1.94 to 1.54, about
+  0.4 ms; and rendering the value as a literal instead of binding it saves 2.25 to 1.76, about the
+  same. Both are ~20%, they overlap, and neither is a 3.7x. DuckDB re-plans a parameterized
+  statement on every execute however it is prepared: 1.54 ms bound against 0.88 ms with no
+  parameters on the same reused handle, and binding the *same* value every call wins nothing back.
+  That is DuckDB, not the driver -- ADO and native agree to within a few percent on the shape they
+  share. `DuckDBCommand.Prepare()` is not the way in either: it costs 0.000 ms, leaves
+  `Parameters.Count` at zero and will "prepare" `SELECT 1 FROM nosuchtable`, never reaching
+  `duckdb_prepare`. Correctness would be free -- a prepared statement picks up a `CREATE OR REPLACE
+  VIEW` underneath it, and prepared statements belong to a connection, so any cache is a session's.
+  The C API cannot be asked for a statement's result columns before execution, only its parameters;
+  `DESCRIBE <query>` answers for those and costs what the `LIMIT 0` already used costs.
+- **Planning can be moved out of the turn, and it buys less than it looks like.** The idea: render
+  the statement with its values as literals, `duckdb_prepare` it *before* taking the turn, then hold
+  the turn only for `BEGIN`/execute/`COMMIT`. Measured, median over 100, against a table:
+
+  | | outside the turn | **holding the turn** |
+  |---|---|---|
+  | SELECT, prepared inside (today) | 0.00 | 2.01 |
+  | SELECT, prepared outside, literal | 0.65 | **1.12** |
+  | SELECT, prepared outside, value bound | 0.33 | 1.65 |
+  | UPDATE, prepared inside (today) | 0.00 | 0.96 |
+  | UPDATE, prepared outside, literal | 0.24 | **0.85** |
+  | `BEGIN` + `COMMIT` with nothing between | | 0.33 |
+
+  The mechanism works and the literal is essential -- bound, the planning follows the execute back
+  inside (1.65 against 1.12). But what the turn serializes is *writes*, and a one-row UPDATE plans
+  cheaply: 0.96 to 0.85, about 12%, of which 0.33 is the transaction bracket that cannot move. Reads
+  outside a transaction never take the turn at all, so their 2.01 to 1.12 buys no contention back --
+  only the ~12% of latency that rendering a literal was already worth. And splitting the work costs
+  more of it in total (0.24 + 0.85 against 0.96): it trades throughput for a shorter critical
+  section, which is the right trade only when something is actually queued behind it.
+  It was built anyway, measured on a real workload, and was slower everywhere -- 8.65 ms a write
+  against 8.49 without it. Two reasons, and the second is fatal:
+  - **Preparing once and executing once saves nothing.** The plan is reused only by a *second*
+    execution, and a plan whose values are literals is never executed twice. What the measurement
+    that suggested this showed was one handle executed a hundred times; here every statement makes
+    its own. So the planning does not go away, it only moves -- and the `PREPARE`/`EXECUTE`/
+    `DEALLOCATE` wrapper is three parsed statements where there was one: 1.19 ms against 0.82 for
+    the same step run directly.
+  - **DuckDB will not prepare `CREATE OR REPLACE TEMP TABLE … AS SELECT`** -- "syntax error at or
+    near CREATE" -- nor `CREATE TABLE IF NOT EXISTS`. It prepares SELECT, INSERT, UPDATE and DELETE
+    and no DDL at all. Every rewritten UPDATE and DELETE is *built* out of that temp-table DDL, so
+    those plans -- the ones the turn exists to serialize -- can never be planned ahead. They inlined
+    their values, prepared what they could, hit the error, deallocated and ran as before: cost with
+    no possibility of benefit.
+
+  For this to work the write plans would have to stop using temp tables, which is a different and
+  much larger change to `Gateway`. The machinery this describes was built once, measured on a real
+  workload and taken back out again -- it is not in the tree, and rebuilding it is the easy half of
+  that change.
+- **A view is bound on every execution, not once when the lake is built.** Everything above is why:
+  every expression in a view definition is paid for by every query touching it. Hence no cast to the
+  type a layer already has, no merge wrapper around a table only one layer carries, `--cache` writing
+  a merged table out once as parquet -- and, further along the same line, `--materialize` not
+  publishing a view at all.
 - **A lake owns what it was built from, or nothing at all.** A factory-built lake holds its own
   container and releases it on disposal, which is what lets a caller hold one object instead of two
   with an ordering constraint; one resolved from someone else's container owns nothing of theirs.

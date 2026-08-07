@@ -281,7 +281,10 @@ in the write layer's own format: the rows that are not what the layers said, and
 there and are not. An ordinary lake reads that back as the layer it is.
 
 It is for a test suite that wants a plain database rather than the layer machinery, and for anything
-that would rather pay the merge once than on every query. The cost is memory — every table is
+that would rather pay the merge once than on every query — which, measured on a 60-column table
+filtered to one row, is worth about 3.7×: 2.25 ms against 8.25 ms for the same statement over the
+merge view. Almost all of the difference is planning, since a view is bound on every execution and
+the merge is most of what there is to bind. The cost is memory — every table is
 resident — and that a table cannot carry anything answered per session: a `filter:` or a
 `getvariable()` column is refused at startup rather than quietly stopping.
 
