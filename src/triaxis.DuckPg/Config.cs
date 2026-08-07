@@ -59,6 +59,18 @@ public sealed class Config
     /// that unspecified in both.
     public bool SortSmallTables { get; set; } = true;
 
+    /// Hold a declared key over what the table publishes, refusing a write that would put two rows
+    /// under one key. DuckDB cannot: the write branch's own PRIMARY KEY sees this process's rows and
+    /// nothing below them, and a materialized table has no constraint at all.
+    ///
+    /// On, because the alternative is a lake that quietly answers with a row nobody wrote. It costs
+    /// one scan of what the table publishes per insert and per key-moving update -- most of what a
+    /// write costs on a layered lake, since there is no index over a merge -- so a lake whose writers
+    /// are already known to be sending fresh keys, a bulk load out of a trusted source above all, can
+    /// have that back by turning it off. Nothing else changes: reads, deletes and ordinary updates
+    /// never asked.
+    public bool CheckKeys { get; set; } = true;
+
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
     /// after that is invisible to it for as long as it lives -- and it cannot create one itself

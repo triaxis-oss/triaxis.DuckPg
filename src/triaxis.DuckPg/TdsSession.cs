@@ -364,7 +364,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             using var command = Command(check.Sql, parameters);
             using var reader = command.ExecuteReader();
-            if (reader.Read()) throw new PgError("23503", check.Message);
+            if (reader.Read()) throw new PgError(check.SqlState, check.Message);
         }
     }
 
@@ -776,6 +776,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             _ => PgError.SqlStateOf(e) switch
             {
                 "23503" => 547,     // a reference still points at the row
+                "23505" => 2627,    // the key is already there
                 "42P01" => 208,     // invalid object name
                 "42703" => 207,     // invalid column name
                 "42601" => 102,     // syntax error

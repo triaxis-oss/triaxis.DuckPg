@@ -337,7 +337,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         {
             using var command = Command(check.Sql, arguments);
             using var reader = command.ExecuteReader();
-            if (reader.Read()) throw new PgError("23503", check.Message);
+            if (reader.Read()) throw new PgError(check.SqlState, check.Message);
         }
     }
 

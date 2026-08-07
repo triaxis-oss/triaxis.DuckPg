@@ -47,6 +47,9 @@ public class ServeCommand : LoggingCommand
     [Option("--no-sort-small-tables", Description = "Leave a small materialized table's sorting and limiting to DuckDB, which is on by default.")]
     public bool NoSortSmallTables { get; set; }
 
+    [Option("--no-check-keys", Description = "Let a write put two rows under one declared key, which is refused by default.")]
+    public bool NoCheckKeys { get; set; }
+
     [Option("--serialize-transactions", Description = "Let one transaction run at a time, the next waiting for the one in front of it.")]
     public bool SerializeTransactions { get; set; }
 
@@ -112,6 +115,7 @@ public class ServeCommand : LoggingCommand
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;
         if (NoSortSmallTables) config.SortSmallTables = false;
+        if (NoCheckKeys) config.CheckKeys = false;
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
         if (Key.Length > 0) config.DefaultKey = Key;

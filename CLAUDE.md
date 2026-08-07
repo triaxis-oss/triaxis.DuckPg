@@ -477,6 +477,44 @@ publish a temp-directory convention as API.
   update left it, `duckpg_keys` holds what a delete collected before the rows went. A DELETE can
   therefore only answer for its key, and says so; `OUTPUT 1`, which is EF Core counting the rows it
   touched, needs neither.
+- **A declared key is a rule over the merged view too, and neither constraint DuckDB offers keeps
+  it.** The write branch's `PRIMARY KEY` sees only the rows this process wrote, so an INSERT of a key
+  a file below already holds is let through -- and the row then shadows that file's row, which is an
+  UPDATE nobody asked for rather than the refusal a client expects. A materialized table has no
+  constraint at all: `Catalog.Materialize` builds it with `CREATE TABLE AS`, and CTAS keeps no key,
+  so the same key goes in as many times as it is sent. `Gateway.Duplicates` asks both halves as one
+  `Plan.Checks` query over the rows about to be written -- a key the table already publishes, and one
+  the statement repeats -- for the same reason a reference is asked there: a statement outside a
+  transaction commits each step as it goes, and the RETURNING path writes the rows down before it can
+  answer. It is asked only where the statement carries every key column, since a key the store
+  generates cannot collide with one it generated before. Giving the materialized table a `UNIQUE`
+  index instead is the obvious fix and the wrong one: a single-layer table is published without the
+  `QUALIFY` that dedupes -- there is nothing to shadow -- so a file already holding a key twice is a
+  lake that starts today and would stop.
+- **An UPDATE writes rows too, and the only two ways it can write two under one key are worth
+  exactly one query.** A moved key may land on one the lake already publishes; a join around the
+  target may match a row twice and write it twice. Anything else reads the merged view, which is
+  already keyed, so `Gateway.RewriteUpdate` asks only when `moves || from >= 0` and an ordinary
+  update pays nothing. What makes it the same question `Duplicates` answers for an insert is
+  `replaced`: the keys the statement is taking away as it writes, which an insert does not have. A
+  row landing on one of those is landing on nothing -- without it `SET id = id + 1` over a whole
+  table would read as every row colliding with itself, and the row that merely stayed where it was
+  would read as colliding with the row it *is*. `Moved` is the key half of the projection the plan
+  builds anyway, which is what keeps the check and the write agreeing about where a row lands.
+- **What a key check costs is one scan of what the table publishes, and that is the floor.** There is
+  no index over a view, so asking whether a layered lake already holds a key means evaluating the
+  merge. Measured on a two-layer 25k-row lake: 6.95 ms for the insert form against 6.45 for a bare
+  `count(*)` over the same view, and 2.19 against 0.88 materialized. That is most of what a write
+  costs -- an insert with no check was 1.4 ms layered and 1.1 materialized -- so this is the one
+  place where `--materialize` is worth 3x for the same reason everything else here is. Getting to
+  the floor was worth having: a correlated EXISTS cost 7.62 rather than 6.95, and the update form
+  15.89 rather than 10.87, because it scanned the merge once for the rows, once for the keys being
+  replaced and once again per key. What it does *not* scale with is rows written -- one check a
+  statement, so a thousand-row batch pays it once -- and it is not asked at all of a keyless table,
+  a key the store generates, an ordinary UPDATE, a DELETE or any read. `Config.CheckKeys` is the
+  opt-out for a lake whose writers are known to send fresh keys, and it is one condition in
+  `Gateway.Duplicates` rather than a second path: what comes back with it is the behaviour above,
+  including the part where the two modes disagree about what a duplicate even looks like.
 - **A declared reference is a rule over the merged view, not a constraint on a table.** DuckDB
   enforces foreign keys but refuses to point one at a view, and a lake publishes views -- so a
   constraint on the write table would only see the rows this process wrote, while the row pointing
