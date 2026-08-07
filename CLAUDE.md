@@ -152,11 +152,20 @@ publish a temp-directory convention as API.
   So `Config.Materialize` is worth 3.7x on the shape a small ORM query takes, and nothing else here
   comes close: planning falls from 3.77 ms to 0.79 because almost all of it *was* the merge. Where
   performance matters, that is the answer, and the rest of this bullet is about the ~2.25 ms left.
-- **What is left after materializing is not worth much.** Of that 2.25 ms, roughly 0.8 is planning,
-  0.9 is execution and ~0.5 is the parameter. A plan cache -- one `duckdb_prepare` handle kept per
-  session, which is what `NativeMethods.PreparedStatements` is for -- saves 1.94 to 1.54, about
+- **What is left after materializing depends entirely on how wide the statement is, and the
+  ~20% below was measured on a narrow one.** On the 68-column statement a real client sends, a held
+  `duckdb_prepare` handle is worth far more: measured against a 12-row table, ADO costs 1.77 ms a
+  call and a reused handle 0.69 (2.6x); against the merge view, 6.86 against 1.63 (**4.2x**). The
+  planning is per *column*, so the wider the statement the more a cached plan saves -- a statement of
+  68 constants with no table in it at all still costs 0.87 ms, against 0.33 for `SELECT 1`. Reusing
+  the `DuckDBCommand` object saves nothing (6.77 against 6.38): its source extracts and prepares on
+  every execute. The driver looks like what blocks a cache and is not -- `DuckDBDataReader`'s only
+  constructor is `internal`, and `[UnsafeAccessor(UnsafeAccessorKind.Constructor)]` reaches it
+  without reflection and stays AOT-clean. What blocks it is DuckDB, below.
+- **On the narrow shape below, the same cache is worth ~20%.** Of that 2.25 ms, roughly 0.8 is
+  planning, 0.9 is execution and ~0.5 is the parameter. A plan cache saves 1.94 to 1.54, about
   0.4 ms; and rendering the value as a literal instead of binding it saves 2.25 to 1.76, about the
-  same. Both are ~20%, they overlap, and neither is a 3.7x. DuckDB re-plans a parameterized
+  same. They overlap. DuckDB re-plans a parameterized
   statement on every execute however it is prepared: 1.54 ms bound against 0.88 ms with no
   parameters on the same reused handle, and binding the *same* value every call wins nothing back.
   That is DuckDB, not the driver -- ADO and native agree to within a few percent on the shape they
@@ -187,24 +196,37 @@ publish a temp-directory convention as API.
   more of it in total (0.24 + 0.85 against 0.96): it trades throughput for a shorter critical
   section, which is the right trade only when something is actually queued behind it.
   It was built anyway, measured on a real workload, and was slower everywhere -- 8.65 ms a write
-  against 8.49 without it. Two reasons, and the second is fatal:
-  - **Preparing once and executing once saves nothing.** The plan is reused only by a *second*
-    execution, and a plan whose values are literals is never executed twice. What the measurement
-    that suggested this showed was one handle executed a hundred times; here every statement makes
-    its own. So the planning does not go away, it only moves -- and the `PREPARE`/`EXECUTE`/
-    `DEALLOCATE` wrapper is three parsed statements where there was one: 1.19 ms against 0.82 for
-    the same step run directly.
-  - **DuckDB will not prepare `CREATE OR REPLACE TEMP TABLE … AS SELECT`** -- "syntax error at or
-    near CREATE" -- nor `CREATE TABLE IF NOT EXISTS`. It prepares SELECT, INSERT, UPDATE and DELETE
-    and no DDL at all. Every rewritten UPDATE and DELETE is *built* out of that temp-table DDL, so
-    those plans -- the ones the turn exists to serialize -- can never be planned ahead. They inlined
-    their values, prepared what they could, hit the error, deallocated and ran as before: cost with
-    no possibility of benefit.
+  against 8.49 without it. **It was built on SQL-level `PREPARE`/`EXECUTE`/`DEALLOCATE`, and that is
+  why.** SQL `PREPARE` is a statement of its own: each `EXECUTE` is parsed and looked up in the
+  catalog before the plan it names is reached, so the wrapper was three parsed statements where
+  there had been one -- 1.19 ms against 0.82 for the same step run directly. It also has its own
+  grammar, which takes SELECT, INSERT, UPDATE and DELETE and refuses DDL with "syntax error at or
+  near CREATE" -- and since every rewritten UPDATE and DELETE is *built* out of
+  `CREATE OR REPLACE TEMP TABLE`, that read as a fatal blocker.
 
-  For this to work the write plans would have to stop using temp tables, which is a different and
-  much larger change to `Gateway`. The machinery this describes was built once, measured on a real
-  workload and taken back out again -- it is not in the tree, and rebuilding it is the easy half of
-  that change.
+  **Neither is true of `duckdb_prepare`.** The C API prepares `CREATE OR REPLACE TEMP TABLE … AS
+  SELECT`, `CREATE TABLE IF NOT EXISTS` and `CREATE OR REPLACE VIEW` alike -- it must, since that is
+  the only thing `DuckDBCommand` ever does with any statement. So both reasons this was abandoned
+  were artifacts of the mechanism it was written on, not facts about DuckDB, and the idea is open
+  again for anyone who wants to measure it properly.
+- **A held plan is bound against *statistics*, and DuckDB invalidates one on a catalog change and
+  never on a data change -- which is what makes a plan cache unsafe here.** A plan made while a
+  write branch is empty has that branch optimized out of it, and every row written afterwards is
+  invisible to that plan for as long as it is held: the merge answers `base` where it should answer
+  what was just written, silently and forever. Measured on duckpg's own merge shape with as little as
+  one row underneath, so it is not a large-table effect. `SET disabled_optimizers='statistics_propagation'`
+  is what fixes it -- `empty_result_pullup` alone does not -- and that is too high a price and too
+  narrow a guarantee, since it names the one optimizer known to bake data in today rather than any
+  that might tomorrow. What *would* be sound is invalidating every session's plans whenever anything
+  commits, which is a generation counter on the gateway rather than an optimizer flag; it costs one
+  re-plan per session per write, so it is worth it for a read-heavy lake and worth nothing for a
+  write-heavy one. Whatever does it must not clear on a connection reset: SqlClient announces one
+  before the first statement of every pooled checkout, so an ORM that opens and closes around each
+  statement resets constantly -- measured at seven plans for seven checkouts of one statement, which
+  is a cache paying to do nothing. Until that exists there is no plan cache. The machinery -- `PlanCache`, reaching
+  `DuckDBDataReader`'s internal constructor through `UnsafeAccessor` to stay AOT-clean, and the
+  measurements showing 2.5x against a table and 2.8x against a merge view -- was built and taken back
+  out; it is not in the tree. What it cannot do is be correct.
 - **A view is bound on every execution, not once when the lake is built.** Everything above is why:
   every expression in a view definition is paid for by every query touching it. Hence no cast to the
   type a layer already has, no merge wrapper around a table only one layer carries, `--cache` writing
