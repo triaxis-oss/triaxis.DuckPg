@@ -719,7 +719,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // again: rebuilding would throw away everything written since it was made. What the file
         // holds has to be what the catalog says it publishes, though -- a store made before a column
         // was declared would fail on every query naming that column, and nowhere near here.
-        if (config.Store is { Length: > 0 } && Stored(conn, table) is { Count: > 0 } stored)
+        if (Keeping && Stored(conn, table) is { Count: > 0 } stored)
         {
             var declared = table.Columns.Select(c => c.Name);
             if (!stored.SequenceEqual(declared, StringComparer.OrdinalIgnoreCase))
@@ -750,6 +750,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         promoted.Add(table.Name);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
     }
+
+    /// A store the lake's state lives in, rather than one that is only somewhere for its tables to
+    /// live. It is what decides both halves of the bargain -- whether the layers are read for a table
+    /// the file already carries, and whether a delta is written at shutdown -- and they have to be
+    /// the same answer, or the run either loses its writes or writes them down twice.
+    bool Keeping => config.Store is { Length: > 0 } && config.StoreMode == StoreMode.Keep;
 
     /// The columns a store already holds for a table, in order, or nothing when it holds no such
     /// table. A view is not a table: a store written by a build that is no longer this one may carry
@@ -782,9 +788,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     {
         // Once only: the baseline reads the very tables this replaces, so a second pass would
         // measure the delta against the delta.
-        // A store keeps what it was given by keeping it, so there is nothing to work out at
-        // shutdown -- and a delta beside it would be a second answer to the same question.
-        if (!config.Materialize || write.Directory is null || config.Store is { Length: > 0 } || flushed) return;
+        // A store that is the state keeps what it was given by keeping it, so there is nothing to
+        // work out at shutdown -- and a delta beside it would be a second answer to the same
+        // question. One that is only where the tables live answers like any other materialized lake.
+        if (!config.Materialize || write.Directory is null || Keeping || flushed) return;
         flushed = true;
 
         foreach (var table in Tables.Values.Where(t => t.Writable))

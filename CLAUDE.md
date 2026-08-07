@@ -77,6 +77,15 @@ publish a temp-directory convention as API.
   never reads the layers for it again -- `Catalog.Stored` is what asks, and a shape that disagrees
   with what the catalog publishes is refused rather than rebuilt, since rebuilding is the one thing
   a store exists to prevent. No delta is flushed beside one.
+- **What a store *means* is one answer, and `Catalog.Keeping` is where it is given.** The file is
+  either the lake's state or only somewhere for its tables to live, and the two halves -- whether the
+  layers are read for a table the file already carries, and whether a delta is written at shutdown --
+  have to agree, or the run either loses its writes or writes them down twice. `StoreMode.Keep` is
+  both halves on and `StoreMode.Spill` is both off, which is why one property answers both gates
+  rather than each asking `config.Store` for itself. `Spill` exists for memory and nothing else: it
+  behaves in every other way like an in-memory materialized lake, so `SpillTests` restarts twice for
+  the same reason `DeltaTests` does. Nothing in a DuckDB file says which mode wrote it, so the two
+  cannot share a path -- and there is no check that could tell.
 - **DuckDB.NET duplicates an in-memory connection and no other.** `Duplicate()` throws
   "Duplication of the connection is only supported for in-memory connections", which is why
   `DuckDbSession.Of` opens the file again for a stored lake -- the driver holds one instance per
@@ -208,7 +217,7 @@ publish a temp-directory convention as API.
 - **Both front doors are opt-in, and a lake needs one.** `PgServer.Enabled` and `TdsServer.Enabled`
   read the same way, so a consumer speaking one protocol opens one listener. `Config.Validate` is
   what makes "neither" an error rather than a lake nothing can reach.
-- **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckDbInstaller, LayerFormat,
+- **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckDbInstaller, LayerFormat, StoreMode,
   DuckPgConfigurationException and DuckDbLibrary -- nothing else.**
   The catalog, the gateway, the two protocols and `TSql/` are internal, which is why `Lake`'s
   constructor is internal and `AddDuckPg` assembles it by hand: a public constructor would have to

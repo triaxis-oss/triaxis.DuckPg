@@ -130,6 +130,97 @@ public class StoreTests : IDisposable
     }
 }
 
+/// The same file, meaning nothing. A spilled store is somewhere for the tables to live and not the
+/// lake's state: the layers are collapsed into it on every start and the delta goes out at shutdown,
+/// exactly as an in-memory materialized lake behaves. What the file buys is the memory.
+public class SpillTests : IDisposable
+{
+    readonly TestLake lake = new TestLake("spill")
+        .Json("base", "orders", """
+            [{"order_id": 1, "note": "base"}, {"order_id": 2, "note": "base"}, {"order_id": 3, "note": "base"}]
+            """)
+        .Stack("base")
+        .WriteTo("local")
+        .Materialized()
+        .StoredAt(mode: StoreMode.Spill)
+        .WithTds();
+
+    public SpillTests()
+    {
+        lake.Config.DefaultKey = ["order_id"];
+        lake.Start();
+    }
+
+    public void Dispose() => lake.Dispose();
+
+    void Write(string sql)
+    {
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        new SqlCommand(sql, connection).ExecuteNonQuery();
+    }
+
+    List<string> Rows() => lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id");
+
+    /// The tables are in the file rather than in memory -- which is the only thing the mode is for.
+    [Fact]
+    public void TheTablesLiveInTheFile()
+    {
+        Assert.True(File.Exists(lake.At("store.duckdb")));
+        Assert.Equal(["BASE TABLE"], lake.Query(
+            "SELECT table_type FROM information_schema.tables " +
+            "WHERE table_schema = 'lake' AND table_name = 'orders'"));
+    }
+
+    /// The file is not the state, so the layers still are: a change underneath is read on the next
+    /// start. This is the whole difference from a kept store, which refuses to look.
+    [Fact]
+    public void TheLayersAreReadAgainOnEveryStart()
+    {
+        lake.Json("base", "orders", """[{"order_id": 1, "note": "changed underneath"}]""");
+        lake.Restart();
+
+        Assert.Equal(["1=changed underneath"], Rows());
+    }
+
+    /// And a write survives by being written down, the way an in-memory materialized lake's does.
+    [Fact]
+    public void TheDeltaIsWrittenAtShutdownAndReadBackOnTheNextStart()
+    {
+        Write("UPDATE [orders] SET [note] = 'written' WHERE [order_id] = 1");
+        Write("DELETE FROM [orders] WHERE [order_id] = 3");
+        Write("INSERT INTO [orders] ([order_id], [note]) VALUES (4, 'new')");
+
+        lake.Stop();
+        Assert.NotEmpty(Directory.GetFiles(lake.At("local")));
+
+        lake.Start();
+        Assert.Equal(["1=written", "2=base", "4=new"], Rows());
+
+        // Twice, because a delta measured against a baseline that already carried it comes out empty
+        // and takes the run before it with it -- and one restart cannot tell the two apart.
+        lake.Restart();
+        Assert.Equal(["1=written", "2=base", "4=new"], Rows());
+    }
+
+    /// A run whose store the previous one left behind starts from the layers plus that delta, never
+    /// from the tables in the file -- otherwise every write would be applied twice, once out of the
+    /// file and once out of the delta it was flushed to.
+    [Fact]
+    public void WhatTheFileHoldsIsRebuiltRatherThanKept()
+    {
+        Write("INSERT INTO [orders] ([order_id], [note]) VALUES (4, 'new')");
+        lake.Restart();
+
+        // The layers no longer say what they said, and a kept store would still be answering '4=new'
+        // off the tables it holds.
+        lake.Json("base", "orders", """[{"order_id": 1, "note": "rewritten"}]""");
+        lake.Restart();
+
+        Assert.Equal(["1=rewritten", "4=new"], Rows());
+    }
+}
+
 /// A store keeps tables, and only a materialized lake has any.
 public class StoreRefusalTests
 {
@@ -143,5 +234,19 @@ public class StoreRefusalTests
 
         var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
         Assert.Contains("materialize", refused.Message);
+    }
+
+    /// Saying what the file is for, without naming one, is a mode that would silently do nothing.
+    [Fact]
+    public void AStoreModeWithoutAStoreIsRefused()
+    {
+        using var lake = new TestLake("spill-unstored")
+            .Json("base", "orders", """[{"order_id": 1}]""")
+            .Stack("base")
+            .Materialized();
+        lake.Config.StoreMode = StoreMode.Spill;
+
+        var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("store", refused.Message);
     }
 }

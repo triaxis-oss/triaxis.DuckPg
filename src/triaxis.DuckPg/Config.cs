@@ -34,13 +34,15 @@ public sealed class Config
     /// directory gets on a clean shutdown.
     public bool Materialize { get; set; }
 
-    /// Where a materialized lake is kept, as a DuckDB database file. Without one the tables live in
-    /// memory and the layers are collapsed into them on every start; with one they are collapsed
-    /// once, into the file, and every start after that opens what is already there -- so a write
-    /// survives by being written, rather than by being worked out again at shutdown. The layers are
-    /// then only consulted for a table the file does not yet carry: the file is the state.
-    /// Only meaningful with `Materialize`, which is what makes the tables tables.
+    /// Where a materialized lake's tables live, as a DuckDB database file, rather than in memory.
+    /// Only meaningful with `Materialize`, which is what makes the tables tables. What the file then
+    /// means is `StoreMode`'s.
     public string? Store { get; set; }
+
+    /// Whether the store is the lake's state or only somewhere for its tables to live. Keeping is
+    /// the default, because a file the caller named is the one thing here that outlives the process
+    /// and discarding it silently would be the worse surprise.
+    public StoreMode StoreMode { get; set; } = StoreMode.Keep;
 
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
@@ -115,6 +117,10 @@ public sealed class Config
                 "`store` keeps a materialized lake, so it needs `materialize`: without it a lake " +
                 "publishes views over the layer files, and there is nothing in a database file to keep");
 
+        if (StoreMode != StoreMode.Keep && Store is not { Length: > 0 })
+            throw new DuckPgConfigurationException(
+                $"`storeMode: {StoreMode}` says what the store file is for, and no `store` was named");
+
         // A filter and a `getvariable()` column are answered per session, and a table shared by
         // every session cannot carry either. Refused rather than dropped: a mode that silently
         // stopped filtering rows would be the worst way to find this out.
@@ -149,6 +155,22 @@ public sealed class Config
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)) + Path.DirectorySeparatorChar;
         return Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase);
     }
+}
+
+public enum StoreMode
+{
+    /// The file is the state. The layers are collapsed into it once and every start after that opens
+    /// what is already there, consulting them only for a table the file does not yet carry -- so a
+    /// write survives by having been written rather than by being worked out again at shutdown, and
+    /// no delta is left beside it.
+    Keep,
+
+    /// The file is only where the tables live. Every start collapses the layers into it afresh and
+    /// every shutdown writes the delta, exactly as an in-memory materialized lake does -- what the
+    /// file buys is the memory, and nothing else. A table this build no longer publishes is left in
+    /// the file rather than dropped: reclaiming the space is not worth deleting something the caller
+    /// may have meant to keep.
+    Spill,
 }
 
 public sealed class TableConfig

@@ -62,8 +62,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first. `--pgwire`, `--write`,
-`--write-format`, `--writable`, `--materialize`, `--store`, `--serialize-transactions`, `--schema`, `--key`
-(repeatable), `--dacpac`,
+`--write-format`, `--writable`, `--materialize`, `--store`, `--store-mode`,
+`--serialize-transactions`, `--schema`, `--key` (repeatable), `--dacpac`,
 `--cache` and `--config` each override the file when both are given; argument paths are relative to
 the working directory, file paths to the file. A file named explicitly with `--config` must exist,
 so a typo is an error rather than a silent fallback to defaults.
@@ -305,6 +305,14 @@ The trade is that the file *is* the state: editing a layer no longer changes a t
 already holds, and a store made against a different schema is refused at startup by name rather than
 rebuilt, since rebuilding would discard everything written to it. Delete it to start again. It needs
 `--materialize`; a layered lake keeps its write layer in files and would apply every write twice.
+
+`--store-mode spill` takes that trade back and keeps only the memory. The file is then somewhere for
+the tables to live and nothing more: the layers are collapsed into it on every start, a layer edited
+underneath is read, and the delta goes out at shutdown exactly as it does for an in-memory
+materialized lake. Use it when a lake is larger than the RAM you want to give it and the layers are
+still the source of truth; use the default `keep` when the file is. The two must not be pointed at
+the same path, since nothing in a DuckDB file says which one wrote it — a `spill` start would rebuild
+a kept store's tables from the layers and lose everything written to them.
 
 `--serialize-transactions` lets one transaction run at a time. Two things go wrong without it, and
 neither is something an application written against SQL Server or PostgreSQL has reason to expect.
@@ -622,7 +630,8 @@ variables and the tool's usual override files layer over it for free.
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
 | `materialize` | `--materialize` | Collapse the layers into real tables; a delta goes out at shutdown. |
-| `store` | `--store` | DuckDB database file a materialized lake is kept in, so writes simply stay. |
+| `store` | `--store` | DuckDB database file a materialized lake's tables live in, rather than memory. |
+| `storeMode` | `--store-mode` | `Keep` (default): the file is the state. `Spill`: only where the tables live. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
