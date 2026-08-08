@@ -25,7 +25,8 @@ dotnet tool install -g triaxis.DuckPg.Cli
 
 Requires .NET 10 and a native DuckDB, which the tool links against rather than bundling:
 `brew install duckdb`, `apt install libduckdb-dev`, or `DUCKDB_LIBRARY` pointing at the library. On a
-machine with neither, `duckpg --install-duckdb` fetches the right one — once, and never unasked. With
+machine with neither, `--install-duckdb` fetches the right one on the way up, and
+`duckpg --install-duckdb-only` does it without serving — once, and never unasked. With
 no library at all, the error says where it looked and what the ways out are, and exits 69; see
 [the native library](docs/duckdb.md) for the full search order.
 

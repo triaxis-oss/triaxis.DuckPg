@@ -65,8 +65,11 @@ public class ServeCommand : LoggingCommand
     [Option("--cache", Description = "Directory to write merged copies of multi-layer tables into, as ZSTD parquet. Trades build time and disk for read speed.")]
     public string? Cache { get; set; }
 
-    [Option("--install-duckdb", Description = "Download the DuckDB library if none is found, and exit.")]
+    [Option("--install-duckdb", Description = "Download the DuckDB library on the way up if none is found, rather than failing.")]
     public bool InstallDuckDb { get; set; }
+
+    [Option("--install-duckdb-only", Description = "Download the DuckDB library if none is found, and exit without serving.")]
+    public bool InstallDuckDbOnly { get; set; }
 
     [Inject] private readonly IConfiguration _configuration = null!;
     [Inject] private readonly IDuckDbInstaller _installer = null!;
@@ -93,7 +96,7 @@ public class ServeCommand : LoggingCommand
 
     public async Task ExecuteAsync(CancellationToken cancellation)
     {
-        if (InstallDuckDb)
+        if (InstallDuckDbOnly)
         {
             await _installer.InstallAsync(cancellation);
             return;
@@ -121,6 +124,7 @@ public class ServeCommand : LoggingCommand
         if (Key.Length > 0) config.DefaultKey = Key;
         if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
         if (Cache is not null) config.Cache = Path.GetFullPath(Cache);
+        if (InstallDuckDb) config.InstallDuckDb = true;
         if (config.Listen is not { Length: > 0 } && config.Tds is not { Length: > 0 })
             config.Listen = DefaultListen;
 
@@ -179,7 +183,7 @@ public class ServeCommand : LoggingCommand
             if (DuckDbLibrary.LoadedVersion is { } loaded && loaded != DuckDbLibrary.Version)
                 Logger.LogWarning(
                     "DuckDB {Loaded} loaded from {Path}, where these bindings speak {Expected}'s C " +
-                    "API -- `duckpg --install-duckdb` fetches a matching one",
+                    "API -- `--install-duckdb` fetches a matching one",
                     loaded,
                     DuckDbLibrary.LoadedFrom ?? "the loader's own search path",
                     DuckDbLibrary.Version);
@@ -197,8 +201,8 @@ public class ServeCommand : LoggingCommand
                 "DuckDB {Version} was not found. Looked in:" + Environment.NewLine + "{Searched}" +
                 Environment.NewLine +
                 "Install it (`brew install duckdb`, `apt install libduckdb-dev`), point " +
-                DuckDbLibrary.PathVariable + " at the library, or run `duckpg --install-duckdb` to " +
-                "fetch it into {Downloaded}.",
+                DuckDbLibrary.PathVariable + " at the library, or add `--install-duckdb` to fetch " +
+                "it into {Downloaded} on the way up.",
                 DuckDbLibrary.Version,
                 string.Join(Environment.NewLine, DuckDbLibrary.SearchPath.Select(path => "  " + path)),
                 DuckDbLibrary.Downloaded)
