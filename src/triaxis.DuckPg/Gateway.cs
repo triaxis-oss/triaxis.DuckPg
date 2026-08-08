@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Data.Common;
+using System.Globalization;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.Logging;
 
@@ -13,9 +16,38 @@ enum PlanKind { Rows, Count, NoOp, Empty }
 /// declare, since the row it protects may live in any layer.
 sealed record Check(string Sql, string Message, string SqlState);
 
-sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string[]? Dirty = null,
-                   string[]? Promoted = null, string[]? Tombstoned = null, Check[]? Checks = null)
+/// The key a plan makes up rather than being given: the step that writes the rows hands it back with
+/// `RETURNING`, so what a caller is later told it got is what was actually written down.
+sealed record Identity(string Table, string Column)
 {
+    /// That step has to be read rather than counted -- a statement carrying `RETURNING` reports
+    /// nothing through `ExecuteNonQuery` -- and of the keys a multi-row write hands back, the last
+    /// is the one a caller is answered with, since that is the row it wrote last.
+    public (int Rows, decimal? Value) Read(DbCommand command)
+    {
+        var rows = 0;
+        decimal? value = null;
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            value = Convert.ToDecimal(reader.GetValue(0), CultureInfo.InvariantCulture);
+            rows++;
+        }
+        return (rows, value);
+    }
+}
+
+sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string[]? Dirty = null,
+                   string[]? Promoted = null, string[]? Tombstoned = null, Check[]? Checks = null,
+                   Identity? Identity = null)
+{
+    /// Which step returns that key: the last one, unless the plan answers with rows of its own --
+    /// and then the one before the answer, since the write comes first and the answer is read off
+    /// what it wrote. Derived rather than stored, so a promotion prepended to the plan cannot make
+    /// it point at the wrong step.
+    public int IdentityStep => Kind == PlanKind.Rows ? Steps.Length - 2 : Steps.Length - 1;
+
     public static Plan Rows(string sql) => new(PlanKind.Rows, [sql], "SELECT");
     public static Plan Count(string tag, params string[] steps) => new(PlanKind.Count, steps, tag);
     public static Plan NoOp(string tag) => new(PlanKind.NoOp, [], tag);
@@ -172,6 +204,17 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 write.Persist(admin, table);
     }
 
+    // ---- generated keys --------------------------------------------------------------------------
+
+    /// The last key generated for each table, by whichever session wrote it -- which is what
+    /// `IDENT_CURRENT` answers, and it is a process's memory rather than a file's: nothing in a
+    /// layer says which of its rows was written last, so a restart has nothing to answer with.
+    readonly ConcurrentDictionary<string, decimal> identities = new(StringComparer.OrdinalIgnoreCase);
+
+    public void Identified(string table, decimal value) => identities[table] = value;
+
+    public decimal? IdentityOf(string table) => identities.TryGetValue(table, out var value) ? value : null;
+
     // ---- settings ------------------------------------------------------------------------------
 
     static Plan PlanSet(string sql, string verb)
@@ -226,15 +269,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         // A declared identity the statement leaves out is filled where every other value comes
         // from -- in the rows being written, so the same statement decides it and writes it.
-        if (Generated(table, columns) is { Count: > 0 } generated)
+        var generated = Generated(table, columns);
+        if (generated.Count > 0)
         {
             var source = rest[(MatchingParen(rest) + 1)..].Trim();
             rest = $"({string.Join(", ", columns.Select(SqlText.Quote).Concat(Quoted(generated)))}) " +
                    $"SELECT *, {string.Join(", ", NextValues(table, generated))} FROM ({source}) AS \"_rows\"";
         }
 
-        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}")
-            with { Dirty = [table.Name], Checks = duplicates });
+        // A caller with no OUTPUT clause reads its key back through SCOPE_IDENTITY, which is a
+        // question about what this statement wrote -- so the write says, rather than the sequence
+        // being asked afterwards where another session's insert may already have moved it.
+        var identity = Identifying(table, generated);
+
+        return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}{Returns(identity)}")
+            with { Dirty = [table.Name], Checks = duplicates, Identity = identity });
     }
 
     /// A declared key is a rule about rows that may live in any layer, so it is kept here rather than
@@ -331,6 +380,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         }
 
         var written = string.Join(", ", columns.Select(SqlText.Quote).Concat(Quoted(generated)));
+        var identity = Identifying(table, generated);
 
         return Promoting(table, new Plan(PlanKind.Rows, [
             $"CREATE OR REPLACE TEMP TABLE duckpg_written AS SELECT {projection}" +
@@ -338,14 +388,22 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             string.Concat(generated.Zip(NextValues(table, generated))
                 .Select(g => $", {g.Second} AS {SqlText.Quote(g.First.Name)}")) +
             $" {source}",
-            $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written",
+            $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written{Returns(identity)}",
             $"SELECT {answered} FROM duckpg_written"],
-            "INSERT") with { Dirty = [table.Name], Checks = duplicates });
+            "INSERT") with { Dirty = [table.Name], Checks = duplicates, Identity = identity });
     }
 
     /// The declared identities a statement does not name, and so leaves to the store.
     static List<Column> Generated(Table table, List<string> columns) =>
         [.. table.Columns.Where(c => c.Identity && !columns.Contains(c.Name, StringComparer.OrdinalIgnoreCase))];
+
+    /// The key this statement makes up, out of everything it fills in -- a declared default is
+    /// filled in too and is not one, since a caller asking what it got back means the identity.
+    static Identity? Identifying(Table table, List<Column> generated) =>
+        generated.FirstOrDefault(c => c.Identity) is { } column ? new Identity(table.Name, column.Name) : null;
+
+    static string Returns(Identity? identity) =>
+        identity is null ? "" : $" RETURNING {SqlText.Quote(identity.Column)}";
 
     static IEnumerable<string> Quoted(IEnumerable<Column> columns) => columns.Select(c => SqlText.Quote(c.Name));
 

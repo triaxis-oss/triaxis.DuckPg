@@ -349,17 +349,35 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         try
         {
             Checked(plan, arguments);
-            foreach (var step in plan.Steps[..^1])
-            {
-                using var command = Command(step, arguments);
-                command.ExecuteNonQuery();
-            }
+            Steps(plan, arguments, plan.Steps.Length - 1);
             if (plan.Steps.Length > 1) Persist(plan);
         }
         finally
         {
             if (transactionStatus == 'I') Release();
         }
+    }
+
+    /// The plan's write steps, in order, and how many rows the last of them touched. A step that
+    /// generates a key hands it back instead of a count, so it is read rather than counted -- what
+    /// the table last generated is a process's memory, and both front doors write to it.
+    int Steps(Plan plan, object?[] arguments, int count)
+    {
+        var affected = 0;
+        for (var i = 0; i < count; i++)
+        {
+            using var command = Command(plan.Steps[i], arguments);
+            if (plan.Identity is not { } generated || i != plan.IdentityStep)
+            {
+                affected = command.ExecuteNonQuery();
+                continue;
+            }
+
+            var (rows, value) = generated.Read(command);
+            if (value is { } key) gateway.Identified(generated.Table, key);
+            affected = rows;
+        }
+        return affected;
     }
 
     /// A serialized lake's turn to write, given up when the transaction that took it ends -- and
@@ -427,13 +445,8 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
             case PlanKind.Count:
             {
-                var affected = 0;
                 var started = Stopwatch.GetTimestamp();
-                foreach (var step in plan.Steps)
-                {
-                    using var command = Command(step, arguments);
-                    affected = command.ExecuteNonQuery();
-                }
+                var affected = Steps(plan, arguments, plan.Steps.Length);
                 if (plan.Affected is { } query)
                 {
                     using var command = Command(query, arguments);

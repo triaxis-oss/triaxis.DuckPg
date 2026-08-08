@@ -113,6 +113,57 @@ public class TSqlTests
         Assert.Equal("""SELECT * FROM "lake"."t" WHERE "flag" = 1""", Translated("SELECT * FROM t WHERE flag = 1"));
     }
 
+    /// `SELECT @a = x` is an assignment and `SELECT a = x` is an alias, which read alike and are
+    /// nothing like each other -- the difference is that one of them names a variable.
+    [Fact]
+    public void AnAssignmentSelectIsTheQueryUnderIt()
+    {
+        var context = new TSqlContext("lake", new Dictionary<string, string>(),
+            new HashSet<string>(["p1", "p2"], StringComparer.OrdinalIgnoreCase), "sa");
+
+        var statements = TSqlParser.Parse("SELECT  @p1 = 1, @p2 = a FROM t");
+        var assign = Assert.IsType<AssignStatement>(Assert.Single(statements));
+
+        Assert.Equal(["p1", "p2"], assign.Variables);
+        Assert.Equal("""SELECT 1, "a" FROM "lake"."t" """.Trim(), TSqlWriter.Write(assign, context));
+
+        // What it assigns is carried beside the statement, since the rows go to the caller's
+        // parameters rather than back down the wire.
+        Assert.Equal(["p1", "p2"], TSqlTranslator.Translate(statements[0], context).Assigns);
+    }
+
+    [Fact]
+    public void ASelectCannotBothAssignAndReturn()
+    {
+        var refused = Assert.Throws<TSqlException>(() => TSqlParser.Parse("SELECT @p1 = 1, 2"));
+        Assert.Contains("assigns to variables or returns rows", refused.Message);
+    }
+
+    /// The generated key is written into the statement as the value it has now, in the type SQL
+    /// Server answers all three with.
+    [Fact]
+    public void TheGeneratedKeyIsRenderedAsAValue()
+    {
+        static string Translated(string sql, decimal? identity, decimal? orders) =>
+            string.Join("; ", TSqlTranslator.Translate(sql, new TSqlContext(
+                "lake", new Dictionary<string, string>(), new HashSet<string>(), "sa",
+                Identity: identity,
+                Identities: table => table.Equals("orders", StringComparison.OrdinalIgnoreCase) ? orders : null))
+                .Select(t => t.Sql));
+
+        Assert.Equal("SELECT CAST(42 AS DECIMAL(38,0))", Translated("SELECT SCOPE_IDENTITY()", 42m, null));
+        Assert.Equal("SELECT CAST(42 AS DECIMAL(38,0))", Translated("SELECT @@IDENTITY", 42m, null));
+
+        // Nothing generated is a null rather than a zero, which would be a key.
+        Assert.Equal("SELECT CAST(NULL AS DECIMAL(38,0))", Translated("SELECT SCOPE_IDENTITY()", null, null));
+
+        // IDENT_CURRENT is the table's rather than the session's, and the schema it was written
+        // with is not part of the question: a lake has one.
+        Assert.Equal("SELECT CAST(7 AS DECIMAL(38,0))", Translated("SELECT IDENT_CURRENT('orders')", null, 7m));
+        Assert.Equal("SELECT CAST(7 AS DECIMAL(38,0))", Translated("SELECT IDENT_CURRENT('[dbo].[orders]')", null, 7m));
+        Assert.Equal("SELECT CAST(NULL AS DECIMAL(38,0))", Translated("SELECT IDENT_CURRENT('other')", null, 7m));
+    }
+
     [Fact]
     public void PlusConcatenatesOnlyWhenItCanBeProved()
     {

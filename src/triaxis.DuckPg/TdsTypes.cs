@@ -20,7 +20,7 @@ static class TdsTypes
 
     /// A variable-length type declared with this length is a MAX type, whose values are sent in
     /// chunks rather than with one leading length.
-    const ushort Max = 0xFFFF;
+    public const ushort Max = 0xFFFF;
 
     /// Microseconds, which is what DuckDB stores and what .NET can render without rounding.
     const int FractionScale = 6;
@@ -329,7 +329,14 @@ static class TdsTypes
     // ---- parameters ------------------------------------------------------------------------------
 
     /// One RPC parameter: its declared type, read straight off the wire, and then its value.
-    public static object? ReadValue(ref TdsReader reader)
+    ///
+    /// The type comes back as the column an answer to it would go out in, which is not always the
+    /// one it arrived as: a parameter marked OUTPUT is answered in what the caller declared, and
+    /// what this writes is a narrower set than what a client may send. Text and binary go back as a
+    /// MAX of their own kind, since that is the only length `WriteValue` chunks correctly, and the
+    /// three shapes newer types replaced -- MONEY, the pre-2008 DATETIME, and the legacy LOBs -- go
+    /// back as what replaced them.
+    public static (TdsColumn Column, object? Value) ReadParameter(ref TdsReader reader)
     {
         var token = reader.U8();
         switch (token)
@@ -338,8 +345,14 @@ static class TdsTypes
             {
                 var declared = reader.U8();
                 var length = reader.U8();
-                if (length == 0) return null;
-                return Scalar(token, declared, reader.Bytes(length));
+                var column = token switch
+                {
+                    MoneyN => Decimal(19, 4),
+                    DateTimeN => new TdsColumn(DateTime2, Scale: FractionScale),
+                    BitN => new TdsColumn(BitN, 1),
+                    _ => new TdsColumn(token, declared),
+                };
+                return (column, length == 0 ? null : Scalar(token, declared, reader.Bytes(length)));
             }
 
             case DecimalN or NumericN:
@@ -348,21 +361,22 @@ static class TdsTypes
                 var precision = reader.U8();
                 var scale = reader.U8();
                 var length = reader.U8();
-                if (length == 0) return null;
-                return ReadDecimal(reader.Bytes(length), scale);
+                return (Decimal(precision, scale),
+                        length == 0 ? null : ReadDecimal(reader.Bytes(length), scale));
             }
 
             case Date:
             {
                 var length = reader.U8();
-                return length == 0 ? null : FromDays(reader.Bytes(3));
+                return (new TdsColumn(Date), length == 0 ? null : FromDays(reader.Bytes(3)));
             }
 
             case Time or DateTime2 or DateTimeOffset:
             {
                 var scale = reader.U8();
                 var length = reader.U8();
-                return length == 0 ? null : ReadTemporal(token, scale, reader.Bytes(length));
+                return (new TdsColumn(token, Scale: FractionScale),
+                        length == 0 ? null : ReadTemporal(token, scale, reader.Bytes(length)));
             }
 
             case NVarChar or NChar or Char or VarChar:
@@ -370,14 +384,14 @@ static class TdsTypes
                 var declared = reader.U16();
                 reader.Skip(5); // collation
                 var bytes = ReadVariable(ref reader, declared);
-                return bytes is null ? null
-                    : token is NVarChar or NChar ? Encoding.Unicode.GetString(bytes) : Encoding.UTF8.GetString(bytes);
+                return (new TdsColumn(NVarChar, Max), bytes is null ? null
+                    : token is NVarChar or NChar ? Encoding.Unicode.GetString(bytes) : Encoding.UTF8.GetString(bytes));
             }
 
             case VarBinary or Binary:
             {
                 var declared = reader.U16();
-                return ReadVariable(ref reader, declared);
+                return (new TdsColumn(VarBinary, Max), ReadVariable(ref reader, declared));
             }
 
             // The legacy LOB types, which an old client still sends: their declared maximum is four
@@ -387,19 +401,20 @@ static class TdsTypes
                 reader.I32();
                 if (token is Text or NText) reader.Skip(5); // collation
                 var length = reader.I32();
-                if (length < 0) return null;
+                var column = new TdsColumn(token == Image ? VarBinary : NVarChar, Max);
+                if (length < 0) return (column, null);
 
                 var bytes = reader.Bytes(length);
-                return token switch
+                return (column, token switch
                 {
                     NText => Encoding.Unicode.GetString(bytes),
                     Text => Encoding.UTF8.GetString(bytes),
                     _ => bytes,
-                };
+                });
             }
 
             case 0x1F: // NULLTYPE, which is what an untyped null parameter arrives as
-                return null;
+                return (new TdsColumn(NVarChar, Max), null);
 
             default:
                 throw new ProtocolException($"unsupported parameter type 0x{token:X2}");

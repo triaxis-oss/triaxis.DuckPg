@@ -104,9 +104,36 @@ sealed class TSqlParser
     Statement SelectOrInto()
     {
         var query = Query();
-        return query.Body is SelectBody { Into: { } target } body
-            ? new SelectIntoStatement(target, query with { Body = body with { Into = null } })
-            : new SelectStatement(query);
+        return Assigning(query)
+            ?? (query.Body is SelectBody { Into: { } target } body
+                ? new SelectIntoStatement(target, query with { Body = body with { Into = null } })
+                : new SelectStatement(query));
+    }
+
+    /// `SELECT @a = x` assigns rather than returns, and there is nothing it could be mistaken for:
+    /// a comparison against a variable is projected by parenthesising it. All of the list or none of
+    /// it, which is where SQL Server draws the line too -- a statement that both assigned and
+    /// returned would be neither.
+    static Statement? Assigning(Query query)
+    {
+        if (query.Body is not SelectBody body) return null;
+
+        var targets = body.Items
+            .Select(item => item.Expr is BinaryExpr { Operator: "=", Left: VariableRef { System: false } target }
+                ? target.Name : null)
+            .ToList();
+
+        if (targets.All(target => target is null)) return null;
+        if (targets.Any(target => target is null))
+            throw new TSqlException("a SELECT either assigns to variables or returns rows, not both", 0);
+
+        return new AssignStatement([.. targets.Select(target => target!)], query with
+        {
+            Body = body with
+            {
+                Items = [.. body.Items.Select(item => new SelectItem(((BinaryExpr)item.Expr).Right, null))],
+            },
+        });
     }
 
     /// `DROP TABLE [IF EXISTS] #t`, which is how a client clears the scratch table it made. What a
