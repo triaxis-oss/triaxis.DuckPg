@@ -148,6 +148,19 @@ public class MaterializeTests : IDisposable
         Assert.Equal(["1", "2"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
     }
 
+    /// A row-limited write is limited on the keys either way -- there is no tombstone here to hide
+    /// what a limit left behind, which is the one step the two modes do not share.
+    [Fact]
+    public void ARowLimitedDeleteTakesTheRowsItSaysAndNoMore()
+    {
+        using (var connection = Open())
+            Assert.Equal(2, new SqlCommand("DELETE TOP (2) FROM [orders]", connection).ExecuteNonQuery());
+
+        Assert.Single(lake.Query("SELECT order_id FROM lake.orders"));
+        lake.Restart();
+        Assert.Single(lake.Query("SELECT order_id FROM lake.orders"));
+    }
+
     /// The delta is the write layer's own format, so an ordinary lake reads it as the layer it is.
     [Fact]
     public void AndAnOrdinaryLakeReadsThatDeltaBack()

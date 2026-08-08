@@ -33,11 +33,18 @@ sealed record OutputItem(Expr Value, Name? Alias);
 /// `MERGE ... WHEN MATCHED THEN UPDATE` desugars to this too, which is why the target carries an
 /// alias: the assignments and the join condition both name it.
 sealed record UpdateStatement(TableName Target, Name? Alias, List<Assignment> Assignments, TableSource? From,
-                              Expr? Where, List<OutputItem> Output) : Statement;
+                              Expr? Where, List<OutputItem> Output, RowLimit? Top = null) : Statement;
 
 /// `Alias` is the target's own, which `DELETE FROM [s] FROM [t] AS [s]` names instead of the table.
 sealed record DeleteStatement(TableName Target, Name? Alias, TableSource? From, Expr? Where,
-                              List<OutputItem> Output) : Statement;
+                              List<OutputItem> Output, RowLimit? Top = null) : Statement;
+
+/// `DELETE TOP (n) [PERCENT]` and its UPDATE twin: at most that many of the rows the predicate
+/// matches, and which of them is left unsaid -- there is no ORDER BY in this form and SQL Server
+/// says outright that the set is unordered. Kept as its own record rather than as a query's
+/// `Top`/`TopPercent` pair, since a write's limit is answered somewhere else entirely: what a row
+/// is, and so what "one of them" counts, is the lake's key rather than the statement's.
+sealed record RowLimit(Expr Count, bool Percent);
 
 /// `SET NOCOUNT ON`, `SET TRANSACTION ISOLATION LEVEL …` — session options a client sets and a
 /// lake has no opinion about.
