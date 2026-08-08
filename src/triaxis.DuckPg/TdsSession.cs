@@ -34,7 +34,19 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     sealed record Prepared(string Statement, string Declaration);
 
-    static readonly Dictionary<string, object?> NoParameters = new();
+    /// One parameter of a call: what the caller sent, the column an answer to it goes back in, and
+    /// whether it asked for one at all.
+    sealed record Parameter(object? Value, TdsColumn Column, bool Output);
+
+    static readonly Dictionary<string, Parameter> NoParameters = new();
+
+    /// What the batch assigned to the caller's parameters, which is what an OUTPUT one is answered
+    /// with. Per call: a statement that assigns nothing leaves the parameter as it went in.
+    readonly Dictionary<string, object?> assigned = new(StringComparer.OrdinalIgnoreCase);
+
+    /// The last key this session's writes generated, which is what `SCOPE_IDENTITY()` answers. Not
+    /// cleared by a rollback: SQL Server does not give a generated key back either.
+    decimal? identity;
 
     public void Run()
     {
@@ -235,13 +247,9 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     /// Runs one client statement, or several: a batch is a list of statements sharing a response,
     /// and every statement but the last says there is more to come.
-    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, object?> parameters, byte doneToken)
+    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken)
     {
-        var context = new TSqlContext(gateway.Config.Schema, Variables(),
-            (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"],
-            gateway.Catalog.Types, gateway.Catalog.Functions, false,
-            gateway.Config.SortSmallTables ? gateway.Catalog.Rows : null);
-        var statements = TSqlTranslator.Translate(sql, context);
+        var statements = TSqlParser.Parse(sql);
 
         if (statements.Count == 0)
         {
@@ -252,19 +260,31 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         for (var i = 0; i < statements.Count; i++)
         {
             var last = i == statements.Count - 1;
-            var plan = gateway.Translate(statements[i].Sql);
-            Execute(msg, plan, parameters, last ? doneToken : TdsToken.DoneInProc, last,
-                    statements[i].Reorder);
+
+            // Rendered one at a time rather than the batch at once: `@@ROWCOUNT`, `@@TRANCOUNT` and
+            // `SCOPE_IDENTITY()` go into the statement as literals, so a statement has to be
+            // written after the one before it has run -- which is what `INSERT …; SELECT
+            // SCOPE_IDENTITY()` is asking for.
+            var translated = TSqlTranslator.Translate(statements[i], Context(parameters));
+            var plan = gateway.Translate(translated.Sql);
+            Execute(msg, plan, parameters, last ? doneToken : TdsToken.DoneInProc, last, translated);
         }
     }
 
-    void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken, bool last,
-                 Reorder? reorder = null)
+    TSqlContext Context(IReadOnlyDictionary<string, Parameter> parameters) =>
+        new(gateway.Config.Schema, Variables(),
+            (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"],
+            gateway.Catalog.Types, gateway.Catalog.Functions, false,
+            gateway.Config.SortSmallTables ? gateway.Catalog.Rows : null,
+            identity, gateway.IdentityOf);
+
+    void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken, bool last,
+                 Translated? translated = null)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
         try
         {
-            Perform(msg, plan, parameters, doneToken, last, reorder);
+            Perform(msg, plan, parameters, doneToken, last, translated);
         }
         finally
         {
@@ -281,8 +301,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         gateway.ExitTurn();
     }
 
-    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, object?> parameters, byte doneToken,
-                 bool last, Reorder? reorder)
+    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken,
+                 bool last, Translated? translated)
     {
         Checked(plan, parameters);
 
@@ -293,15 +313,37 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 Done(msg, doneToken, last ? Status.Final : Status.More, 0);
                 return;
 
+            // An assignment select produces its values like any other query and hands none of them
+            // to the client: they go into the caller's parameters, and back out with the call.
+            case PlanKind.Rows when translated?.Assigns is { } variables:
+            {
+                using var command = Command(plan.Steps[^1], parameters);
+                using var reader = Execute(command);
+
+                // The last row wins, and a query that found none leaves the variables alone --
+                // which is what SQL Server does, and why `@@ROWCOUNT` is what it counted.
+                var rows = 0L;
+                while (reader.Read())
+                {
+                    for (var i = 0; i < variables.Count; i++)
+                        assigned[variables[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    rows++;
+                }
+
+                // `@@ROWCOUNT` counts what the query found, but the DONE token carries no count: an
+                // assignment select is not a statement that affected rows, and a caller running
+                // `INSERT …; SELECT @id = SCOPE_IDENTITY()` through `ExecuteNonQuery` is told about
+                // the insert alone.
+                rowCount = rows;
+                Done(msg, doneToken, last ? Status.Final : Status.More, 0);
+                return;
+            }
+
             case PlanKind.Rows:
             {
                 // An insert asked what it wrote puts the rows down before it can answer with them;
                 // whatever came first, the last step is the one that has rows.
-                foreach (var step in plan.Steps[..^1])
-                {
-                    using var written = Command(step, parameters);
-                    written.ExecuteNonQuery();
-                }
+                Steps(plan, parameters, plan.Steps.Length - 1);
 
                 using var command = Command(plan.Steps[^1], parameters);
                 using var reader = Execute(command);
@@ -309,8 +351,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 // The ordering and the limit were taken off the statement before it was sent, so
                 // they are applied to what came back -- and only ever for a table the catalog
                 // counted small, which is what bounds how much is held to do it.
-                using var result = reorder is null ? new ReaderRows(reader)
-                                                  : (IRows)SortedRows.Of(reader, reorder);
+                using var result = translated?.Reorder is { } reorder ? (IRows)SortedRows.Of(reader, reorder)
+                                                                      : new ReaderRows(reader);
                 var rows = Rows(msg, result);
                 gateway.Grew(plan, (int)rows);
                 if (plan.Steps.Length > 1) Persist(plan);
@@ -322,13 +364,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
             case PlanKind.Count:
             {
-                var affected = 0;
                 var started = Stopwatch.GetTimestamp();
-                foreach (var step in plan.Steps)
-                {
-                    using var command = Command(step, parameters);
-                    affected = command.ExecuteNonQuery();
-                }
+                var affected = Steps(plan, parameters, plan.Steps.Length);
                 if (plan.Affected is { } query)
                 {
                     using var command = Command(query, parameters);
@@ -355,10 +392,36 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
     }
 
+    /// The plan's write steps, in order, and how many rows the last of them touched. One of them may
+    /// be the step that generates a key, and that one is read rather than counted: what it hands
+    /// back is what `SCOPE_IDENTITY()` and `IDENT_CURRENT` are later asked about.
+    int Steps(Plan plan, IReadOnlyDictionary<string, Parameter> parameters, int count)
+    {
+        var affected = 0;
+        for (var i = 0; i < count; i++)
+        {
+            using var command = Command(plan.Steps[i], parameters);
+            if (plan.Identity is not { } generated || i != plan.IdentityStep)
+            {
+                affected = command.ExecuteNonQuery();
+                continue;
+            }
+
+            var (rows, value) = generated.Read(command);
+            if (value is { } key)
+            {
+                identity = key;
+                gateway.Identified(generated.Table, key);
+            }
+            affected = rows;
+        }
+        return affected;
+    }
+
     /// What has to be true before a plan runs at all -- a reference nothing else may still be
     /// pointing at. Before, because a statement outside a transaction commits each step as it goes,
     /// so a rule enforced afterwards would be enforced on a row already gone.
-    void Checked(Plan plan, IReadOnlyDictionary<string, object?> parameters)
+    void Checked(Plan plan, IReadOnlyDictionary<string, Parameter> parameters)
     {
         foreach (var check in plan.Checks ?? [])
         {
@@ -501,12 +564,12 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     bool attention;
 
-    DbCommand Command(string sql, IReadOnlyDictionary<string, object?> parameters)
+    DbCommand Command(string sql, IReadOnlyDictionary<string, Parameter> parameters)
     {
         var command = duck.CreateCommand();
         command.CommandText = sql;
-        foreach (var (name, value) in parameters)
-            command.Parameters.Add(new DuckDBParameter(name, value ?? DBNull.Value));
+        foreach (var (name, parameter) in parameters)
+            command.Parameters.Add(new DuckDBParameter(name, parameter.Value ?? DBNull.Value));
         return command;
     }
 
@@ -526,7 +589,6 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         ["spid"] = ProcessId.ToString(),
         ["servername"] = SqlText.Literal("duckpg"),
         ["language"] = SqlText.Literal("us_english"),
-        ["identity"] = "NULL",
     };
 
     public int ProcessId { get; } = Random.Shared.Next(1, short.MaxValue);
@@ -551,14 +613,17 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             var name = nameLength == 0xFFFF ? "" : reader.Ucs2(nameLength);
             reader.Skip(2); // option flags
 
-            var arguments = new List<(string Name, object? Value)>();
+            var arguments = new List<Argument>();
             while (!reader.AtEnd)
             {
                 // A byte where a parameter name should start is the separator before the next call.
                 if (payload[reader.Position] is 0x80 or 0xFF) break;
                 var parameter = reader.BVarchar();
-                reader.Skip(1); // status flags
-                arguments.Add((parameter.TrimStart('@'), TdsTypes.ReadValue(ref reader)));
+                var status = reader.U8();
+                var (column, value) = TdsTypes.ReadParameter(ref reader);
+
+                // BY_REF_VALUE: the caller wants this one back, whatever the batch makes of it.
+                arguments.Add(new Argument(parameter.TrimStart('@'), value, column, (status & 0x01) != 0));
             }
 
             Call(msg, procedure, name, arguments);
@@ -569,10 +634,16 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         wire.Send(TdsMessage.Result, msg);
     }
 
-    void Call(TdsMsg msg, ushort procedure, string name, List<(string Name, object? Value)> arguments)
+    /// One argument of a call, as it arrived: what the caller named it, what it sent, the column an
+    /// answer goes back in, and whether it asked for one.
+    sealed record Argument(string Name, object? Value, TdsColumn Column, bool Output);
+
+    void Call(TdsMsg msg, ushort procedure, string name, List<Argument> arguments)
     {
         if (name.Length > 0 && !name.StartsWith("sp_", StringComparison.OrdinalIgnoreCase))
             throw new PgError("42883", $"stored procedure {name} does not exist");
+
+        assigned.Clear();
 
         var kind = procedure != 0 ? procedure : name.ToLowerInvariant() switch
         {
@@ -589,16 +660,22 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         switch (kind)
         {
             case Procedure.ExecuteSql:
-                Run(msg, Text(arguments, 0), Bind(Declaration(arguments, 1), arguments.Skip(2)), TdsToken.DoneInProc);
+            {
+                var bound = Bind(Declaration(arguments, 1), arguments.Skip(2));
+                Run(msg, Text(arguments, 0), bound, TdsToken.DoneInProc);
+                Outputs(msg, bound);
                 break;
+            }
 
             case Procedure.PrepExec:
             {
                 var handle = ++handles;
                 prepared[handle] = new Prepared(Text(arguments, 2), Declaration(arguments, 1));
-                ReturnValue(msg, "handle", handle, wire.Payload);
-                Run(msg, prepared[handle].Statement,
-                    Bind(prepared[handle].Declaration, arguments.Skip(3)), TdsToken.DoneInProc);
+                ReturnValue(msg, "handle", new TdsColumn(TdsTypes.IntN, 4), handle);
+
+                var bound = Bind(prepared[handle].Declaration, arguments.Skip(3));
+                Run(msg, prepared[handle].Statement, bound, TdsToken.DoneInProc);
+                Outputs(msg, bound);
                 break;
             }
 
@@ -606,7 +683,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             {
                 var handle = ++handles;
                 prepared[handle] = new Prepared(Text(arguments, 2), Declaration(arguments, 1));
-                ReturnValue(msg, "handle", handle, wire.Payload);
+                ReturnValue(msg, "handle", new TdsColumn(TdsTypes.IntN, 4), handle);
                 Done(msg, TdsToken.DoneInProc, Status.Final, 0);
                 break;
             }
@@ -616,7 +693,10 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 var handle = Convert.ToInt32(arguments[0].Value);
                 if (!prepared.TryGetValue(handle, out var statement))
                     throw new PgError("26000", $"prepared handle {handle} is unknown");
-                Run(msg, statement.Statement, Bind(statement.Declaration, arguments.Skip(1)), TdsToken.DoneInProc);
+
+                var bound = Bind(statement.Declaration, arguments.Skip(1));
+                Run(msg, statement.Statement, bound, TdsToken.DoneInProc);
+                Outputs(msg, bound);
                 break;
             }
 
@@ -635,11 +715,25 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         Done(msg, TdsToken.DoneProc, Status.Final, 0);
     }
 
+    /// What the caller asked to have back. A parameter it marked OUTPUT carries whatever the batch
+    /// assigned to it, in the type the caller declared -- and one nothing assigned comes back as it
+    /// went in, which is what a procedure that never touched it hands back.
+    void Outputs(TdsMsg msg, Dictionary<string, Parameter> bound)
+    {
+        foreach (var (name, parameter) in bound.Where(p => p.Value.Output))
+            ReturnValue(msg, name, parameter.Column,
+                        assigned.TryGetValue(name, out var value) ? value : parameter.Value);
+    }
+
     void Reset()
     {
         prepared.Clear();
         pendingWrites.Clear();
         transactions = 0;
+
+        // A key is session state, and this connection is now somebody else's: whoever gets it next
+        // asking `SCOPE_IDENTITY()` must not be handed a row the last session wrote.
+        identity = null;
         Release();
         DropTemporaryTables();
     }
@@ -665,16 +759,16 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
     }
 
-    static string Text(List<(string Name, object? Value)> arguments, int index) =>
+    static string Text(List<Argument> arguments, int index) =>
         index < arguments.Count ? arguments[index].Value?.ToString() ?? "" : "";
 
-    static string Declaration(List<(string Name, object? Value)> arguments, int index) => Text(arguments, index);
+    static string Declaration(List<Argument> arguments, int index) => Text(arguments, index);
 
     /// sp_executesql declares its parameters in a string; the values follow in the same order, so
     /// the declaration is only needed for the names a statement will refer to.
-    static Dictionary<string, object?> Bind(string declaration, IEnumerable<(string Name, object? Value)> values)
+    static Dictionary<string, Parameter> Bind(string declaration, IEnumerable<Argument> values)
     {
-        var bound = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        var bound = new Dictionary<string, Parameter>(StringComparer.OrdinalIgnoreCase);
         var declared = declaration
             .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .Select(part => part.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "")
@@ -683,25 +777,29 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             .ToList();
 
         var index = 0;
-        foreach (var (name, value) in values)
+        foreach (var argument in values)
         {
-            var key = name.Length > 0 ? name : index < declared.Count ? declared[index] : $"p{index}";
-            bound[key] = value;
+            var key = argument.Name.Length > 0 ? argument.Name
+                : index < declared.Count ? declared[index] : $"p{index}";
+            bound[key] = new Parameter(argument.Value, argument.Column, argument.Output);
             index++;
         }
 
         // A declared parameter the client did not send a value for is still a name the statement
-        // may mention, and DuckDB needs every placeholder bound.
-        foreach (var name in declared) bound.TryAdd(name, null);
+        // may mention, and DuckDB needs every placeholder bound. It cannot be one asked back for,
+        // since a caller expecting an answer sends the parameter -- so its column is never written.
+        foreach (var name in declared)
+            bound.TryAdd(name, new Parameter(null, new TdsColumn(TdsTypes.NVarChar, TdsTypes.Max), false));
         return bound;
     }
 
-    static void ReturnValue(TdsMsg msg, string name, int value, int payload)
+    /// A value going back to the caller under the name it gave the parameter -- the `@` included,
+    /// since that is the name SqlClient matches its own parameters by.
+    void ReturnValue(TdsMsg msg, string name, TdsColumn column, object? value)
     {
-        var column = new TdsColumn(TdsTypes.IntN, 4);
-        msg.U8(0xAC).U16(0).BVarchar(name).U8(0x01).I32(0).U16(0x0001);
+        msg.U8(TdsToken.ReturnValue).U16(0).BVarchar("@" + name).U8(0x01).I32(0).U16(0x0001);
         TdsTypes.WriteTypeInfo(msg, column);
-        TdsTypes.WriteValue(msg, column, value, payload);
+        TdsTypes.WriteValue(msg, column, value, wire.Payload);
     }
 
     // ---- transactions ----------------------------------------------------------------------------

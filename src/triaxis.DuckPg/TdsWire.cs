@@ -15,9 +15,9 @@ static class TdsMessage
 /// The tokens a response stream is made of.
 static class TdsToken
 {
-    public const byte ReturnStatus = 0x79, ColMetadata = 0x81, Error = 0xAA, Info = 0xAB,
-                      LoginAck = 0xAD, Row = 0xD1, EnvChange = 0xE3, Done = 0xFD, DoneProc = 0xFE,
-                      DoneInProc = 0xFF;
+    public const byte ReturnStatus = 0x79, ColMetadata = 0x81, ReturnValue = 0xAC, Error = 0xAA,
+                      Info = 0xAB, LoginAck = 0xAD, Row = 0xD1, EnvChange = 0xE3, Done = 0xFD,
+                      DoneProc = 0xFE, DoneInProc = 0xFF;
 }
 
 /// Body builder for a response. Everything inside a TDS packet is little-endian; only the packet

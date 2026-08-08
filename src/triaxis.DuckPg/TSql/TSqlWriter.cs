@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 
 namespace triaxis.DuckPg.TSql;
@@ -23,7 +24,12 @@ sealed record TSqlContext(
     /// How many rows a table holds, for the tables held as tables and small enough to sort here
     /// rather than in DuckDB. Null where nothing is offered that, which is every lake but a
     /// materialized one.
-    Func<string, long?>? Small = null);
+    Func<string, long?>? Small = null,
+    /// The last identity this session generated, which is what `SCOPE_IDENTITY()` and `@@IDENTITY`
+    /// answer. The session's own, so one connection cannot read the key another was handed.
+    decimal? Identity = null,
+    /// The last identity generated for a table by anybody, which is what `IDENT_CURRENT` answers.
+    Func<string, decimal?>? Identities = null);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -83,6 +89,12 @@ sealed class TSqlWriter(TSqlContext context)
         {
             case SelectStatement select:
                 Query(select.Query);
+                return;
+
+            // The values are produced like any other query's; who they go to is the session's,
+            // since a variable is the caller's and not the database's.
+            case AssignStatement assign:
+                Query(assign.Query);
                 return;
 
             case SelectIntoStatement into:
@@ -766,12 +778,31 @@ sealed class TSqlWriter(TSqlContext context)
         return SqlText.Quote(resolved) + "." + SqlText.Quote(function.Text);
     }
 
+    /// All three ways of asking for a generated key answer `numeric(38,0)` in SQL Server, whatever
+    /// the column itself was declared as -- so the value is written as one rather than as the number
+    /// it happens to be, and never having generated one is a null rather than a zero.
+    static string Numeric(decimal? value) =>
+        $"CAST({value?.ToString(CultureInfo.InvariantCulture) ?? "NULL"} AS DECIMAL(38,0))";
+
+    /// The table `IDENT_CURRENT` is asked about, which is written as a string and may be qualified.
+    /// Only the table's own name is kept: what schema means here is the lake's, and it is the only
+    /// one a key was generated in.
+    static string Named(Expr argument) => argument switch
+    {
+        Literal { Kind: LiteralKind.String, Text: var text } => text.Split('.')[^1].Trim('[', ']', '"'),
+        _ => throw new TSqlException("IDENT_CURRENT takes the name of a table, written as a string", 0),
+    };
+
     string Variable(VariableRef variable)
     {
         if (!variable.System)
             return context.Parameters.Contains(variable.Name)
                 ? context.Macro ? SqlText.Quote(variable.Name) : "$" + variable.Name
                 : throw new TSqlException($"undeclared variable @{variable.Name}", 0);
+
+        // `@@IDENTITY` is `SCOPE_IDENTITY()` without the scope, and without triggers there is no
+        // scope to tell the two apart -- so one remembered value answers both.
+        if (variable.Name.Equals("identity", StringComparison.OrdinalIgnoreCase)) return Numeric(context.Identity);
 
         return context.Variables.TryGetValue(variable.Name, out var value)
             ? value
@@ -909,8 +940,16 @@ sealed class TSqlWriter(TSqlContext context)
                 Put(") ^ 2");
                 return true;
 
-            case "scope_identity" or "ident_current":
-                throw new TSqlException($"{name}() has no meaning over files", 0);
+            // What the store filled in, answered from what it remembers rather than from the files:
+            // a row in a layer does not say when it was written, and the last key handed out is the
+            // one thing only the process that handed it out knows.
+            case "scope_identity" when args.Count == 0:
+                Put(Numeric(context.Identity));
+                return true;
+
+            case "ident_current" when args.Count == 1:
+                Put(Numeric(context.Identities?.Invoke(Named(args[0]))));
+                return true;
 
             default:
                 return false;

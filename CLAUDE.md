@@ -662,6 +662,59 @@ publish a temp-directory convention as API.
   off the table, which is how an `int` key reached SqlClient as a long. It is per process, so two serving the same
   write directory would collide; and an OUTPUT naming anything else a lake does not generate is
   refused, since the alternative is answering with a null the caller would store.
+- **A generated key is remembered because the write handed it back, and for no other reason.** The
+  sequence cannot be asked afterwards: DuckDB's `currval` is the *database's* last value and not the
+  connection's -- measured, two connections read each other's -- so it answers a question about
+  another session as readily as about this one. So the write says instead: `Gateway.Identifying` puts
+  `RETURNING <key>` on the step that inserts, `Plan.IdentityStep` names which step that is, and
+  `Identity.Read` reads the keys off it rather than counting rows -- `ExecuteNonQuery` reports nothing
+  for a statement carrying `RETURNING`, which is what made a PostgreSQL-side insert report zero rows
+  the first time this was built. The step is *derived* rather than stored, since `Promoting` prepends
+  to `Steps` and an index would then point at the promotion. The last key of the several a batch
+  writes is the answer, which is the row written last. Both doors read it, because
+  `IDENT_CURRENT` is the process's and a lake serves two front doors; only the TDS one can ask.
+  Nothing here survives a restart: which row was written last is not something a layer file records,
+  so `SCOPE_IDENTITY()` before this process generated anything is a null rather than a zero.
+- **What that costs is the driver's reader and not the `RETURNING`, which is free.** Measured against
+  DuckDB directly, median over 500: 0.757 ms for the insert, 0.731 with `RETURNING` through
+  `ExecuteNonQuery` -- the same within noise -- and 0.856 reading it back, so ~0.10 ms is
+  `DuckDBDataReader` being materialized for one row of one column. End to end through the TDS door on
+  a materialized lake that is 1.3 → 1.5 ms on the cheapest write there is, and on a layered lake it
+  cannot be measured at all: persisting the parquet dominates, at ~4 ms either way. It is paid only
+  by an insert into a table with a declared identity the statement left out -- the same insert that
+  skips the duplicate-key check, since a key the store generates cannot collide -- and nothing else
+  moved: the same statement against a table with no identity measured 3.3 ms before and 3.3 after,
+  which is what says the parameter plumbing costs nothing.
+- **`SCOPE_IDENTITY()` is per connection and `IDENT_CURRENT` is per table, which is why they are kept
+  in two different places.** `TdsSession.identity` is the session's and `Gateway.identities` is the
+  process's; `@@IDENTITY` is `SCOPE_IDENTITY()` without the scope, and without triggers there is no
+  scope to tell them apart, so one value backs both -- answered in `TSqlWriter.Variable` rather than
+  through the `Variables` dictionary, or the same number would have two sources. All three render as
+  `numeric(38,0)`, which is what SQL Server answers whatever the column was declared as.
+- **A batch is translated a statement at a time, and that is what makes any of it work.** Every
+  session value a statement mentions -- `@@ROWCOUNT`, `@@TRANCOUNT`, `SCOPE_IDENTITY()` -- is written
+  into it as a literal, so rendering the whole batch up front renders the second statement against
+  the state the first has not yet changed. `INSERT …; SELECT @id = SCOPE_IDENTITY()` is exactly that
+  shape, and it is what a client sends. `TSqlParser.Parse` still reads the batch once; only the
+  rendering moved into the loop, which is why `TSqlTranslator.Translate` now takes a statement.
+- **`SELECT @a = x` assigns and `SELECT a = x` aliases, and the only difference is that one names a
+  variable.** `TSqlParser.Assigning` reads the whole select list or none of it -- SQL Server refuses
+  the mixture and so does this -- and hands back an `AssignStatement` whose `Query` is the same query
+  with the assignments taken off its items, so what produces the values is a query like any other.
+  What it is not is a comparison: projecting one means parenthesising it. The rows never reach the
+  client; `TdsSession` puts the last row into `assigned` and `Outputs` sends them back as RETURNVALUE
+  tokens for the parameters the RPC marked BY_REF_VALUE. The DONE token carries no count, because
+  SQL Server does not report one for an assignment select -- `INSERT …; SELECT @id = …` through
+  `ExecuteNonQuery` has to answer 1 rather than 2.
+- **An OUTPUT parameter is answered in the type the caller declared, and the wire already says what
+  that is.** `TdsTypes.ReadParameter` hands back the column beside the value, so nothing has to map a
+  declared `int` onto a TDS token twice; `WriteValue` converts whatever DuckDB produced into it, which
+  is how a `DECIMAL(38,0)` `SCOPE_IDENTITY()` reaches a client that declared `Int32`. The column is
+  normalised on the way out rather than echoed: text and binary go back as a MAX of their own kind,
+  since that is the only length `WriteValue` chunks correctly, and MONEY, the pre-2008 DATETIME and
+  the legacy LOBs go back as what replaced them. SqlClient matches a RETURNVALUE to its own parameter
+  **by name, with the `@`** -- `ParameterNameFixed` -- so a token named without it is dropped
+  silently.
 - **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**
   `SAVE TRANSACTION` renders to nothing -- marking a point costs nothing -- but
   `ROLLBACK TRANSACTION <name>` throws instead of rendering a plain `ROLLBACK` or nothing at all:

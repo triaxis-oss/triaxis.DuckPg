@@ -726,6 +726,111 @@ public class TdsTests : IDisposable
         Assert.Contains("duckpg", (string)new SqlCommand("SELECT @@VERSION", connection).ExecuteScalar());
     }
 
+    /// A session value goes into the statement as a literal, so a batch has to be rendered a
+    /// statement at a time -- rendered all at once, the second one answers with what the first had
+    /// not yet changed. This is the same rule `INSERT …; SELECT SCOPE_IDENTITY()` depends on.
+    [Fact]
+    public void ASessionValueIsWhatItIsWhenTheStatementRuns()
+    {
+        using var connection = Open();
+        using var reader = new SqlCommand("SELECT * FROM orders; SELECT @@ROWCOUNT", connection).ExecuteReader();
+
+        while (reader.Read()) { }
+        Assert.True(reader.NextResult());
+        Assert.True(reader.Read());
+        Assert.Equal(3, reader.GetInt32(0));
+    }
+
+    /// `SELECT @out = …` assigns rather than returns, and what it assigned goes back in the call's
+    /// return values -- which is the only way a caller running `ExecuteNonQuery` ever sees it.
+    [Fact]
+    public void AnAssignmentSelectAnswersTheOutputParameter()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @out = 42", connection);
+        var parameter = command.Parameters.Add("@out", System.Data.SqlDbType.Int);
+        parameter.Direction = System.Data.ParameterDirection.Output;
+
+        command.ExecuteNonQuery();
+        Assert.Equal(42, parameter.Value);
+    }
+
+    /// The value comes back in the type the caller declared rather than the one DuckDB answered in,
+    /// since an application reads it as what it asked for.
+    [Theory]
+    [InlineData(System.Data.SqlDbType.Int, "42", 42)]
+    [InlineData(System.Data.SqlDbType.BigInt, "42", 42L)]
+    [InlineData(System.Data.SqlDbType.NVarChar, "'text'", "text")]
+    [InlineData(System.Data.SqlDbType.Bit, "CAST(1 AS BIT)", true)]
+    public void AnOutputParameterKeepsTheTypeItWasDeclared(System.Data.SqlDbType type, string value, object expected)
+    {
+        using var connection = Open();
+        using var command = new SqlCommand($"SELECT @out = {value}", connection);
+        var parameter = command.Parameters.Add("@out", type, 50);
+        parameter.Direction = System.Data.ParameterDirection.Output;
+
+        command.ExecuteNonQuery();
+        Assert.Equal(expected, parameter.Value);
+    }
+
+    /// A query that found nothing assigns nothing, and the parameter comes back as it went in --
+    /// which is what an input/output parameter of a procedure that never touched it does.
+    [Fact]
+    public void AnUnassignedOutputParameterComesBackUnchanged()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @out = order_id FROM orders WHERE order_id = 999", connection);
+        var parameter = command.Parameters.Add("@out", System.Data.SqlDbType.Int);
+        parameter.Direction = System.Data.ParameterDirection.InputOutput;
+        parameter.Value = 7;
+
+        command.ExecuteNonQuery();
+        Assert.Equal(7, parameter.Value);
+    }
+
+    /// Several at once, and each to its own name: the answer is matched by the name the caller gave
+    /// the parameter, not by the order the values were assigned in.
+    [Fact]
+    public void SeveralOutputParametersAreAnsweredByName()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @b = 2, @a = 1", connection);
+        var a = command.Parameters.Add("@a", System.Data.SqlDbType.Int);
+        var b = command.Parameters.Add("@b", System.Data.SqlDbType.Int);
+        a.Direction = System.Data.ParameterDirection.Output;
+        b.Direction = System.Data.ParameterDirection.Output;
+
+        command.ExecuteNonQuery();
+        Assert.Equal(1, a.Value);
+        Assert.Equal(2, b.Value);
+    }
+
+    /// The last row wins, which is what SQL Server does with a select that assigns from several.
+    [Fact]
+    public void AnAssignmentSelectTakesTheLastRow()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @out = order_id FROM orders ORDER BY order_id", connection);
+        var parameter = command.Parameters.Add("@out", System.Data.SqlDbType.Int);
+        parameter.Direction = System.Data.ParameterDirection.Output;
+
+        command.ExecuteNonQuery();
+        Assert.Equal(3, parameter.Value);
+    }
+
+    /// Assigning and returning at once is neither, and SQL Server refuses it too.
+    [Fact]
+    public void ASelectCannotBothAssignAndReturn()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand("SELECT @out = 1, 2", connection);
+        var parameter = command.Parameters.Add("@out", System.Data.SqlDbType.Int);
+        parameter.Direction = System.Data.ParameterDirection.Output;
+
+        var error = Assert.Throws<SqlException>(() => command.ExecuteNonQuery());
+        Assert.Contains("assigns to variables or returns rows", error.Message);
+    }
+
     [Fact]
     public void AFailedStatementLeavesTheConnectionUsable()
     {

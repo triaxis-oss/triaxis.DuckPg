@@ -73,6 +73,9 @@ same way; see [the schema, from a dacpac](schema.md).
 | either of those joined to another table | the other tables become the write's own `FROM`, their conditions its `WHERE` |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
+| `SCOPE_IDENTITY()`, `@@IDENTITY` | the last key this connection generated, as `numeric(38,0)` |
+| `IDENT_CURRENT('t')` | the last key generated for that table, by any connection |
+| `SELECT @id = SCOPE_IDENTITY()` | nothing goes back as rows; the value fills the OUTPUT parameter |
 
 Only an inner join folds into the write's own clauses: an outer one keeps the rows matching nothing,
 and those are rows the write would still touch, which a condition cannot say once the join is gone.
@@ -86,6 +89,25 @@ the caller's hand.
 
 The `MERGE` branches that add or remove rows are refused: what "already there" means when the row a
 statement would shadow lives in a layer below is the lake's question, not one statement's.
+
+A client that cannot use `OUTPUT` reads its key back the older way, and gets the same answer:
+
+```sql
+INSERT INTO [orders] ([amount]) VALUES (@p1) ;SELECT  @id = SCOPE_IDENTITY()
+```
+
+sent as one batch with `@id` declared OUTPUT. The insert hands its generated key back as it writes,
+so what `SCOPE_IDENTITY()` answers is the row that was actually stored rather than wherever the
+sequence has since got to. It is the connection's own — another session never sees it, and it is
+null until that connection has generated one. `@@IDENTITY` is the same value, since there are no
+triggers here for a scope to tell apart, and `IDENT_CURRENT('t')` is the table's rather than the
+session's. All three answer `numeric(38,0)`, whatever the column was declared as, and none of them
+survives a restart: which row was written last is not something a layer file records.
+
+`SELECT @a = x, @b = y` assigns and returns nothing, which is what makes the batch above work
+through `ExecuteNonQuery`; the values go back as the call's return values, in the types the caller
+declared, and a statement that both assigned and returned is refused the way SQL Server refuses it.
+A query that found no rows leaves the parameters as they went in.
 
 An ORM that qualifies everything it writes — LLBLGen Pro among them — is what all of this is for:
 table references, column references and `TOP(@p)` paging over a row-numbered derived table all land

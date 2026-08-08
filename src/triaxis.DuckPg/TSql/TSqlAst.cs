@@ -8,6 +8,12 @@ abstract record Statement;
 
 sealed record SelectStatement(Query Query) : Statement;
 
+/// `SELECT @a = x, @b = y` — T-SQL's assignment select, which returns no rows: the values go into
+/// the variables the caller declared, and back to it as the call's return values. `Query` is the
+/// same query with the assignments taken off its items, so what produces the values is one query
+/// like any other; `Variables` names what each of its columns fills, in order.
+sealed record AssignStatement(List<string> Variables, Query Query) : Statement;
+
 /// `SELECT … INTO #t FROM …` — T-SQL's CTAS, and a statement rather than a query: what it returns
 /// is a table. Only a temporary one, since a lake's tables are its files.
 sealed record SelectIntoStatement(TableName Target, Query Query) : Statement;
