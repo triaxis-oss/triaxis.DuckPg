@@ -236,6 +236,22 @@ public class StoreRefusalTests
         Assert.Contains("materialize", refused.Message);
     }
 
+    /// DuckDB names the database after the file, so the obvious name for a lake's store is the one
+    /// that collides with the schema it publishes into -- and what DuckDB says about it names
+    /// neither.
+    [Fact]
+    public void AStoreNamedAfterTheSchemaIsRefused()
+    {
+        using var lake = new TestLake("store-named-lake")
+            .Json("base", "orders", """[{"order_id": 1}]""")
+            .Stack("base")
+            .Materialized()
+            .StoredAt($"{new Config().Schema}.duckdb");
+
+        var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("schema", refused.Message);
+    }
+
     /// Saying what the file is for, without naming one, is a mode that would silently do nothing.
     [Fact]
     public void AStoreModeWithoutAStoreIsRefused()

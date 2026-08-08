@@ -148,6 +148,17 @@ public sealed class Config
             throw new DuckPgConfigurationException(
                 $"`storeMode: {StoreMode}` says what the store file is for, and no `store` was named");
 
+        // DuckDB names the database after the store file, so `store: lake.duckdb` under the default
+        // schema makes every `lake.orders` the catalog builds ambiguous between the two. What comes
+        // out otherwise is a binder error from the first materialized table, naming neither the file
+        // nor the schema -- and the obvious name for the file is the one that cannot be used.
+        if (Store is { Length: > 0 } file &&
+            string.Equals(Path.GetFileNameWithoutExtension(file), Schema, StringComparison.OrdinalIgnoreCase))
+            throw new DuckPgConfigurationException(
+                $"the store file names the database `{Path.GetFileNameWithoutExtension(file)}`, which is " +
+                $"also the schema this lake publishes into -- DuckDB cannot tell the two apart, so " +
+                $"name the file something else or set `schema`");
+
         // A filter and a `getvariable()` column are answered per session, and a table shared by
         // every session cannot carry either. Refused rather than dropped: a mode that silently
         // stopped filtering rows would be the worst way to find this out.
