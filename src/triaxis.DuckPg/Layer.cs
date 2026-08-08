@@ -287,15 +287,21 @@ static class Layer
 /// walk, so they live together.
 static class Yaml
 {
-    static string Scratch => Path.Combine(Path.GetTempPath(), "duckpg");
-
     /// The source as JSON DuckDB can read. The whole tree is mirrored rather than one file,
     /// because the `k=v` directories above the files are part of what is being read -- the copy
     /// has to keep them for the partitions to survive the conversion.
+    ///
+    /// The copy belongs to this conversion and to nothing else. Naming it after the layer instead
+    /// made it a machine-wide cache two lakes over one layer were both inside, converting into each
+    /// other's files and deleting the tree the other was still reading -- and a cache discarded as
+    /// soon as it is read is one nothing can be reused out of, so what the sharing bought was the
+    /// race. `CreateTempSubdirectory` is what a name nobody else can derive costs: unique across
+    /// processes as readily as across tasks, and no directory anyone else has to be able to write
+    /// into either.
     public static string ToJsonTree(string glob, string? key, LayerFormat format)
     {
         var root = Root(glob);
-        var scratch = Path.Combine(Scratch, $"{Path.GetFileName(root)}-{glob.GetHashCode():x8}");
+        var scratch = Directory.CreateTempSubdirectory("duckpg-").FullName;
 
         foreach (var file in Expand(glob))
         {
