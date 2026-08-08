@@ -630,6 +630,30 @@ publish a temp-directory convention as API.
   the real one into `USING` and left the write against nothing. The alias then has to survive into
   the gateway, since the predicate names it too -- which is what `Gateway.DeleteAlias` keeps, and why
   the scan carries an `AS`.
+- **A write's target is named as often as it is aliased, and an ORM names it.** EF Core writes
+  `DELETE FROM [s] FROM [t] AS [s]`; LLBLGen spells every table out in full and puts the target
+  *inside* its own join tree -- `DELETE FROM [db].[dbo].[t] FROM ((… INNER JOIN [db].[dbo].[t] ON …)
+  LEFT JOIN …)`. So `TSqlParser.Bound` resolves either way: an alias the clause bound, or, failing
+  that, the one unaliased source carrying that table's name. *One* -- a name matching two sources is
+  ambiguous and left alone, which is what SQL Server does with it, and a target that resolves to
+  nothing is the plain `UPDATE t SET … FROM s` where the FROM clause is something the target reads
+  rather than something it sits in. The old guard was `target.Parts is not [var named]`, so a
+  three-part target never even reached the alias lookup.
+- **An outer join that decides nothing is dropped, and that is not the same as allowing one.**
+  An ORM renders the entity's whole relation graph whether the statement reads it or not, so the
+  refusal above fires on joins that could not change a single row: every row of the preserved side
+  comes through a LEFT JOIN, matched or not, so removing one nothing else names leaves exactly the
+  rows behind that were there. `TSqlParser.Pruned` takes those away until none is left and `Inner`
+  then decides the rest, which is why the refusal still stands for the join somebody reads.
+  Conservative on every axis, because each axis is a way to delete the wrong rows: only a single
+  named table, never a join tree; never the target, since `[a] LEFT JOIN [target]` matched exactly
+  the rows the write meant and dropping `a` would widen it to all of them; never a FULL join, which
+  preserves both sides. And `Names` counts an unqualified column and a subquery as reading
+  everything -- one could be anyone's and the other may be correlated, and neither says anything
+  that can be read off the tree. What makes the difference visible is a row pointing at a parent that
+  is not there: it is in the result of the LEFT JOIN and not of an INNER one, so a rewrite that
+  confused the two would leave it behind and report a smaller count. That row is in
+  `TdsTests.Related` for exactly that reason.
 - **A join around that target folds into the write's own clauses.** `TSqlParser.Selecting` makes the
   other tables the write's `FROM` and their `ON` conditions part of its `WHERE`, which is the shape
   `Gateway.RewriteUpdate` already ran for a `MERGE`. Only an inner join folds: an outer one keeps the

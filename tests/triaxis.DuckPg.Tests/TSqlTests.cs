@@ -352,6 +352,62 @@ public class TSqlTests
     public void RendersAWriteJoinedToAnotherTable(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// What LLBLGen renders: every table spelled out in full, the target named rather than aliased
+    /// and sitting inside its own join tree, the tree parenthesised, and the entity's whole relation
+    /// graph written out whether the statement reads any of it or not. The LEFT JOIN nothing else
+    /// names cannot pick which rows are deleted -- every entries row comes through it, matched or
+    /// not -- so it goes, and what is left is the ordinary joined delete.
+    [Fact]
+    public void RendersTheJoinTreeAnOrmWritesOut()
+    {
+        Assert.Equal(
+            """DELETE FROM "lake"."entries" USING "lake"."categories" """ +
+            """WHERE (("lake"."entries"."revision_pKey" = $p1)) AND """ +
+            """("lake"."categories"."pKey" = "lake"."entries"."category_pKey")""",
+            Translate("""
+                DELETE FROM [lake].[dbo].[entries]
+                FROM (([lake].[dbo].[categories]
+                       INNER JOIN [lake].[dbo].[entries]
+                         ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+                      LEFT JOIN [lake].[dbo].[batches]
+                         ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+                WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1)
+                """, "p1"));
+    }
+
+    /// A join that decides nothing is dropped; one that decides something is still refused, and the
+    /// difference is whether anything outside the join reads the nullable side.
+    [Theory]
+    // Nothing names the outer side, so every row of the target survives the join either way.
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+        """DELETE FROM "lake"."orders" AS "s" """)]
+    [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+        """UPDATE "lake"."orders" AS "s" SET "x" = 1""")]
+    // Read by the predicate, so the join is what picks the rows and cannot be taken away.
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE t.x IS NULL",
+        null)]
+    // Read by what the update writes.
+    [InlineData("UPDATE [s] SET [x] = [t].[x] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+        null)]
+    // An unqualified column could be anyone's, and a subquery may be correlated: neither is read
+    // here, so neither is guessed at.
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE x = 1",
+        null)]
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id " +
+        "WHERE EXISTS (SELECT 1 FROM other WHERE other.id = t.id)", null)]
+    // The target itself is never the one dropped: the rows it matched are the ones the write meant.
+    [InlineData("DELETE FROM [s] FROM [staging] AS [t] LEFT JOIN [orders] AS [s] ON t.id = s.id", null)]
+    public void DropsOnlyTheJoinsThatDecideNothing(string tsql, string? expected)
+    {
+        if (expected is null)
+        {
+            Assert.Contains("an outer join cannot pick",
+                Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
+            return;
+        }
+        Assert.Equal(expected.Trim(), Translate(tsql));
+    }
+
     /// The OUTPUT clause sits between SET and WHERE, so a statement carrying one does not end at its
     /// assignments. `OUTPUT 1` is how EF Core counts the rows a statement touched.
     [Theory]
@@ -381,11 +437,12 @@ public class TSqlTests
         "NOT MATCHED BY SOURCE")]
     // One side of a join deleted and the other filtering it is a different statement, and one whose
     // rows a lake decides differently.
-    // An outer join keeps the rows matching nothing, and those are rows the write would still
-    // touch -- which a condition cannot say once the join is gone.
-    [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+    // An outer join that something else reads keeps the rows matching nothing, and those are rows
+    // the write would still touch -- which a condition cannot say once the join is gone. One nothing
+    // reads is dropped instead; see DropsOnlyTheJoinsThatDecideNothing.
+    [InlineData("UPDATE [s] SET [x] = [t].[x] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
         "an outer join cannot pick")]
-    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
+    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE [t].[x] = 1",
         "an outer join cannot pick")]
     // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
     // the answer than the answer.

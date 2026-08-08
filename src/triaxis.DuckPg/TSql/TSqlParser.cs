@@ -200,19 +200,24 @@ sealed class TSqlParser
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
 
-        if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
+        if (from is null || Bound(from, target) is not { } source)
             return new UpdateStatement(target, null, assignments, from, where, output);
 
-        var (rest, filtered) = Selecting(from, source, where, at);
+        var (rest, filtered) = Selecting(from, source, where, at,
+            [.. assignments.Select(a => a.Value), .. output.Select(o => o.Value)]);
         return new UpdateStatement(source.Name, source.Alias, assignments, rest, filtered, output);
     }
 
     /// A write whose FROM clause joins its target to something else: the join is what picks the rows,
     /// so the other tables become the write's own FROM and the conditions holding them together join
     /// the WHERE. Only an inner join says that -- an outer one keeps rows matching nothing, and those
-    /// are rows the write would still touch, which a condition cannot say afterwards.
-    (TableSource? From, Expr? Where) Selecting(TableSource from, NamedTableSource target, Expr? where, int at)
+    /// are rows the write would still touch, which a condition cannot say afterwards. What is left
+    /// after the joins that decide nothing have been dropped, that is.
+    (TableSource? From, Expr? Where) Selecting(TableSource from, NamedTableSource target, Expr? where, int at,
+                                               List<Expr>? read = null)
     {
+        from = Pruned(from, target, [.. read ?? [], .. where is null ? (Expr[])[] : [where]]);
+
         if (ReferenceEquals(from, target)) return (null, where);
         if (!Inner(from))
             throw new TSqlException("an outer join cannot pick the rows a write touches: it keeps the ones " +
@@ -393,21 +398,126 @@ sealed class TSqlParser
         var output = Output();
         var where = Accept("where") ? Expression() : null;
 
-        if (from is null || target.Parts is not [var named] || Aliased(from, named) is not { } source)
+        if (from is null || Bound(from, target) is not { } source)
             return new DeleteStatement(target, null, from, where, output);
 
-        var (rest, filtered) = Selecting(from, source, where, at);
+        var (rest, filtered) = Selecting(from, source, where, at, [.. output.Select(o => o.Value)]);
         return new DeleteStatement(source.Name, source.Alias, rest, filtered, output);
     }
 
-    /// The source an alias names, or null when the FROM clause binds no such alias. Both writes that
-    /// can name their target that way resolve it the same way.
-    static NamedTableSource? Aliased(TableSource from, Name alias) => from switch
+    /// The source a write's target names, or null when the FROM clause holds no such thing -- and
+    /// then the target is a table of its own and the FROM clause is something it reads, which is the
+    /// plain `UPDATE t SET … FROM s WHERE …`.
+    ///
+    /// An alias the clause bound, which is what EF Core writes; or the table spelled out, which is
+    /// what LLBLGen writes -- it names every table in full and puts the target itself inside the
+    /// join tree. A name matching more than one source is ambiguous, and left alone rather than
+    /// guessed at: SQL Server refuses it too.
+    static NamedTableSource? Bound(TableSource from, TableName target)
     {
-        NamedTableSource named when named.Alias is { } bound &&
-            string.Equals(bound.Text, alias.Text, StringComparison.OrdinalIgnoreCase) => named,
-        JoinSource join => Aliased(join.Left, alias) ?? Aliased(join.Right, alias),
-        _ => null,
+        List<TableSource> sources = [];
+        Flatten(from, sources, []);
+        var named = sources.OfType<NamedTableSource>().ToList();
+
+        if (target.Parts is [var alias] &&
+            named.Where(source => source.Alias is { } bound && Same(bound, alias)).ToList() is [var only])
+            return only;
+
+        return named.Where(source => source.Alias is null && Same(source.Name.Table, target.Table)).ToList()
+            is [var single] ? single : null;
+    }
+
+    static bool Same(Name a, Name b) => string.Equals(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
+
+    /// An outer join whose nullable side nothing else names does not pick which rows a write touches:
+    /// every row of the preserved side comes through it, matched or not, so taking it away leaves the
+    /// same rows behind -- and what is left is an ordinary predicate the write can fold in. This is
+    /// what an ORM rendering an entity's whole relation graph produces: LLBLGen writes out every
+    /// relation the entity has, whether or not the statement reads any of it.
+    ///
+    /// Conservative on every axis. Only a single named table is dropped, never a join tree; never the
+    /// target, since the rows it matched are exactly the ones the write meant; never a FULL join,
+    /// which preserves both its sides. And anything that might name it and cannot be read -- an
+    /// unqualified column, a subquery that may be correlated -- counts as naming it.
+    static TableSource Pruned(TableSource from, NamedTableSource target, List<Expr> read)
+    {
+        while (Prune(from, target, read) is { } smaller) from = smaller;
+        return from;
+    }
+
+    static TableSource? Prune(TableSource from, NamedTableSource target, List<Expr> read)
+    {
+        foreach (var join in Joins(from))
+        {
+            var nullable = join.Kind switch
+            {
+                JoinKind.Left => join.Right,
+                JoinKind.Right => join.Left,
+                _ => null,
+            };
+
+            if (nullable is not NamedTableSource dropped || ReferenceEquals(dropped, target)) continue;
+
+            // What stays is the tree without that join, and what could still name the table is the
+            // rest of the statement plus the conditions of the joins that stay -- its own goes with
+            // it.
+            var kept = Replace(from, join, ReferenceEquals(nullable, join.Right) ? join.Left : join.Right);
+            List<TableSource> _ = [];
+            List<Expr> conditions = [];
+            Flatten(kept, _, conditions);
+
+            if (!read.Concat(conditions).Any(expr => Names(expr, dropped))) return kept;
+        }
+        return null;
+    }
+
+    static IEnumerable<JoinSource> Joins(TableSource source) => source is not JoinSource join
+        ? []
+        : [join, .. Joins(join.Left), .. Joins(join.Right)];
+
+    /// The tree with one join replaced by what is left of it, rebuilt down the path that reaches it.
+    /// The leaves are the same objects either way, which is what lets the target keep its identity.
+    static TableSource Replace(TableSource source, JoinSource join, TableSource with) =>
+        ReferenceEquals(source, join) ? with
+        : source is JoinSource other
+            ? other with { Left = Replace(other.Left, join, with), Right = Replace(other.Right, join, with) }
+            : source;
+
+    /// Whether an expression may be reading a source's columns. A qualified reference says outright
+    /// which one it means; an unqualified one and a subquery say nothing that can be read here, so
+    /// both count as reading everything.
+    static bool Names(Expr expr, NamedTableSource source) => Walk(expr).Any(part => part switch
+    {
+        ColumnRef column => column.Parts.Count < 2 || Same(column.Parts[^2], source.Alias ?? source.Name.Table),
+        StarRef star => star.Qualifier.Count == 0 || Same(star.Qualifier[^1], source.Alias ?? source.Name.Table),
+        ExistsExpr or SubqueryExpr => true,
+        _ => false,
+    });
+
+    static IEnumerable<Expr> Walk(Expr expr) => [expr, .. Children(expr).SelectMany(Walk)];
+
+    /// What one expression is made of. A subquery's own body is not walked into, because `Names`
+    /// already answers for anything holding one.
+    static IEnumerable<Expr> Children(Expr expr) => expr switch
+    {
+        ParenExpr paren => [paren.Inner],
+        UnaryExpr unary => [unary.Operand],
+        BinaryExpr binary => [binary.Left, binary.Right],
+        CastExpr cast => [cast.Value],
+        ConvertExpr convert => convert.Style is null ? [convert.Value] : [convert.Value, convert.Style],
+        IsNullExpr isNull => [isNull.Value],
+        BetweenExpr between => [between.Value, between.Low, between.High],
+        LikeExpr like => like.Escape is null ? [like.Value, like.Pattern] : [like.Value, like.Pattern, like.Escape],
+        InExpr inExpr => [inExpr.Value, .. inExpr.Items],
+        FunctionCall call => [.. call.Arguments, .. call.Over is null ? (Expr[])[]
+            : [.. call.Over.PartitionBy, .. call.Over.OrderBy.Select(o => o.Expr)]],
+        CaseExpr branch =>
+        [
+            .. branch.Operand is null ? (Expr[])[] : [branch.Operand],
+            .. branch.Branches.SelectMany(b => (Expr[])[b.When, b.Then]),
+            .. branch.Else is null ? (Expr[])[] : [branch.Else],
+        ],
+        _ => [],
     };
 
     /// `SET` here is only the session-option form; `SET @x = …` needs variables, which a lake has
