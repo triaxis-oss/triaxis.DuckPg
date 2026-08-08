@@ -66,6 +66,24 @@ publish a temp-directory convention as API.
   and is the only one of the three that catches a surprise nobody anticipated. The rows are counted
   only for a materialized layer, where the count is a table already in memory -- reading a lake's
   parquet footers to answer a log line is not what starting up is for.
+- **The YAML-to-JSON copy belongs to one conversion, and naming it after the layer is what made it
+  a bug.** `Yaml.ToJsonTree` used to derive a scratch directory from the glob, so every lake over
+  that layer was inside one copy: two started together called `File.Create` on the same file and
+  whichever lost died, and either could delete the tree the other was still reading, since
+  `Yaml.Discard` takes the whole directory. It reads like a cache and is not one -- `Layer.Read`
+  throws it away as soon as it has been read, so nothing is ever there to reuse and all the sharing
+  bought was the collision. `Directory.CreateTempSubdirectory` is the whole fix: a name nobody else
+  can derive is unique across processes as readily as across tasks, needs no lock and no key, and
+  leaves no directory anyone else has to be able to write into. Making it a real shared cache is
+  the other coherent answer and a much larger one -- it means a lock file held shared while the
+  tree is read and exclusively to build or delete it, a key over the files' identity *and* the
+  mapping key, and keeping the tree rather than discarding it, since a cache read once pays for
+  none of that. What settles it is that there is nothing to win: only YAML and keyed files are
+  converted at all -- parquet is scanned where it lies -- so the input is a seed somebody typed,
+  and a seed converts in 0.65 ms at ten rows, 7.9 at a hundred and 28 at five hundred. Sharing a
+  few milliseconds per table is not worth a lock, which is the argument to make again if anyone
+  proposes measuring this on a layer no one would write by hand.
+  `SharedLayerTests` is where both halves are pinned, the collision and the two trees.
 - **Layer sequence numbers decide everything.** Read layers are 0..n-1 in configured order, the
   write layer is n. `QUALIFY … ORDER BY _seq DESC` is what makes a higher layer shadow a lower one,
   and a tombstone only hides rows with `_seq < writeSeq`.
