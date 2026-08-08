@@ -3,7 +3,7 @@ using Microsoft.Extensions.Logging;
 namespace triaxis.DuckPg;
 
 /// Fetching the native DuckDB on demand, for a caller that wants it now rather than when a lake
-/// starts -- provisioning a machine, or a `--install-duckdb` that has nothing else to do.
+/// starts -- provisioning a machine, which is all `--install-duckdb-only` does.
 /// `Config.InstallDuckDb` is the same fetch, made where a lake would otherwise fail to start.
 public interface IDuckDbInstaller
 {

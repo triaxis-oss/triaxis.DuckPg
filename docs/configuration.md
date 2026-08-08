@@ -26,7 +26,7 @@ a typo is an error rather than a silent fallback to defaults.
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
 | `cache` | `--cache` | Directory for merged copies of multi-layer tables, as ZSTD parquet. |
-| `installDuckDb` | — | Fetch the native DuckDB when a lake starts and finds none, rather than failing. The `--install-duckdb` flag is a different thing: it fetches and exits without serving. |
+| `installDuckDb` | `--install-duckdb` | Fetch the native DuckDB when a lake starts and finds none, rather than failing. `--install-duckdb-only` does that fetch and exits without serving. |
 | `sessionVariables` | — | DuckDB variable → startup parameter name. |
 | `columns` | — | Virtual columns added to every table lacking them. |
 | `tables.<name>.key` | — | What identifies a row in this table. |
