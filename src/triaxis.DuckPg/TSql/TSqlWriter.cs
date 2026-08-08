@@ -141,6 +141,7 @@ sealed class TSqlWriter(TSqlContext context)
                 Join(update.Assignments, a => { Put(Quote(a.Column)); Put(" = "); Expression(a.Value); });
                 if (update.From is not null) { Put(" FROM "); Source(update.From); }
                 if (update.Where is not null) { Put(" WHERE "); Expression(update.Where); }
+                Limit(update.Top);
                 Answers(update.Output);
                 return;
 
@@ -150,6 +151,7 @@ sealed class TSqlWriter(TSqlContext context)
                 if (delete.Alias is not null) Put(" AS ").Put(Quote(delete.Alias));
                 if (delete.From is not null) { Put(" USING "); Source(delete.From); }
                 if (delete.Where is not null) { Put(" WHERE "); Expression(delete.Where); }
+                Limit(delete.Top);
                 Answers(delete.Output);
                 return;
 
@@ -247,6 +249,20 @@ sealed class TSqlWriter(TSqlContext context)
         Source(source);
 
         Answers(insert.Output);
+    }
+
+    /// How many rows a write may touch. Neither dialect has a place for it -- SQL Server puts it
+    /// before the target and DuckDB has no `DELETE ... LIMIT` at all -- so it is written where a
+    /// limit goes and taken off again by the gateway, which is the only thing that knows what one
+    /// row of a lake's table is. `PERCENT` is carried through rather than counted here: what it is a
+    /// share of is the rows the write is about to touch, which is a query the gateway builds.
+    void Limit(RowLimit? top)
+    {
+        if (top is null) return;
+
+        Put(" LIMIT ");
+        Expression(top.Count is ParenExpr paren ? paren.Inner : top.Count);
+        if (top.Percent) Put(" PERCENT");
     }
 
     /// What a statement was asked to hand back, which DuckDB spells `RETURNING`. A lake answers it

@@ -436,13 +436,15 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     Plan RewriteUpdate(string sql)
     {
         var reference = SqlText.ReadTableRef(sql, SqlText.FindKeyword(sql, "UPDATE") + 6);
-        if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("UPDATE", sql);
+        if (Writable(reference.Schema, reference.Name) is not { } table)
+            return Plan.Count("UPDATE", Unlimited(sql, "UPDATE"));
         RequireKey(table, "UPDATE");
 
         // What the statement was asked to hand back is answered from the rows it wrote, so it comes
         // off the end before anything else is read: it is no part of the predicate that follows SET.
         var (answered, rest) = Answers(sql);
-        sql = rest;
+        var (rows, percent, limitless) = Limited(rest);
+        sql = limitless;
 
         var alias = ReadAlias(sql, reference.End);
         var set = SqlText.FindKeyword(sql, "SET", reference.End);
@@ -477,6 +479,19 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 : qualifier + SqlText.Quote(c.Name)));
         var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
 
+        // Which rows a `TOP (n)` settled on is decided once, on the keys, and everything after it
+        // reads that choice back rather than making it again: the steps off the key set written
+        // down, a check off the query that produced it, since a check runs before any step does.
+        // The target has to be named even where nothing else is in scope, or the key column would be
+        // as much the chosen set's as the row's.
+        var owner = SqlText.Quote(alias ?? table.Name) + ".";
+        var counted = Keyed(table, scan, qualifier, predicate);
+        var keyed = rows is null ? counted
+            : Keyed(table, scan, qualifier, predicate, Limit(rows, percent, counted));
+        var touched = rows is null ? predicate
+            : $"({predicate}) AND {Within(table, "SELECT * FROM duckpg_keys", owner)}";
+        var checking = rows is null ? predicate : $"({predicate}) AND {Within(table, keyed, owner)}";
+
         // A key that moves may land on one the lake already publishes, and a join around the target
         // may produce the same row twice -- both write two rows under one key, which the write
         // branch's own PRIMARY KEY catches and a materialized table does not. Where each row lands
@@ -488,15 +503,15 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                          $"SELECT {Moved(table, assignments, qualifier)}, " +
                          string.Join(", ", table.Key.Select(k =>
                              $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}")) +
-                         $" FROM {scan} WHERE {predicate}",
+                         $" FROM {scan} WHERE {checking}",
                          replacing: true)
             : [];
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
         string[] steps = [
-            Keys(table, scan, qualifier, predicate),
-            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {predicate}",
+            Keys(keyed),
+            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {touched}",
             .. tombstones ? (string[])[Tombstone(table)] : [],
             Evict(table),
             $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"];
@@ -519,11 +534,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (from < 0) return Plan.Count("DELETE", sql);
 
         var reference = SqlText.ReadTableRef(sql, from + 4);
-        if (Writable(reference.Schema, reference.Name) is not { } table) return Plan.Count("DELETE", sql);
+        if (Writable(reference.Schema, reference.Name) is not { } table)
+            return Plan.Count("DELETE", Unlimited(sql, "DELETE"));
         RequireKey(table, "DELETE");
 
         var (answered, rest) = Answers(sql);
-        sql = rest;
+        var (rows, percent, limitless) = Limited(rest);
+        sql = limitless;
 
         // The target may be named by an alias the statement bound to it, and the predicate will
         // then say so too -- so the scan carries the alias rather than dropping it.
@@ -544,15 +561,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         var predicate = where < 0 ? "TRUE" : sql[(where + 5)..];
 
+        // Which rows a `TOP (n)` settled on is the key set the plan writes down, and the checks read
+        // the query behind it rather than the table -- they run before any step does.
+        var counted = Keyed(table, scan, qualifier, predicate);
+        var keyed = rows is null ? counted
+            : Keyed(table, scan, qualifier, predicate, Limit(rows, percent, counted));
+
         // A cascade goes before the rows it depends on are hidden, and every level answers for the
         // references that do not cascade -- a row two tables down may be held by one of those.
         List<string> cascade = [];
         List<Check> checks = [];
         List<(Table Table, bool Tombstones)> promote = [(table, true)];
-        Cascading(table, "duckpg_keys", Keyed(table, scan, qualifier, predicate), cascade, checks, promote);
+        Cascading(table, "duckpg_keys", keyed, cascade, checks, promote);
 
         string[] steps =
-            [Keys(table, scan, qualifier, predicate), .. cascade,
+            [Keys(keyed), .. cascade,
              .. table.Materialized ? (string[])[] : [Tombstone(table)], Evict(table)];
         var referenced = checks.ToArray();
 
@@ -625,12 +648,59 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             : qualifier + SqlText.Quote(k)));
 
     /// The keys a statement touches, taken from the merged view before anything moves.
-    static string Keys(Table table, string scan, string qualifier, string predicate) =>
-        $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS {Keyed(table, scan, qualifier, predicate)}";
+    static string Keys(string keyed) => $"CREATE OR REPLACE TEMP TABLE duckpg_keys AS {keyed}";
 
-    static string Keyed(Table table, string scan, string qualifier, string predicate) =>
-        $"SELECT DISTINCT {string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)))} " +
-        $"FROM {scan} WHERE {predicate}";
+    /// `limit` is what a `TOP (n)` write may touch, and it is applied to the keys because that is
+    /// what one row of a lake's table is. Ordered, though SQL Server leaves the choice unsaid and
+    /// any n rows would answer it: this query is evaluated more than once -- the plan writes it down
+    /// and every check re-asks it, since a check runs before the first step -- and an arbitrary n
+    /// taken twice is two different sets, which would have the checks answering for rows that stayed.
+    static string Keyed(Table table, string scan, string qualifier, string predicate, string? limit = null)
+    {
+        var keys = string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)));
+        return $"SELECT DISTINCT {keys} FROM {scan} WHERE {predicate}" +
+               (limit is null ? "" : $" ORDER BY {keys} LIMIT {limit}");
+    }
+
+    /// The row limit the writer put on the end of a write, taken off again. Neither dialect has a
+    /// place for one -- SQL Server writes it before the target and DuckDB has no `DELETE ... LIMIT`
+    /// at all -- so a top-level one here is duckpg's own spelling and can be nobody else's.
+    static (string? Rows, bool Percent, string Statement) Limited(string sql)
+    {
+        var at = SqlText.FindKeyword(sql, "LIMIT");
+        if (at < 0) return (null, false, sql);
+
+        var rows = sql[(at + "LIMIT".Length)..].Trim();
+        var percent = SqlText.FindKeyword(rows, "PERCENT");
+        return (percent < 0 ? rows : rows[..percent].TrimEnd(), percent >= 0, sql[..at]);
+    }
+
+    /// How many rows that limit stands for. A share is counted over the rows it is a share of and
+    /// rounded up, which is what SQL Server does with `TOP n PERCENT`: one percent of anything at
+    /// all is a row, and of a hundred and one rows it is two.
+    static string Limit(string rows, bool percent, string counted) =>
+        percent
+            ? $"(SELECT CAST(CEIL(count(*) * ({rows}) / 100.0) AS BIGINT) FROM ({counted}) AS \"_percent\")"
+            : rows;
+
+    /// Whether a row is one of those the limit settled on, as a condition over the row itself. The
+    /// key set stands as a derived table rather than being joined to: it is built over the same scan
+    /// under the same names, and only a subquery keeps that copy's aliases from swallowing the
+    /// comparison's other side.
+    static string Within(Table table, string keys, string owner) =>
+        $"EXISTS (SELECT 1 FROM ({keys}) AS \"_top\" WHERE " +
+        string.Join(" AND ", table.Key.Select(k =>
+            $"\"_top\".{SqlText.Quote(k)} IS NOT DISTINCT FROM {owner}{SqlText.Quote(k)}")) + ")";
+
+    /// A `TOP (n)` is performed on the key the lake declares for a table, so a target the lake does
+    /// not publish -- a session's own `#temp`, which is the only other thing a write can name here --
+    /// has nothing to perform it on. Refused rather than passed on: DuckDB would answer for the
+    /// `LIMIT` and not for the statement it was written on.
+    static string Unlimited(string sql, string operation) =>
+        SqlText.FindKeyword(sql, "LIMIT") < 0
+            ? sql
+            : throw new PgError("0A000", $"TOP on a {operation} counts the rows of a table the lake " +
+                                         "publishes, and this is not one of them");
 
     /// What a DELETE calls its target, spelled out or not -- and nothing at all when the word after
     /// the table is the clause that follows it.

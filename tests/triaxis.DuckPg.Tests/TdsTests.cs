@@ -623,6 +623,116 @@ public class TdsTests : IDisposable
         Assert.Equal(2, Count(connection));
     }
 
+    /// `DELETE TOP (n)` is the row-limited delete a legacy ORM writes to take a long delete in
+    /// bites, mixed case and trailing semicolon and all. Which n rows go is the lake's to choose,
+    /// since the form carries no ORDER BY and SQL Server leaves the set unordered too -- what is not
+    /// free to vary is that no more than n go, and that the count reported is the rows that did.
+    [Fact]
+    public void ADeleteCanBeLimitedToSomeOfTheRowsItMatches()
+    {
+        using var connection = Open();
+
+        Assert.Equal(2, new SqlCommand("Delete Top (2) From [orders];", connection).ExecuteNonQuery());
+        Assert.Equal(1, Count(connection));
+
+        lake.Restart();
+        Assert.Single(lake.Query("SELECT order_id FROM lake.orders"));
+    }
+
+    /// Fewer matching rows than the limit is all of them, and the count is that smaller number. The
+    /// predicate is still what says which rows were eligible: the limit takes from what it left.
+    [Fact]
+    public void ARowLimitTakesOnlyWhatThePredicateLeft()
+    {
+        using var connection = Open();
+
+        Assert.Equal(2, new SqlCommand(
+            "DELETE TOP (10000) FROM [orders] WHERE [order_id] < 3", connection).ExecuteNonQuery());
+        Assert.Equal(1, Count(connection));
+
+        lake.Restart();
+        Assert.Equal(["3"], lake.Query("SELECT order_id FROM lake.orders"));
+    }
+
+    /// A share rather than a count, rounded up the way SQL Server rounds it: half of three rows is
+    /// two, and one percent of anything at all would still be one.
+    [Fact]
+    public void ARowLimitCanBeAShareOfWhatMatches()
+    {
+        using var connection = Open();
+
+        Assert.Equal(2, new SqlCommand("DELETE TOP (50) PERCENT FROM [orders]", connection).ExecuteNonQuery());
+        Assert.Equal(1, Count(connection));
+    }
+
+    /// The same limit on the write that leaves its rows where they are, which is the only other
+    /// shape it comes in.
+    [Fact]
+    public void AnUpdateCanBeLimitedToSomeOfTheRowsItMatches()
+    {
+        using var connection = Open();
+
+        Assert.Equal(1, new SqlCommand(
+            "UPDATE TOP (1) [orders] SET [note] = 'limited' WHERE [order_id] < 3",
+            connection).ExecuteNonQuery());
+        Assert.Equal(3, Count(connection));
+
+        lake.Restart();
+        Assert.Single(lake.Query("SELECT order_id FROM lake.orders WHERE note = 'limited'"));
+    }
+
+    /// A limited write that moves its key, which is the one shape that asks the duplicate check a
+    /// question: the check has to be asked of the rows the limit settled on and not of the rows the
+    /// predicate matched, or a collision among the rows left alone would refuse the statement.
+    [Fact]
+    public void ALimitedUpdateMovingItsKeyIsCheckedOverTheRowsItTouches()
+    {
+        using var connection = Open();
+
+        // Both matching rows moved onto one key is a duplicate; one row moved onto it is a row.
+        Assert.Contains("duplicate key", Assert.Throws<SqlException>(() => new SqlCommand(
+            "UPDATE [orders] SET [order_id] = 100 WHERE [order_id] < 3", connection).ExecuteNonQuery()).Message);
+
+        Assert.Equal(1, new SqlCommand(
+            "UPDATE TOP (1) [orders] SET [order_id] = 100 WHERE [order_id] < 3",
+            connection).ExecuteNonQuery());
+        Assert.Equal(3, Count(connection));
+
+        lake.Restart();
+        Assert.Equal(["2", "3", "100"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// The limit over a target the statement named by alias and filtered through a join: the keys
+    /// the choice is made on have to say which side of the join they came from, the same as the keys
+    /// an unlimited write collects.
+    [Fact]
+    public void ALimitedWriteCanBeFilteredThroughAJoin()
+    {
+        using var connection = Open();
+        new SqlCommand("SELECT o.order_id INTO #some FROM orders o WHERE o.order_id < 3",
+                       connection).ExecuteNonQuery();
+
+        Assert.Equal(1, new SqlCommand(
+            "DELETE TOP (1) FROM [s] FROM [orders] AS [s] " +
+            "INNER JOIN [#some] AS [t] ON [t].[order_id] = [s].[order_id]", connection).ExecuteNonQuery());
+        Assert.Equal(2, Count(connection));
+
+        lake.Restart();
+        Assert.Contains("3", lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// A limit is performed on the key the lake declares, so a table it does not publish has nothing
+    /// to perform it on -- and is told so rather than handed a statement DuckDB would refuse.
+    [Fact]
+    public void ARowLimitOnATemporaryTableIsRefused()
+    {
+        using var connection = Open();
+        new SqlCommand("SELECT order_id INTO #scratch FROM orders", connection).ExecuteNonQuery();
+
+        Assert.Contains("TOP on a DELETE", Assert.Throws<SqlException>(() =>
+            new SqlCommand("DELETE TOP (1) FROM [#scratch]", connection).ExecuteNonQuery()).Message);
+    }
+
     static List<string> Rows(SqlConnection connection, string sql)
     {
         var rows = new List<string>();
@@ -907,6 +1017,62 @@ public class TdsTests : IDisposable
         Assert.Equal(["100|9", "101|9", "102|8"],
             lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
     }
+
+    /// Where the two shapes meet: a row limit on the join tree an ORM writes out. The tree is
+    /// resolved to one source before the limit is performed on that source's keys -- so the limit
+    /// caps what the rest of the statement selected, rather than the target reaching DuckDB twice.
+    /// Two entries are of revision 7 and nothing outside the target is read here, so the limit is
+    /// all that picks; which of the two goes is the lake's to say.
+    [Fact]
+    public void ARowLimitCapsTheJoinTreeAnOrmWritesOut()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(Tree("DELETE TOP (1)", ""), connection);
+        command.Parameters.AddWithValue("@p1", 7);
+        Assert.Equal(1, command.ExecuteNonQuery());
+
+        lake.Restart();
+        var left = lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey");
+        Assert.Equal(2, left.Count);
+        Assert.Contains("102|8", left);
+    }
+
+    /// The same limit where the join is read and so cannot be pruned away: it picks the rows too,
+    /// and the limit takes from what it left. Only one entry of revision 7 is in that category, so
+    /// the row that goes is that one and the count reported is the row that went -- not the ten
+    /// thousand asked for, and not the two the predicate alone would have matched.
+    [Fact]
+    public void ARowLimitTakesOnlyWhatTheJoinTreeSelected()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(
+            Tree("DELETE TOP (10000)", " AND [dbo].[categories].[name] = 'first'"), connection);
+        command.Parameters.AddWithValue("@p1", 7);
+        Assert.Equal(1, command.ExecuteNonQuery());
+
+        lake.Restart();
+        Assert.Equal(["101|7", "102|8"], lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// The delete an ORM renders for an entity with relations, with whatever the caller put in front
+    /// of the target and whatever it added to the predicate. The joined table is qualified two-part
+    /// where the predicate reads it and three-part where the FROM clause binds it, which is how a
+    /// real client writes it -- both spellings have to reach the one source.
+    static string Tree(string verb, string extra) => $"""
+        {verb} FROM [lake].[dbo].[entries]
+        FROM (([lake].[dbo].[categories]
+               INNER JOIN [lake].[dbo].[entries]
+                 ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+              LEFT JOIN [lake].[dbo].[batches]
+                 ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+        WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1{extra})
+        """;
 
     [Fact]
     public void AFailedStatementLeavesTheConnectionUsable()

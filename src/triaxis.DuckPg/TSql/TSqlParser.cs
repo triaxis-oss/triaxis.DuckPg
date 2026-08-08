@@ -189,6 +189,7 @@ sealed class TSqlParser
     Statement Update()
     {
         Expect("update");
+        var top = Top();
         var at = Peek.Position;
         var target = TableName();
         Expect("set");
@@ -201,11 +202,21 @@ sealed class TSqlParser
         var where = Accept("where") ? Expression() : null;
 
         if (from is null || Bound(from, target) is not { } source)
-            return new UpdateStatement(target, null, assignments, from, where, output);
+            return new UpdateStatement(target, null, assignments, from, where, output, top);
 
         var (rest, filtered) = Selecting(from, source, where, at,
             [.. assignments.Select(a => a.Value), .. output.Select(o => o.Value)]);
-        return new UpdateStatement(source.Name, source.Alias, assignments, rest, filtered, output);
+        return new UpdateStatement(source.Name, source.Alias, assignments, rest, filtered, output, top);
+    }
+
+    /// The `TOP (n) [PERCENT]` a write may carry. The parentheses are what tells it from a table of
+    /// that name -- SQL Server requires them here and makes them optional on a SELECT, so `DELETE
+    /// top` is the table and `DELETE TOP (1)` is the limit, with nothing to weigh up.
+    RowLimit? Top()
+    {
+        if (!Peek.Is("top") || !Ahead(1).Is(TokenKind.Operator, "(")) return null;
+        Expect("top");
+        return new RowLimit(Primary(), Accept("percent"));
     }
 
     /// A write whose FROM clause joins its target to something else: the join is what picks the rows,
@@ -391,6 +402,7 @@ sealed class TSqlParser
     Statement Delete()
     {
         Expect("delete");
+        var top = Top();
         Accept("from");
         var at = Peek.Position;
         var target = TableName();
@@ -399,10 +411,10 @@ sealed class TSqlParser
         var where = Accept("where") ? Expression() : null;
 
         if (from is null || Bound(from, target) is not { } source)
-            return new DeleteStatement(target, null, from, where, output);
+            return new DeleteStatement(target, null, from, where, output, top);
 
         var (rest, filtered) = Selecting(from, source, where, at, [.. output.Select(o => o.Value)]);
-        return new DeleteStatement(source.Name, source.Alias, rest, filtered, output);
+        return new DeleteStatement(source.Name, source.Alias, rest, filtered, output, top);
     }
 
     /// The source a write's target names, or null when the FROM clause holds no such thing -- and

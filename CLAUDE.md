@@ -672,6 +672,22 @@ publish a temp-directory convention as API.
   is not there: it is in the result of the LEFT JOIN and not of an INNER one, so a rewrite that
   confused the two would leave it behind and report a smaller count. That row is in
   `TdsTests.Related` for exactly that reason.
+- **A row limit on a write is performed on the keys, not on the rows.** `DELETE TOP (n)` is how a
+  legacy ORM takes a long delete in bites, and neither dialect below has a place for it: SQL Server
+  writes it before the target and DuckDB has no `DELETE … LIMIT` at all. So `TSqlWriter.Limit` puts
+  it on the end as a `LIMIT` nobody else could have written, and `Gateway.Limited` takes it back off
+  -- the limit then goes on `Keyed`, since what one row of a lake's table is is its key, and every
+  step and every check reads back the key set that choice produced. `Keyed` orders by the key to
+  make it, though SQL Server says outright that the set is unordered and any n rows would answer:
+  the query is evaluated more than once -- the plan writes it down, and `Plan.Checks` re-asks it
+  because a check runs before the first step -- and an arbitrary n taken twice is two different
+  sets, which would leave the reference and duplicate checks answering for rows that stayed.
+  An UPDATE needs one thing more, `Gateway.Within`, since its rows are projected by a query of their
+  own: the key set stands as a derived table there rather than being joined to, because it is built
+  over the same scan under the same aliases and only a subquery keeps that copy from swallowing the
+  comparison's other side. The parentheses are required, which is what tells `TOP` from a table of
+  that name -- SQL Server requires them on a write and makes them optional on a SELECT. A target the
+  lake does not publish is refused rather than passed on: a `#temp` has no declared key to limit.
 - **A join around that target folds into the write's own clauses.** `TSqlParser.Selecting` makes the
   other tables the write's `FROM` and their `ON` conditions part of its `WHERE`, which is the shape
   `Gateway.RewriteUpdate` already ran for a `MERGE`. Only an inner join folds: an outer one keeps the

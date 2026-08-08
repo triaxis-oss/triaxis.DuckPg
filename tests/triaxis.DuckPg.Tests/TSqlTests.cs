@@ -304,6 +304,34 @@ public class TSqlTests
             Translate("INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[order_id] VALUES (@p0)", "p0"));
     }
 
+    /// `DELETE TOP (n)` deletes at most n of the rows the predicate matches, and says nothing about
+    /// which -- there is no ORDER BY in this form. It goes out as a trailing `LIMIT` for the gateway
+    /// to perform on the lake's own key, which neither dialect would run as it stands.
+    [Theory]
+    [InlineData("DELETE TOP (10000) FROM [t]", """DELETE FROM "lake"."t" LIMIT 10000""")]
+    // Verbatim from a legacy ORM, mixed case and trailing semicolon and all.
+    [InlineData("Delete Top (10000) From STAFF_SCHEDULE_RevisionEvents;",
+        """DELETE FROM "lake"."STAFF_SCHEDULE_RevisionEvents" LIMIT 10000""")]
+    [InlineData("DELETE TOP (5) FROM [t] WHERE [a] = 1", """DELETE FROM "lake"."t" WHERE "a" = 1 LIMIT 5""")]
+    [InlineData("DELETE TOP (5) PERCENT FROM [t]", """DELETE FROM "lake"."t" LIMIT 5 PERCENT""")]
+    [InlineData("UPDATE TOP (3) [t] SET [a] = 1 WHERE [b] = 2",
+        """UPDATE "lake"."t" SET "a" = 1 WHERE "b" = 2 LIMIT 3""")]
+    [InlineData("UPDATE TOP (3) PERCENT [t] SET [a] = 1", """UPDATE "lake"."t" SET "a" = 1 LIMIT 3 PERCENT""")]
+    [InlineData("DELETE TOP (2) FROM [orders] OUTPUT 1 WHERE [id] = 2",
+        """DELETE FROM "lake"."orders" WHERE "id" = 2 LIMIT 2 RETURNING 1""")]
+    // The parentheses are what tell the keyword from a table of that name, which is why SQL Server
+    // requires them on a write and duckpg does too.
+    [InlineData("DELETE FROM top WHERE id = 1", """DELETE FROM "lake"."top" WHERE "id" = 1""")]
+    [InlineData("UPDATE top SET a = 1", """UPDATE "lake"."top" SET "a" = 1""")]
+    public void RendersARowLimitedWrite(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
+    /// The count may be a parameter, which a lake binds like any other.
+    [Fact]
+    public void ARowLimitCanBeAParameter() =>
+        Assert.Equal("""DELETE FROM "lake"."t" WHERE "a" = $p1 LIMIT $p0""",
+                     Translate("DELETE TOP (@p0) FROM [t] WHERE [a] = @p1", "p0", "p1"));
+
     /// What EF Core's ExecuteDelete writes: the target names an alias the FROM clause binds, and the
     /// predicate names it too.
     [Theory]
@@ -351,6 +379,39 @@ public class TSqlTests
         """DELETE FROM "lake"."orders" AS "s" USING "lake"."staging" AS "c" WHERE "c"."id" = "s"."id" """)]
     public void RendersAWriteJoinedToAnotherTable(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
+
+    /// The target named again inside its own FROM clause, which is the smallest thing an ORM
+    /// spelling every table out writes -- no join, nothing to prune, only the one source. It is one
+    /// table either way, and a limit on it does not make it two.
+    [Theory]
+    [InlineData("DELETE FROM [db].[dbo].[t] FROM [db].[dbo].[t] WHERE [db].[dbo].[t].[c] = 1",
+        """DELETE FROM "lake"."t" WHERE "lake"."t"."c" = 1""")]
+    [InlineData("DELETE TOP (5) FROM [db].[dbo].[t] FROM [db].[dbo].[t] WHERE [db].[dbo].[t].[c] = 1",
+        """DELETE FROM "lake"."t" WHERE "lake"."t"."c" = 1 LIMIT 5""")]
+    [InlineData("UPDATE TOP (5) [db].[dbo].[t] SET [c] = 2 FROM [db].[dbo].[t] WHERE [db].[dbo].[t].[c] = 1",
+        """UPDATE "lake"."t" SET "c" = 2 WHERE "lake"."t"."c" = 1 LIMIT 5""")]
+    public void RendersATargetItsOwnFromClauseNamesAgain(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
+    /// A row limit on that same join tree: the limit is the write's and the tree is resolved before
+    /// it, so what comes out is the folded join with the limit still on the end. The joined table is
+    /// qualified two-part where the predicate reads it and three-part where the FROM clause binds
+    /// it -- real client output, and both have to reach the one source.
+    [Fact]
+    public void RendersARowLimitOnTheJoinTreeAnOrmWritesOut() =>
+        Assert.Equal(
+            """DELETE FROM "lake"."entries" USING "lake"."categories" """ +
+            """WHERE (("lake"."entries"."revision_pKey" = $p1 AND "lake"."categories"."level" = 3)) AND """ +
+            """("lake"."categories"."pKey" = "lake"."entries"."category_pKey") LIMIT 10000""",
+            Translate("""
+                DELETE TOP (10000) FROM [lake].[dbo].[entries]
+                FROM (([lake].[dbo].[categories]
+                       INNER JOIN [lake].[dbo].[entries]
+                         ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+                      LEFT JOIN [lake].[dbo].[batches]
+                         ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+                WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1 AND [dbo].[categories].[level] = 3)
+                """, "p1"));
 
     /// What LLBLGen renders: every table spelled out in full, the target named rather than aliased
     /// and sitting inside its own join tree, the tree parenthesised, and the entity's whole relation
