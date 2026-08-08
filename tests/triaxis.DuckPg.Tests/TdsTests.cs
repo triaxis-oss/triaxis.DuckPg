@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using Microsoft.Data.SqlClient;
 
 namespace triaxis.DuckPg.Tests;
@@ -829,6 +830,82 @@ public class TdsTests : IDisposable
 
         var error = Assert.Throws<SqlException>(() => command.ExecuteNonQuery());
         Assert.Contains("assigns to variables or returns rows", error.Message);
+    }
+
+    /// Three tables an entity's relation graph joins, one entry pointing at a batch that is not
+    /// there. That row is the point of the fixture: it is in the result of a LEFT JOIN and not of an
+    /// INNER one, so a rewrite that confused the two would quietly leave it alone.
+    static TestLake Related([CallerMemberName] string name = "")
+    {
+        var lake = new TestLake(name)
+            .Json("base", "categories", """[{"pKey": 1, "name": "first"}, {"pKey": 2, "name": "second"}]""")
+            .Json("base", "batches", """[{"pKey": 10, "label": "one"}]""")
+            .Json("base", "entries", """
+                [{"pKey": 100, "category_pKey": 1, "batch_pKey": 10,   "revision_pKey": 7},
+                 {"pKey": 101, "category_pKey": 2, "batch_pKey": 999,  "revision_pKey": 7},
+                 {"pKey": 102, "category_pKey": 1, "batch_pKey": 10,   "revision_pKey": 8}]
+                """)
+            .Stack("base")
+            .WriteTo("local")
+            .WithTds();
+        lake.Config.DefaultKey = ["pKey"];
+        return lake.Start();
+    }
+
+    /// The delete an ORM renders for an entity with relations: every name in full, the target inside
+    /// its own parenthesised join tree rather than aliased beside it, and the entity's whole relation
+    /// graph written out -- including a LEFT JOIN the statement never reads.
+    [Fact]
+    public void TheJoinTreeAnOrmWritesOutDeletesTheRightRows()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            DELETE FROM [lake].[dbo].[entries]
+            FROM (([lake].[dbo].[categories]
+                   INNER JOIN [lake].[dbo].[entries]
+                     ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+                  LEFT JOIN [lake].[dbo].[batches]
+                     ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+            WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1)
+            """, connection);
+        command.Parameters.AddWithValue("@p1", 7);
+
+        // Both rows of revision 7 go, the one matching no batch among them.
+        Assert.Equal(2, command.ExecuteNonQuery());
+        Assert.Equal(["102|8"], lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
+
+        // And it survives the restart, which is what says the tombstones went to the files.
+        lake.Restart();
+        Assert.Equal(["102|8"], lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// The same shape on the other write, since an ORM that renders a relation graph for a delete
+    /// renders one for an update too.
+    [Fact]
+    public void TheJoinTreeAnOrmWritesOutUpdatesTheRightRows()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            UPDATE [lake].[dbo].[entries] SET [revision_pKey] = @p0
+            FROM (([lake].[dbo].[categories]
+                   INNER JOIN [lake].[dbo].[entries]
+                     ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+                  LEFT JOIN [lake].[dbo].[batches]
+                     ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+            WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1)
+            """, connection);
+        command.Parameters.AddWithValue("@p0", 9);
+        command.Parameters.AddWithValue("@p1", 7);
+
+        Assert.Equal(2, command.ExecuteNonQuery());
+        Assert.Equal(["100|9", "101|9", "102|8"],
+            lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
     }
 
     [Fact]

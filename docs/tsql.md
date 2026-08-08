@@ -71,6 +71,7 @@ same way; see [the schema, from a dacpac](schema.md).
 | `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
 | `UPDATE [o] SET … FROM [t] AS [o] WHERE …` — its `ExecuteUpdate` | the same, on the other write |
 | either of those joined to another table | the other tables become the write's own `FROM`, their conditions its `WHERE` |
+| `DELETE FROM [db].[dbo].[t] FROM ((… JOIN [db].[dbo].[t] ON …) LEFT JOIN …)` — LLBLGen | the target is found by name inside the tree; the joins nothing reads are dropped |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
 | `SCOPE_IDENTITY()`, `@@IDENTITY` | the last key this connection generated, as `numeric(38,0)` |
@@ -79,6 +80,19 @@ same way; see [the schema, from a dacpac](schema.md).
 
 Only an inner join folds into the write's own clauses: an outer one keeps the rows matching nothing,
 and those are rows the write would still touch, which a condition cannot say once the join is gone.
+
+An outer join *nothing else reads* is dropped first, and then that rule decides what is left. An ORM
+writes out the entity's whole relation graph whether the statement reads it or not, and such a join
+cannot change which rows are written: every row of the preserved side comes through it, matched or
+not, so taking it away leaves the same rows behind. Only a single named table is dropped, never a
+join tree, never a FULL join, and never the write's own target — `[a] LEFT JOIN [target]` matched
+exactly the rows the statement meant, and dropping `a` would widen it to every row of the target. An
+unqualified column or a subquery in the predicate counts as reading everything, so nothing is
+dropped on their account.
+
+The write's target is resolved to an alias the FROM clause bound, or — when the statement spells the
+table out and puts it inside the join tree, which is what LLBLGen does — to the one unaliased source
+of that name. A name matching two sources is ambiguous and left alone, as SQL Server leaves it.
 
 `OUTPUT INSERTED.[key], i._Position` is answered by materializing the rows, writing from there and
 reading back off the same copy, so each key comes back beside the position of the row that got it. A
