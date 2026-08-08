@@ -35,15 +35,20 @@ a set difference, that delta says *which* rows a table now has and not *how many
 with no key, a row inserted identical to one the layers hold does not come back. With a key, which
 `UPDATE` and `DELETE` need anyway, the two modes agree on everything.
 
-**`--store lake.duckdb`** gives that materialized lake a DuckDB database file to live in. The layers
-are collapsed into it once; every start after that opens what is already there, and the layers are
-only consulted for a table the file does not yet carry. A write survives by having been written rather
-than by being worked out again at shutdown, so no delta is exported beside a store — and a sequence
-keeps its place, so a declared `IDENTITY` carries on where it left off. The trade is that the file
-*is* the state: editing a layer no longer changes a table the store already holds, and a store made
-against a different schema is refused at startup by name rather than rebuilt, since rebuilding would
-discard everything written to it. Delete it to start again. It needs `--materialize`; a layered lake
-keeps its write layer in files and would apply every write twice.
+**`--store warehouse.duckdb`** gives that materialized lake a DuckDB database file to live in. The
+layers are collapsed into it once; every start after that opens what is already there, and the layers
+are only consulted for a table the file does not yet carry. A write survives by having been written
+rather than by being worked out again at shutdown, so no delta is exported beside a store — and a
+sequence keeps its place, so a declared `IDENTITY` carries on where it left off. The trade is that
+the file *is* the state: editing a layer no longer changes a table the store already holds, and a
+store made against a different schema is refused at startup by name rather than rebuilt, since
+rebuilding would discard everything written to it. Delete it to start again. It needs
+`--materialize`; a layered lake keeps its write layer in files and would apply every write twice.
+
+**The file cannot be named after the schema.** DuckDB names the database after the file, so
+`--store lake.duckdb` and the default `lake` schema leave every `lake.orders` ambiguous between the
+two, and nothing the lake publishes can be bound. That combination is refused at startup by name —
+call the file something else, or move the lake with `--schema`.
 
 `--store-mode spill` takes that trade back and keeps only the memory saving: the layers are collapsed
 into the file on every start and the delta goes out at shutdown, as for an in-memory materialized
