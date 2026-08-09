@@ -19,6 +19,7 @@ defaults.
 | `tds` | `--tds` | TDS listen address, e.g. `127.0.0.1:1433`. Off unless set. |
 | `schema` | `--schema` | Schema the published views live in, and the front of every session's search path. Default `lake`. |
 | `layers` | positional | Layer directories, lowest first. |
+| `base` | `--base` | A baked database served instead of layers, copied on the way up and never written to. |
 | `write` | `--write`, `-w` | Directory holding the writable top layer. |
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
@@ -48,6 +49,12 @@ so it reads the same keys and the same arguments — `layers`, `write`, `default
 `installDuckDb` and the per-table `key` and `columns` blocks. `--out` is its own and is required.
 It has flags for those keys and for nothing else: serving's own options belong to `duckpg` and are
 refused in front of the verb rather than silently dropped there.
+
+`--out` ending in `.duckdb` writes a database rather than a directory, and `--block-size` is what
+that one is created with — small, because a block is allocated whole and a lake of many small tables
+is mostly blocks. Serving one takes `--base` and nothing else: no `layers`, no `defaultKey`, no
+`dacpac`, since the file carries all three. Layers under a base are refused, as is a file that is not
+a bake, one baked into another schema, and one stamped with a version this duckpg does not speak.
 
 Usually a bake needs no file at all, since what it merges by is `--key` and a dacpac. Name one with
 `-c` for a lake whose shape is in `tables:` blocks a flag cannot carry, and name the file describing

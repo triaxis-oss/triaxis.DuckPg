@@ -106,13 +106,35 @@ What the configuration adds *on top* of a table stays where it was: virtual colu
 defaults belong to the run reading the file, not to the file. What cannot be kept identical is
 refused rather than written.
 
+### Baking a whole database
+
+Name the output `.duckdb` and the bake writes what a materialized lake holds instead — the collapsed
+tables, their keys and indexes, the declared views and macros — and `--base` serves it:
+
+```shell
+duckpg bake ./common ./tenant --dacpac schema.dacpac --out seed.duckdb
+duckpg --base seed.duckdb --write ./local
+```
+
+Nothing is scanned, described, parsed, merged or keyed on the way up, because all of it is already in
+the bytes. On a 300-table lake that is **643 ms to serving, against 1371 ms from the layers and a
+dacpac and 3543 ms with `--materialize`** — and it needs no dacpac, no key and no configuration at
+all, since the file carries them. It is what to reach for when the same initial state is served over
+and over: the run copies the file, serves its own copy, and never writes to the base.
+
+Writes persist as they do without a bake. The base is attached read-only and is what the delta at
+shutdown is measured against, so a write directory beside it reads its own delta back on the next
+start. The one difference from the layers: a materialized table holds every declared default already
+stamped and there is no reader left to stamp one, so `(getdate())` in a baked database is the moment
+the bake ran — as it has always been in a `--store`.
+
 ## Documentation
 
 | | |
 |---|---|
 | [Layers](docs/layers.md) | what each file publishes, keyed files, partitions, the write layer, transactions |
 | [Configuration](docs/configuration.md) | every key and flag, virtual columns, filters and session variables |
-| [Performance](docs/performance.md) | `--cache`, `--materialize`, `--store` and what each is worth |
+| [Performance](docs/performance.md) | `--cache`, `--materialize`, `--store`, baking a database and what each is worth |
 | [Schema](docs/schema.md) | a dacpac as the declared schema: types, keys, defaults, references, views, functions |
 | [Protocols](docs/protocols.md) | the PostgreSQL and TDS front doors, and what each client can rely on |
 | [T-SQL](docs/tsql.md) | the dialect the TDS door accepts, and what it becomes |
