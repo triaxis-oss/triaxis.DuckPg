@@ -21,7 +21,7 @@ a typo is an error rather than a silent fallback to defaults.
 | `store` | `--store` | DuckDB database file a materialized lake's tables live in, rather than memory. Its name becomes the database name, so it cannot be the schema's. |
 | `storeMode` | `--store-mode` | `Keep` (default): the file is the state. `Spill`: only where the tables live. |
 | `sortSmallTables` | `--no-sort-small-tables` | Sort and limit a small materialized table's rows here rather than in DuckDB. On by default; the flag turns it off. |
-| `checkKeys` | `--no-check-keys` | Refuse a write that would put two rows under one declared key. On by default; the flag turns it off. |
+| `checkKeys` | `--no-check-keys` | Refuse a write that would put two rows under one declared key. On by default; the flag turns off the scan behind it, though a materialized table carries the key as a real `PRIMARY KEY` and refuses it anyway. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
