@@ -3,9 +3,23 @@ using Microsoft.Extensions.Logging;
 
 namespace triaxis.DuckPg;
 
-/// Writes a lake down instead of serving it: a directory takes one parquet a table and is read back
-/// as an ordinary layer, and a path ending in `.duckdb` takes the database a materialized lake would
-/// hold, served with `Config.Base`.
+/// What a bake writes, which is two quite different things: a layer to stack under the next lake,
+/// or a whole lake to serve in place of one.
+public enum BakeFormat
+{
+    /// A directory holding one parquet a table, read back as an ordinary layer -- it stacks, its
+    /// declared defaults are left to whoever reads it, and the configuration above it still applies.
+    Parquet,
+
+    /// The database a materialized lake would hold: collapsed tables, their keys and indexes, and
+    /// the declared views and macros. Served with `Config.Base`, which needs no dacpac, key or
+    /// configuration of its own, and holds every declared default already stamped.
+    Database,
+}
+
+/// Writes a lake down instead of serving it, as a layer or as a database. Which one is the caller's
+/// to say; unsaid, it is taken from the name, since `.duckdb` means one of them and nothing else
+/// does.
 ///
 /// The pair to `IDuckPgLakeFactory`, and the same bargain: the configuration arrives per call rather
 /// than per container, so one process can bake as many lakes as it has configurations for, and each
@@ -17,19 +31,20 @@ public interface IDuckPgBaker
     /// DuckDB's own 256 KB and 18.7 MB at this. It cannot be changed once the file exists.
     public const int DefaultBlockSize = 16384;
 
-    /// Builds the lake `config` describes and writes it to `target`: a directory for parquet and a
-    /// `.duckdb` path for a database, which is the only one `blockSize` is read for.
-    Task BakeAsync(Config config, string target, int blockSize = DefaultBlockSize,
-                   CancellationToken cancellation = default);
+    /// Builds the lake `config` describes and writes it to `target`. `format` unset is taken from
+    /// the name -- `.duckdb` is a database and anything else a directory of parquet -- and named is
+    /// what it says, whatever the name looks like. `blockSize` is only read for a database.
+    Task BakeAsync(Config config, string target, BakeFormat? format = null,
+                   int blockSize = DefaultBlockSize, CancellationToken cancellation = default);
 }
 
 sealed class DuckPgBaker(ILoggerFactory loggers) : IDuckPgBaker
 {
-    public async Task BakeAsync(Config config, string target,
+    public async Task BakeAsync(Config config, string target, BakeFormat? format = null,
                                 int blockSize = IDuckPgBaker.DefaultBlockSize,
                                 CancellationToken cancellation = default)
     {
-        var database = IsDatabase(target);
+        var database = (format ?? Inferred(target)) == BakeFormat.Database;
         if (database) config = Materialized(config, target);
 
         // A container of its own rather than a scope: each bake is configured differently, and a
@@ -49,12 +64,14 @@ sealed class DuckPgBaker(ILoggerFactory loggers) : IDuckPgBaker
         else await bake.WriteAsync(target, cancellation);
     }
 
-    /// A layer's format is a property of the file, and this is the same reading applied to the
-    /// output: `.duckdb` is one thing and nothing else is.
+    /// What a name says a bake is to write, for a caller that did not say. A layer's format is a
+    /// property of the file, and this is the same reading applied to the output: `.duckdb` is one
+    /// thing and nothing else is. Only ever a default -- `BakeFormat` is what decides.
     const string DatabaseExtension = ".duckdb";
 
-    static bool IsDatabase(string target) =>
-        Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase);
+    static BakeFormat Inferred(string target) =>
+        Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase)
+            ? BakeFormat.Database : BakeFormat.Parquet;
 
     /// The same lake, collapsed into the file being written rather than served from views. A store
     /// that is the state is exactly what a baked database is, so `Keep` is what it is built as. It

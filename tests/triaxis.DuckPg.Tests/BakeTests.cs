@@ -269,6 +269,29 @@ public class BakeTests
         Assert.Empty(Rows(duck, $"SELECT * FROM {Bake.Identified}"));
     }
 
+    /// The name is a default and not the mechanism: a caller that says which one it wants gets it,
+    /// whatever the file is called.
+    [Fact]
+    public void TheFormatIsTheCallersToNameOverTheName()
+    {
+        using var lake = new TestLake()
+            .Yaml("base", "orders", "- order_id: 1")
+            .Stack("base");
+
+        // A directory of parquet, under a name that reads like a database.
+        lake.Baked("looks-like.duckdb", BakeFormat.Parquet);
+        Assert.True(Directory.Exists(lake.At("looks-like.duckdb")));
+        Assert.True(File.Exists(lake.At("looks-like.duckdb", "orders.parquet")));
+
+        // And a database, under a name that does not.
+        lake.Baked("looks-like-a-directory", BakeFormat.Database);
+        Assert.True(File.Exists(lake.At("looks-like-a-directory")));
+
+        using var duck = new DuckDBConnection($"Data Source={lake.At("looks-like-a-directory")}");
+        duck.Open();
+        Assert.Equal(["1"], Rows(duck, "SELECT order_id FROM lake.orders"));
+    }
+
     /// A reference is duckpg's own rule, checked over the merged view rather than by DuckDB, so a
     /// database that is to be served without the dacpac has to carry it.
     [Fact]

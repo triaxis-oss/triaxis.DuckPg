@@ -60,9 +60,10 @@ fetches the matching version the first time a lake finds none — see
 ## Baking a lake from your own process
 
 `IDuckPgBaker` is the pair to `IDuckPgLakeFactory`: it takes a `Config` per call and writes what that
-lake publishes out instead of serving it. A directory takes one parquet a table and is read back as
-an ordinary layer; a path ending in `.duckdb` takes the whole lake as a database, which `Config.Base`
-then serves without a dacpac, a key or a configuration of its own.
+lake publishes out instead of serving it. `BakeFormat.Parquet` writes a directory of one file a table,
+read back as an ordinary layer; `BakeFormat.Database` writes the whole lake as a database, which
+`Config.Base` then serves without a dacpac, a key or a configuration of its own. Left unsaid it is
+taken from the name, `.duckdb` meaning a database.
 
 ```csharp
 var services = new ServiceCollection().AddLogging().AddDuckPgBaker();

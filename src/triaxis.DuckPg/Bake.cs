@@ -47,7 +47,7 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
         config.ValidateShape();
         config.ValidateSessionless("a baked database");
 
-        // Replaced rather than opened: `Materialized` builds this as a store that is the state, and
+        // Replaced rather than opened: the baker configures this as a store that is the state, and
         // a store that is already there is kept rather than rebuilt.
         foreach (var stale in (string[])[target, target + ".wal"])
             if (File.Exists(stale)) File.Delete(stale);

@@ -6,10 +6,15 @@ namespace triaxis.DuckPg.Cli;
 public class BakeCommand : LakeCommand
 {
     [Option("--out", "-o", Required = true, Description =
-        "Where the bake goes: a directory, written as one parquet a table and read back as an " +
-        "ordinary layer, or a path ending in .duckdb, written as the database a materialized lake " +
-        "would hold. A directory must be outside the layers.")]
+        "Where the bake goes, and what --format defaults to: a path ending in .duckdb is a database " +
+        "and anything else a directory. A directory must be outside the layers.")]
     public string Out { get; set; } = "";
+
+    [Option("--format", Description =
+        "What to write: Parquet for a directory of one file a table, read back as an ordinary layer, " +
+        "or Database for the whole lake as a DuckDB file, served with --base. Taken from the name " +
+        "when unset -- .duckdb is a database and anything else is a directory.")]
+    public BakeFormat? Format { get; set; }
 
     [Option("--block-size", Description =
         "Block size a baked database is created with, in bytes. Small is what makes a lake of many " +
@@ -26,5 +31,5 @@ public class BakeCommand : LakeCommand
     }
 
     public Task ExecuteAsync(CancellationToken cancellation) =>
-        Guarded(() => _baker.BakeAsync(Configured(), Path.GetFullPath(Out), BlockSize, cancellation));
+        Guarded(() => _baker.BakeAsync(Configured(), Path.GetFullPath(Out), Format, BlockSize, cancellation));
 }

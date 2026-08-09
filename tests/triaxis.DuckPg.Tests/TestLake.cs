@@ -143,7 +143,7 @@ sealed class TestLake : IDisposable
     /// own. What the bake said lands in `Logged`, exactly as a start's own lines do -- and pointing
     /// `Stack` at the same directory afterwards is how a test tells a baked lake from the one it
     /// was baked from.
-    public TestLake Baked(string directory = "baked")
+    public TestLake Baked(string directory = "baked", BakeFormat? format = null)
     {
         Logged.Clear();
 
@@ -155,7 +155,7 @@ sealed class TestLake : IDisposable
 
         using var provider = services.BuildServiceProvider();
         provider.GetRequiredService<IDuckPgBaker>()
-                .BakeAsync(Config, At(directory)).GetAwaiter().GetResult();
+                .BakeAsync(Config, At(directory), format).GetAwaiter().GetResult();
         return this;
     }
 
