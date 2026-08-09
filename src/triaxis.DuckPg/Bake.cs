@@ -33,18 +33,145 @@ namespace triaxis.DuckPg;
 sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDbInstaller installer,
                   ILogger<Bake> logger)
 {
+    /// What a bake writes into rather than a directory of parquet: one DuckDB database holding the
+    /// collapsed tables, which a later run copies and serves without reading a layer or a dacpac at
+    /// all. Decided by the name, the way a layer's format is decided by the file's.
+    public const string DatabaseExtension = ".duckdb";
+
+    public static bool IsDatabase(string target) =>
+        Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase);
+
     /// Everything a bake is made of, released when it is done. A bake outlives nothing, so it owns
     /// its container the way a factory-built lake owns its own.
-    public static async Task RunAsync(Config config, string directory, ILoggerFactory? loggers,
+    ///
+    /// A database bake is a materialized lake written into the file it is named after, so it is that
+    /// configuration that gets built -- on a copy, since the one it was handed describes a lake
+    /// served from layers and is nobody's to rewrite.
+    /// What a baked database is written with, and why it is not DuckDB's own 256 KB. A block is the
+    /// unit a file is allocated in, so a lake of many small tables pays for one whichever way it is
+    /// filled: 300 tables holding 1500 rows between them came to 159 MB at the default and 18.7 MB
+    /// at this, which is 9 ms to copy against 172. Since copying is what serving one costs, that is
+    /// most of what the mode is for -- an experiment wanting a fresh instance a thousand times over
+    /// is paying it a thousand times. Raise it with `--block-size` for a bake whose tables are big
+    /// enough for the metadata of small blocks to be the cost instead.
+    public const int DefaultBlockSize = 16384;
+
+    public static async Task RunAsync(Config config, string target, ILoggerFactory? loggers,
+                                      int blockSize = DefaultBlockSize,
                                       CancellationToken cancellation = default)
     {
+        var database = IsDatabase(target);
+        if (database) config = Materialized(config, target);
+
         var services = new ServiceCollection();
         if (loggers is not null) services.AddSingleton(loggers);
-        services.AddDuckPgBake(config);
+        services.AddDuckPgBake(config, database ? blockSize : 0);
 
         await using var provider = services.BuildServiceProvider();
-        await provider.GetRequiredService<Bake>().WriteAsync(directory, cancellation);
+        var bake = provider.GetRequiredService<Bake>();
+
+        if (database) await bake.WriteDatabaseAsync(target, cancellation);
+        else await bake.WriteAsync(target, cancellation);
     }
+
+    /// The same lake, collapsed into the file being written rather than served from views. A store
+    /// that is the state is exactly what a baked database is, so `Keep` is what it is built as --
+    /// and the file is deleted first, or that same rule would have this build open what an earlier
+    /// bake left and keep it instead of replacing it.
+    static Config Materialized(Config config, string target)
+    {
+        if (Directory.Exists(target))
+            throw new DuckPgConfigurationException(
+                $"{target} is a directory, and a bake into a database writes one file");
+
+        var baked = config.Copy();
+        baked.Materialize = true;
+        baked.Store = target;
+        baked.StoreMode = StoreMode.Keep;
+        return baked;
+    }
+
+    /// The lake collapsed into one database: the tables a materialized lake would serve, their keys
+    /// and indexes, the declared views and macros, and the rules DuckDB has nowhere to keep. A later
+    /// run copies this and serves the copy, so nothing is scanned, described, parsed or merged on
+    /// the way up -- which is the whole of what it buys over a directory of parquet.
+    ///
+    /// A materialized table holds every declared default already stamped, and there is no reader
+    /// left to stamp one: `(getdate())` in a baked database is the moment the bake ran, exactly as
+    /// it is in a `--store`. That is the one way this is not the layers it came from, and
+    /// `--derive-ids` is the answer for the ids among them, being derived rather than generated.
+    public async Task WriteDatabaseAsync(string target, CancellationToken cancellation)
+    {
+        config.ValidateShape();
+        config.ValidateSessionless("a baked database");
+
+        // Replaced rather than opened: `Materialized` builds this as a store that is the state, and
+        // a store that is already there is kept rather than rebuilt.
+        foreach (var stale in (string[])[target, target + ".wal"])
+            if (File.Exists(stale)) File.Delete(stale);
+
+        if (config.InstallDuckDb && !DuckDbLibrary.SearchPath.Any(DuckDbLibrary.Usable))
+            await installer.InstallAsync(cancellation);
+
+        duck.Open();
+        using (var macros = duck.CreateCommand())
+        {
+            macros.CommandText = Shims.Macros;
+            macros.ExecuteNonQuery();
+        }
+
+        HostFunctions.Register(duck);
+        catalog.Build(duck);
+        Declare();
+
+        // What a lake would otherwise pay for on every start, paid once here: DuckDB writes table
+        // data uncompressed until something checkpoints it, and a file nobody has checkpointed is a
+        // file every later run copies in full.
+        Exec("CHECKPOINT");
+
+        logger.LogInformation("baked {Tables} into {Target}",
+            catalog.Tables.Count == 1 ? "1 table" : $"{catalog.Tables.Count} tables", target);
+    }
+
+    /// The part of a lake DuckDB has nowhere to hold. Columns, keys, uniques, defaults, sequences,
+    /// views and macros are all in its own catalog by the time the tables are built, and a copy of
+    /// the file carries them. A declared reference and its ON DELETE are duckpg's own rules, checked
+    /// in .NET over the merged view, and an identity is a column the declaring schema said the store
+    /// fills in -- neither is anything DuckDB would recognise, so both are written down.
+    void Declare()
+    {
+        Exec($"CREATE SCHEMA IF NOT EXISTS {Schema}");
+        Exec($"CREATE OR REPLACE TABLE {Meta} (key VARCHAR PRIMARY KEY, value VARCHAR)");
+        Exec($"INSERT INTO {Meta} VALUES ('version', '1'), ('schema', {SqlText.Literal(config.Schema)})");
+
+        Exec($"CREATE OR REPLACE TABLE {Referenced} (name VARCHAR, \"table\" VARCHAR, columns VARCHAR[], " +
+             "parent VARCHAR, parent_columns VARCHAR[], on_delete VARCHAR)");
+        foreach (var reference in catalog.References)
+            Exec($"INSERT INTO {Referenced} VALUES ({SqlText.Literal(reference.Name)}, " +
+                 $"{SqlText.Literal(reference.Table)}, {List(reference.Columns)}, " +
+                 $"{SqlText.Literal(reference.Parent)}, {List(reference.ParentColumns)}, " +
+                 $"{SqlText.Literal(reference.OnDelete)})");
+
+        Exec($"CREATE OR REPLACE TABLE {Identified} (\"table\" VARCHAR, \"column\" VARCHAR)");
+        foreach (var table in catalog.Tables.Values)
+            foreach (var column in table.Columns.Where(c => c.Identity))
+                Exec($"INSERT INTO {Identified} VALUES ({SqlText.Literal(table.Name)}, " +
+                     $"{SqlText.Literal(column.Name)})");
+    }
+
+    /// A schema of duckpg's own, like `wr`, `layer` and `base` -- not the unqualified `main` the
+    /// shims live in. Those are unqualified because a client has to find them: `Shims.Apply` rewrites
+    /// `pg_catalog.pg_class` to a bare `duckpg_pg_class`, so being in the search path is the point.
+    /// This is the opposite -- nothing should ever name it from a session, and `main` is in every
+    /// session's path. A schema is also the namespace the prefix was spelling out by hand, which is
+    /// why the tables below can be called what they are.
+    public const string Schema = "duckpg";
+    public const string Meta = $"{Schema}.meta";
+    public const string Referenced = $"{Schema}.reference";
+    public const string Identified = $"{Schema}.identity";
+
+    static string List(string[] values) =>
+        $"[{string.Join(", ", values.Select(SqlText.Literal))}]";
 
     public async Task WriteAsync(string directory, CancellationToken cancellation)
     {
@@ -144,6 +271,13 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
     /// earlier one filled leaves that one's tables behind, and a layer directory is read for
     /// whatever is in it -- so a table this lake no longer publishes would go on being published by
     /// the file nobody replaced. Said rather than deleted: the directory is the caller's.
+    void Exec(string sql)
+    {
+        using var command = duck.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
     void Strays(string directory, List<string> written)
     {
         var mine = new HashSet<string>(written, StringComparer.OrdinalIgnoreCase);

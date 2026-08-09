@@ -320,6 +320,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     public IReadOnlySet<string> Functions => macros;
 
+    /// Every reference this lake actually holds, with the action already resolved to one it can
+    /// perform. What a bake writes down, since a database carries a lake's tables and DuckDB has
+    /// nowhere to put a rule duckpg enforces itself.
+    public IEnumerable<Reference> References => pointing.Values.SelectMany(references => references);
+
     public const string NoAction = "NoAction";
     public const string Cascade = "Cascade";
     public const string SetNull = "SetNull";

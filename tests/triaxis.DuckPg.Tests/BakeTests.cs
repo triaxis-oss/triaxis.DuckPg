@@ -1,3 +1,5 @@
+using DuckDB.NET.Data;
+
 namespace triaxis.DuckPg.Tests;
 
 /// `duckpg bake` — the layers written out as the parquet layer they publish, so the next run scans
@@ -216,6 +218,97 @@ public class BakeTests
 
         var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Baked());
         Assert.Contains("a bake serves nothing", refused.Message);
+    }
+
+    /// Baked into a database rather than a directory, which is a materialized lake written down:
+    /// the tables it would have served, their keys, and the rules DuckDB has nowhere to keep.
+    [Fact]
+    public void ADatabaseBakeHoldsTheCollapsedTables()
+    {
+        using var lake = new TestLake()
+            .Yaml("base", "customers", """
+                - customer_id: 1
+                  name: seeded
+                - customer_id: 2
+                  name: kept
+                """)
+            .Json("tenant", "customers", """[{"customer_id": 1, "name": "overridden"}]""")
+            .Stack("base", "tenant");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), new Dacpac.TableModel("customers",
+            [("customer_id", "int"), ("name", "nvarchar")], ["customer_id"]));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+
+        lake.Baked("baked.duckdb");
+
+        using var duck = new DuckDBConnection($"Data Source={lake.At("baked.duckdb")}");
+        duck.Open();
+
+        Assert.Equal(["1|overridden", "2|kept"],
+            Rows(duck, "SELECT customer_id, name FROM lake.customers ORDER BY customer_id"));
+
+        // A table rather than a view over anything: there is nothing left to merge.
+        Assert.Equal(["BASE TABLE"], Rows(duck,
+            "SELECT table_type FROM information_schema.tables WHERE table_schema = 'lake' AND table_name = 'customers'"));
+
+        // The declared key, held by DuckDB itself, which is what a copy of this file carries.
+        Assert.Equal(["PRIMARY KEY"], Rows(duck,
+            "SELECT constraint_type FROM duckdb_constraints() WHERE table_name = 'customers' AND constraint_type = 'PRIMARY KEY'"));
+
+        // What makes copying one cheap, and it cannot be changed after the file is created: a block
+        // is allocated whole, so a lake of many small tables is mostly blocks.
+        Assert.Equal([Bake.DefaultBlockSize.ToString()], Rows(duck, "SELECT block_size FROM pragma_database_size()"));
+
+        // In a schema of its own rather than in `main`, which is in every session's search path:
+        // nothing here is a client's to find.
+        Assert.Equal(["identity", "meta", "reference"], Rows(duck,
+            $"SELECT table_name FROM information_schema.tables WHERE table_schema = '{Bake.Schema}' " +
+            "ORDER BY table_name"));
+
+        Assert.Equal(["lake", "1"], Rows(duck, $"SELECT value FROM {Bake.Meta} ORDER BY key"));
+        Assert.Empty(Rows(duck, $"SELECT * FROM {Bake.Referenced}"));
+        Assert.Empty(Rows(duck, $"SELECT * FROM {Bake.Identified}"));
+    }
+
+    /// A reference is duckpg's own rule, checked over the merged view rather than by DuckDB, so a
+    /// database that is to be served without the dacpac has to carry it.
+    [Fact]
+    public void ADatabaseBakeWritesDownTheRulesDuckDbCannotHold()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1, "customer_id": 1}]""")
+            .Json("base", "customers", """[{"customer_id": 1}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            [new Dacpac.TableModel("customers", [("customer_id", "int")], ["customer_id"]),
+             new Dacpac.TableModel("orders", [("order_id", "int"), ("customer_id", "int")], ["order_id"],
+                                   Identity: ["order_id"])],
+            [],
+            [new Dacpac.ReferenceModel("FK_orders_customers", "orders", ["customer_id"],
+                                       "customers", ["customer_id"], "Cascade")]);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Config.Write = lake.At("local");
+
+        lake.Baked("baked.duckdb");
+
+        using var duck = new DuckDBConnection($"Data Source={lake.At("baked.duckdb")}");
+        duck.Open();
+
+        Assert.Equal(["FK_orders_customers|orders|customers|Cascade"], Rows(duck,
+            $"SELECT name, \"table\", parent, on_delete FROM {Bake.Referenced}"));
+        Assert.Equal(["orders|order_id"], Rows(duck, $"SELECT * FROM {Bake.Identified}"));
+    }
+
+    static List<string> Rows(DuckDBConnection duck, string sql)
+    {
+        using var command = duck.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+
+        var rows = new List<string>();
+        while (reader.Read())
+            rows.Add(string.Join("|", Enumerable.Range(0, reader.FieldCount)
+                .Select(i => reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString())));
+        return rows;
     }
 
     /// What an earlier bake left for a table this one no longer publishes goes on being a layer
