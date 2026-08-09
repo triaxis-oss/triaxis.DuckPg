@@ -104,6 +104,43 @@ Every number here was measured on this code. The user-facing summary is [perform
   measurements showing 2.5x against a table and 2.8x against a merge view -- was built and taken back
   out; it is not in the tree. What it cannot do is be correct.
 
+## Compressing what is held
+
+- **A checkpoint is the only thing that compresses an in-memory DuckDB, and nothing drives one.**
+  Compression is applied when a row group is written out at checkpoint; a file database is driven
+  there by its WAL, and an in-memory one is never driven anywhere. So a materialized lake holds every
+  column as it was built until asked otherwise -- `pragma_storage_info` says `Uncompressed` for every
+  segment of a freshly built table, and `DICT_FSST`, `BitPacking` and `Constant` for the same table
+  after `CHECKPOINT`. That is the whole of `Config.Compress`: one statement at the end of
+  `Catalog.Build`. Measured over 5M rows of a five-column table, medians through the wire:
+
+  | | as built | compressed |
+  |---|---|---|
+  | held in memory | 279.7 MB | **64.0 MB** |
+  | build | 0.7 s | 1.1 s |
+  | `count(*) WHERE note = 'order-42'` | 14.6 ms | **4.3 ms** |
+  | `sum(amount) WHERE bucket = 3` | **3.5 ms** | 6.5 ms |
+  | a row by its key | 0.63 ms | 0.60 ms |
+  | a one-row `UPDATE` | 9.9 ms | 10.0 ms |
+
+  Which is why it is off: a dictionary-encoded string is filtered by comparing against the dictionary
+  rather than against every row, and a bit-packed number is unpacked a vector at a time on the way
+  into an aggregate. The two move in opposite directions by about the same factor, so nothing but the
+  memory is true for every lake.
+- **Once, at the end of the build, rather than per table.** A checkpoint is the whole database's, so
+  a second one buys nothing and the one there is also covers the `layer` tables a YAML or JSON layer
+  was read into -- which is why this is not gated on `Materialize`, though that is the mode it exists
+  for. It runs on the lake's own connection under `Rebuild` too, and it does not need the lake to be
+  quiet: `CHECKPOINT` with another connection's transaction open neither blocks nor errors on 1.5.5,
+  it simply leaves that transaction's blocks alone. Size is no bound either -- a three-row table
+  comes back `Constant` and `DICT_FSST`, which is what lets `CompressTests` assert on a fixture
+  rather than on a million rows.
+- **What is written afterwards is not compressed, and nothing checkpoints again.** The segments an
+  insert appends read `Uncompressed` for the life of the process. Checkpointing on a timer or after a
+  write was not built: it would decide, on behalf of a lake nobody is watching, to spend CPU on rows
+  that may be read once -- and the interesting case, a lake loaded once and then read, is exactly the
+  one the build-time checkpoint already covers.
+
 ## Sorting a small table here rather than in DuckDB
 
 - **A sort costs what a row is wide, not what a table is long, and that is what `SortSmallTables`

@@ -173,6 +173,13 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Macros(conn);
         Declared(conn);
         Empty();
+
+        // DuckDB writes table data uncompressed and compresses it at a checkpoint, which no WAL
+        // drives an in-memory database to -- so what a materialized lake collapsed its layers into
+        // stays in the widest form of every column until something asks. Asked once here rather
+        // than per table: a checkpoint is the whole database's, so it also covers the tables a YAML
+        // or JSON layer was read into.
+        if (config.Compress) Exec(conn, "CHECKPOINT");
     }
 
     /// A lake holding nothing answers every query with "no such table", and nothing in that answer
