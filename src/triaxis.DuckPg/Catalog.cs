@@ -143,6 +143,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                                   KeyFor(name, settings, columns, partitions),
                                   writable || config.Materialize, writeSource, settings.Filter,
                                   config.Materialize);
+            Diagnose(table);
 
             if (table.Materialized)
             {
@@ -582,6 +583,77 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// the view with the value this instance started with rather than stamping a new one.
     readonly Dictionary<(string Expression, string Type), ColumnDefault?> evaluated = new();
 
+    /// A table asked for per-row ids that has no key to derive one from. Warned rather than refused:
+    /// one `--derive-ids` across a mixed lake should leave the odd table out, exactly as one `--key`
+    /// does, and what it leaves is the frozen value the lake had before it was asked.
+    void Diagnose(Table table)
+    {
+        if (!config.DeriveIds || table.Key.Length > 0) return;
+
+        foreach (var column in table.Columns.Where(c => c.Default is { } d && Invents(d.Expr)))
+            logger.LogWarning("{Table}.{Column} keeps one id for the whole run: {Table} declares no key to derive " +
+                              "one from", table.Name, column.Name, table.Name);
+    }
+
+    /// What fills a read layer's gap for a column: what the declared default was worth when the lake
+    /// was built, or -- where the lake was asked to make one up per row and can -- an id derived from
+    /// the row's key.
+    string? Filled(Table table, Column column) =>
+        column.Default is not { } declared ? null : Derived(table, column) ?? declared.Value;
+
+    /// A `NEWID()` default answered per row rather than per run: the row's key written into the low
+    /// half of a uuid whose high half is fixed for the column. The high half is a hash of the table
+    /// and column names taken here, once, so no row pays for it and two columns cannot answer alike.
+    ///
+    /// Derived and not generated. A view is bound on every execution, so `uuid()` in one would answer
+    /// differently every scan -- which is why a declared default is frozen at build in the first
+    /// place. Determinism is what buys back everything freezing was protecting: the same id on every
+    /// scan, the same id after a restart, and an id `Baseline` agrees with, so the shutdown delta
+    /// stays a delta rather than becoming every row of the table.
+    ///
+    /// A key of one narrow integer goes in as itself, so consecutive rows get consecutive ids and an
+    /// index over them stays dense -- which is what `NEWSEQUENTIALID()` is for. Anything else is
+    /// hashed to 64 bits: `hex` of a wider integer is truncated by the padding, and a composite or a
+    /// string key has no ordering worth keeping anyway.
+    ///
+    /// Never for a key column itself -- the key decides which row shadows which, and one derived from
+    /// itself would be circular -- and never without a key, since a row with no identity has nothing
+    /// to derive from.
+    string? Derived(Table table, Column column)
+    {
+        if (!config.DeriveIds || column.Default is not { } declared || !Invents(declared.Expr)) return null;
+        if (table.Key.Length == 0 || table.Key.Any(k => Same(k, column.Name))) return null;
+
+        var key = table.Key is [var only] && table.Columns.Any(c => Same(c.Name, only) && Narrow(c.Type))
+            ? $"{SqlText.Quote(only)}::BIGINT"
+            : $"hash({string.Join(", ", table.Key.Select(SqlText.Quote))})";
+        var low = $"lpad(hex({key}), 16, '0')";
+
+        return $"CAST('{Prefix(table.Name, column.Name)}' || substr({low}, 1, 4) || '-' || " +
+               $"substr({low}, 5, 12) AS UUID)";
+    }
+
+    /// The half of the uuid that belongs to the column rather than to the row, as the first three
+    /// groups of one. SHA-256 rather than a counter: it has to be the same on the next run and in
+    /// the next process, and a name is the only thing that is.
+    static string Prefix(string table, string column)
+    {
+        var hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes($"{table}.{column}")));
+        return $"{hash[..8]}-{hash[8..12]}-{hash[12..16]}-";
+    }
+
+    /// Whether a declared default is the one thing a lake can honestly make up per row. `NEWID()`
+    /// stands for a value nobody else holds, and only the row's own identity can decide that the
+    /// same way twice; `(getdate())` asks when the row was written, which a file cannot say.
+    static bool Invents(string expr) =>
+        string.Concat(expr.Where(ch => ch is not ('(' or ')' or ' '))).Equals("uuid", StringComparison.OrdinalIgnoreCase);
+
+    /// An integer whose hex fits the 16 characters the low half of a uuid has room for. A wider one
+    /// is silently cut short by the padding, which would give two keys one id.
+    static bool Narrow(string type) =>
+        type is "TINYINT" or "SMALLINT" or "INTEGER" or "BIGINT"
+             or "UTINYINT" or "USMALLINT" or "UINTEGER" or "UBIGINT";
+
     Column Defaulted(DuckDBConnection conn, string table, Column column) =>
         schema.Default(table, column.Name) is { } expression
             ? column with { Default = Evaluate(conn, expression, column.Type) }
@@ -814,7 +886,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     string Over(Table table, string file) =>
         Deferrable(table) && table.Columns.Any(c => c.Default is not null)
             ? "SELECT " + string.Join(", ", table.Columns.Select(c =>
-                  (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
+                  (Filled(table, c) is { } fill ? $"COALESCE({SqlText.Quote(c.Name)}, {fill})" : SqlText.Quote(c.Name))
                   + $" AS {SqlText.Quote(c.Name)}")) + $" FROM {Scan(file)}"
             : $"SELECT * FROM {Scan(file)}";
 
@@ -935,7 +1007,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// A lake with no read layers has nothing frozen: its rows arrive as writes, and the write
     /// table's own default stamps each as it is written.
     bool Carried(Table table, string column) =>
-        table.Layers.Count == 0 || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column)));
+        table.Layers.Count == 0 || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column)))
+        || (table.Columns.FirstOrDefault(c => Same(c.Name, column)) is { } declared
+            && Derived(table, declared) is not null);
 
     /// Whether two column lists say the same thing about a row, which order does not change.
     static bool Covers(string[] key, string[] columns) =>
@@ -1093,7 +1167,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (Underlay(table) is { } copy)
             return Wrap(table, writable, tombstones, [
                 "SELECT " + string.Join(", ", table.Columns.Select(c =>
-                     (c.Default is { } d ? $"COALESCE({SqlText.Quote(c.Name)}, {d.Value})" : SqlText.Quote(c.Name))
+                     (Filled(table, c) is { } fill ? $"COALESCE({SqlText.Quote(c.Name)}, {fill})" : SqlText.Quote(c.Name))
                      + $" AS {SqlText.Quote(c.Name)}")) +
                  $", NULL::VARCHAR AS \"_file\", 0::BIGINT AS \"_seq\" FROM {Scan(copy)}",
                 .. writable
@@ -1111,7 +1185,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (!writable && table.Layers is [var only] && table.Virtuals.Count == 0 && table.Filter is null)
             return "SELECT " +
                    string.Join(", ", table.Columns.Select(c =>
-                       (Value(c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)
+                       (Value(table, c, only.Columns.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)
                         ?? $"CAST(NULL AS {c.Type})") + $" AS {SqlText.Quote(c.Name)}")) +
                    $" FROM {only.Scan}";
 
@@ -1173,14 +1247,14 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     ///
     /// A layer that carries the column still has rows leaving it empty, so the default goes over
     /// the value rather than only where the column is missing from the file altogether.
-    static string? Value(Column column, Column? source, bool defaults)
+    string? Value(Table table, Column column, Column? source, bool defaults)
     {
         // A cast to the type the layer already has is an expression DuckDB binds on every
         // statement and nothing else -- and a view is bound per execution, not per lake.
         var value = source is null ? null
             : Same(source.Type, column.Type) ? SqlText.Quote(column.Name)
             : $"CAST({SqlText.Quote(column.Name)} AS {column.Type})";
-        var fill = defaults ? column.Default?.Value : null;
+        var fill = defaults ? Filled(table, column) : null;
         return (value, fill) switch
         {
             (null, null) => null,
@@ -1193,7 +1267,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     string Branch(Table table, List<Column> available, string scan, int seq, bool named, bool defaults)
     {
         var columns = string.Join(", ", table.Columns
-            .Select(c => (Column: c, Value: Value(c, available.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)))
+            .Select(c => (Column: c, Value: Value(table, c, available.FirstOrDefault(a => Same(a.Name, c.Name)), defaults)))
             .Where(c => c.Value is not null)
             .Select(c => $"{c.Value} AS {SqlText.Quote(c.Column.Name)}"));
 

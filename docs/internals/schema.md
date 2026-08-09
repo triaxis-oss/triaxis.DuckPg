@@ -15,9 +15,29 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   Only a default the merge depends on -- on a key column, or under a filter or a virtual column --
   is written into the copy. `Catalog.Signature` keys on a default's declared expression and not on
   what it evaluated to, or every stamped table would rebuild on every restart.
+- **An id a file does not carry can be per row, but only if it is derived.** `Catalog.Derived` is
+  what `--derive-ids` turns on, and it replaces `ColumnDefault.Value` in the two places a read layer's
+  gap is filled -- `Catalog.Value` for a layer branch and `Catalog.Over` for a `--cache` copy, both
+  through `Catalog.Filled`. The value is the row's key in the low half of a uuid whose high half is a
+  SHA-256 of the table and column names, taken in .NET so no row pays for it: `CAST('<prefix>' ||
+  substr(lpad(hex(<key>), 16, '0'), 1, 4) || '-' || substr(..., 5, 12) AS UUID)`.
+  **Generating instead would undo the reason the default is frozen at all**: a view is bound on every
+  execution, so `uuid()` in one answers differently every scan. Determinism buys back three things at
+  once -- the same id twice in a row, the same id after a restart, and an id `Baseline` agrees with,
+  without which every row of every table with such a column would land in the shutdown delta.
+  A key of one narrow integer goes in as itself, so consecutive rows get consecutive ids and the ART
+  over them stays dense; anything wider or composite is `hash`ed to the same 64 bits, because `lpad`
+  *truncates* `hex` of a HUGEINT rather than padding it, which would quietly give two keys one id.
+  Measured over 1M rows: 191 ms for the integer form and 208 for the hashed, against 461 for a
+  `md5`-per-row uuid and 1 ms for the frozen literal -- the cost is the string building and the cast,
+  not the hash, which is why precomputing the prefix is most of what makes it affordable. Only
+  `NEWID()` -- `Catalog.Invents` matches its translated `uuid()` -- since `(getdate())` per row would
+  be inventing an answer rather than deriving one. Never on a key column, which would be circular,
+  and never without a key: that table keeps the run's one value and is named in a warning, the same
+  bargain `KeyFor` strikes. `Catalog.Carried` counts a derived column as being in the data, which is
+  what lets a declared unique hold over the very columns that made it unenforceable.
 
 ## Keys
-
 - **A declared key is a rule over the merged view, and only a materialized lake can hand any of it
   to DuckDB.** The write branch's `PRIMARY KEY` sees only the rows this process wrote, so an INSERT
   of a key a file below already holds is let through -- and the row then shadows that file's row,

@@ -53,6 +53,10 @@ public class ServeCommand : LoggingCommand
     [Option("--no-check-keys", Description = "Let a write put two rows under one declared key, which is refused by default.")]
     public bool NoCheckKeys { get; set; }
 
+    [Option("--derive-ids", Description = "Give every row its own value for a NEWID() default, derived from its key, " +
+                                          "rather than one value for the whole run.")]
+    public bool DeriveIds { get; set; }
+
     [Option("--serialize-transactions", Description = "Let one transaction run at a time, the next waiting for the one in front of it.")]
     public bool SerializeTransactions { get; set; }
 
@@ -123,6 +127,7 @@ public class ServeCommand : LoggingCommand
         if (Compress) config.Compress = true;
         if (NoSortSmallTables) config.SortSmallTables = false;
         if (NoCheckKeys) config.CheckKeys = false;
+        if (DeriveIds) config.DeriveIds = true;
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
         if (Key.Length > 0) config.DefaultKey = Key;
