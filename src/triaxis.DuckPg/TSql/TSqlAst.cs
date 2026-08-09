@@ -8,6 +8,13 @@ abstract record Statement;
 
 sealed record SelectStatement(Query Query) : Statement;
 
+/// `EXPLAIN <statement>`, which is DuckDB's spelling and not T-SQL's -- SQL Server says
+/// `SET SHOWPLAN_ALL ON`. It is here because a caller debugging a lake through the SQL Server door
+/// otherwise has no way to ask what a statement will actually do, and what the gateway sends is not
+/// what it was sent. The statement inside is parsed and rendered like any other; what the answer is
+/// made of is the gateway's to decide.
+sealed record ExplainStatement(Statement Inner, bool Analyze) : Statement;
+
 /// `SELECT @a = x, @b = y` — T-SQL's assignment select, which returns no rows: the values go into
 /// the variables the caller declared, and back to it as the call's return values. `Query` is the
 /// same query with the assignments taken off its items, so what produces the values is one query

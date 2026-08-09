@@ -155,6 +155,14 @@ including going away when a pooled connection is handed out again. `##global` on
 another connection cannot see them here, and `SELECT … INTO` and `DROP TABLE` accept nothing else: a
 lake's tables are the files under it.
 
+## Asking what a statement does
+
+`EXPLAIN <statement>` and `EXPLAIN ANALYZE <statement>` are DuckDB's spelling rather than SQL
+Server's `SET SHOWPLAN_ALL ON`, and are accepted here because what duckpg sends is not always what it
+was sent: a write against a layered lake becomes several statements. Where the answer is a single
+query, EXPLAIN is DuckDB's own plan; where it is several, it lists them in order under `step` and
+`statement`, along with any check that runs before them.
+
 ## What is refused
 
 A style or a hash format that is not covered is named rather than approximated, and so is a statement

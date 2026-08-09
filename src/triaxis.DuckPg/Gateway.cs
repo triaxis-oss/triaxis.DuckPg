@@ -95,7 +95,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
     /// Statements that produce a result set. DuckDB also allows a bare FROM-first SELECT.
     static readonly HashSet<string> RowProducing =
-        ["SELECT", "WITH", "VALUES", "TABLE", "FROM", "DESCRIBE", "SUMMARIZE", "EXPLAIN", "PIVOT", "UNPIVOT",
+        ["SELECT", "WITH", "VALUES", "TABLE", "FROM", "DESCRIBE", "SUMMARIZE", "PIVOT", "UNPIVOT",
          "EXECUTE", "CALL", "PRAGMA"];
 
     /// Settings every PG client pokes at that DuckDB neither has nor needs.
@@ -132,11 +132,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (sql.Length == 0) return Plan.Empty;
 
         var verb = SqlText.FirstWord(sql);
-        return verb switch
+        return Logged(sql, verb switch
         {
             "INSERT" => RewriteInsert(sql),
             "UPDATE" => RewriteUpdate(sql),
             "DELETE" => RewriteDelete(sql),
+            "EXPLAIN" => PlanExplain(sql),
             "SET" or "RESET" => PlanSet(sql, verb),
             "SHOW" => PlanShow(sql),
             // The rest of Npgsql's reset script, none of which DuckDB has an equivalent for.
@@ -146,7 +147,64 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             "ROLLBACK" or "ABORT" => Plan.Count("ROLLBACK", "ROLLBACK"),
             "CALL" when Intercepted(sql) is { } intercepted => intercepted,
             _ => RowProducing.Contains(verb) ? Plan.Rows(sql) : Plan.Count(verb, sql),
-        };
+        });
+    }
+
+    /// What the rewrite actually sends. The line above logs what a client asked for, and for a
+    /// statement that is rewritten those are not the same thing -- a four-statement plan read there
+    /// as a plain UPDATE, which is worse than saying nothing. Only where the plan is more than the
+    /// statement itself, so an ordinary query still costs one line and no formatting.
+    Plan Logged(string sql, Plan plan)
+    {
+        if (!logger.IsEnabled(LogLevel.Debug) || (plan.Steps is [var only] && only == sql)) return plan;
+
+        foreach (var check in plan.Checks ?? [])
+            logger.LogDebug("  check: {Sql}", check.Sql.ReplaceLineEndings(" "));
+        for (var i = 0; i < plan.Steps.Length; i++)
+            logger.LogDebug("  step {Step}: {Sql}", i + 1, plan.Steps[i].ReplaceLineEndings(" "));
+        if (plan.Affected is { } affected)
+            logger.LogDebug("  affected: {Sql}", affected.ReplaceLineEndings(" "));
+        return plan;
+    }
+
+    /// `EXPLAIN <statement>` of what the gateway will run rather than of what the client wrote --
+    /// which for anything rewritten are different statements, and the difference is the reason this
+    /// is answered here instead of being handed to DuckDB whole.
+    ///
+    /// A plan that is exactly one query is explained as that query, so the shape and the cost come
+    /// back as DuckDB writes them -- which is every read, and now every write a materialized table
+    /// takes by key. Anything else answers with the statements themselves, in order. It has to: a
+    /// step reads temp tables the step before it made, and none of them exist until it runs. A check
+    /// counts towards that even though it is not a step, since it is a query that runs and hiding it
+    /// would leave the same gap between what this says and what happens that the log had.
+    Plan PlanExplain(string sql)
+    {
+        var at = SqlText.FindKeyword(sql, "EXPLAIN");
+        var prefix = sql[..(at + 7)];
+        var inner = sql[(at + 7)..].TrimStart();
+
+        // `EXPLAIN ANALYZE` runs the statement it explains, so it belongs to the prefix rather than
+        // to what is translated -- and a plan of several steps cannot honour it at all.
+        if (SqlText.FirstWord(inner) == "ANALYZE")
+        {
+            prefix += " ANALYZE";
+            inner = inner["ANALYZE".Length..].TrimStart();
+        }
+
+        var planned = Translate(inner);
+        if (planned.Steps is [var single] && planned.Checks is null or [] && planned.Affected is null)
+            return Plan.Rows($"{prefix} {single}");
+
+        List<(string Step, string Sql)> rows =
+            [.. (planned.Checks ?? []).Select((c, i) => ($"check {i + 1}", c.Sql)),
+             .. planned.Steps.Select((s, i) => ($"step {i + 1}", s)),
+             .. planned.Affected is { } affected ? ((string, string)[])[("affected", affected)] : []];
+
+        if (rows.Count == 0) rows.Add(("step 0", "-- nothing runs"));
+
+        return Plan.Rows("SELECT * FROM (VALUES " +
+                         string.Join(", ", rows.Select(r => $"({SqlText.Literal(r.Step)}, {SqlText.Literal(r.Sql)})")) +
+                         ") AS \"_plan\"(\"step\", \"statement\")");
     }
 
     // ---- gateway-owned procedures -------------------------------------------------------------
@@ -435,7 +493,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
     Plan RewriteUpdate(string sql)
     {
-        var reference = SqlText.ReadTableRef(sql, SqlText.FindKeyword(sql, "UPDATE") + 6);
+        var update = SqlText.FindKeyword(sql, "UPDATE");
+        var reference = SqlText.ReadTableRef(sql, update + 6);
         if (Writable(reference.Schema, reference.Name) is not { } table)
             return Plan.Count("UPDATE", Unlimited(sql, "UPDATE"));
         RequireKey(table, "UPDATE");
@@ -458,6 +517,30 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         RejectVirtual(table, assignments.Keys, "UPDATE");
 
         var moves = table.Key.Any(assignments.ContainsKey);
+
+        // Nothing lies beneath a materialized row, so there is no old one for a written one to
+        // shadow -- which is the whole job the rest of this method does. Evict-and-reinsert exists
+        // so a write branch can stand over the layers below it; with no layers below, DuckDB's own
+        // UPDATE is that same operation in one statement, finding its rows through the table's key
+        // rather than through a temp table built to stand in for one. Measured on a 414-table lake,
+        // a single row by key: 8.0 ms as four statements against 1.05 for the one, and ~95% of the
+        // difference is spent *preparing* statements rather than running them.
+        //
+        // The conditions are the ones the rest of the method already turns on: a FROM puts another
+        // table in scope and may match a row twice, a TOP has to settle on which rows before
+        // anything is written, and a moved key has to be checked against what the table already
+        // publishes. Where none of them holds, the statement a client sent is the statement to run.
+        if (table.Materialized && from < 0 && rows is null && !moves)
+        {
+            var passed = sql[..update] + "UPDATE " + table.QualifiedName + sql[reference.End..];
+
+            // `OUTPUT` is answered off the rows as written, which is what DuckDB's own `RETURNING`
+            // hands back -- `DELETED` is refused everywhere here, so there is no older row to want.
+            return answered is null
+                ? Plan.Count("UPDATE", passed) with { Dirty = [table.Name] }
+                : new Plan(PlanKind.Rows, [$"{passed} RETURNING {answered}"], "UPDATE")
+                    with { Dirty = [table.Name] };
+        }
 
         // The rewritten row lands in the write layer under the key it already had, where it shadows
         // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
@@ -573,6 +656,16 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         List<Check> checks = [];
         List<(Table Table, bool Tombstones)> promote = [(table, true)];
         Cascading(table, "duckpg_keys", keyed, cascade, checks, promote);
+
+        // The one-statement path an UPDATE takes, for the same reason: nothing lies beneath a
+        // materialized row, so there is no tombstone to write and so no key set to write it from.
+        // Only where the plan has nothing else to do with those keys -- a cascade reads them back
+        // one table down, a USING puts another table in scope, a TOP has to settle on rows first,
+        // and an OUTPUT is answered from keys read before the rows went. The reference checks stay:
+        // they run before any step and ask the query rather than the temp table.
+        if (table.Materialized && cascade.Count == 0 && joined < 0 && rows is null && answered is null)
+            return Plan.Count("DELETE", sql[..from] + "FROM " + table.QualifiedName + sql[reference.End..])
+                with { Dirty = [table.Name], Checks = checks.ToArray() };
 
         string[] steps =
             [Keys(keyed), .. cascade,

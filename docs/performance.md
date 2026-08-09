@@ -35,6 +35,12 @@ declares past the key becomes an index here too. It also means the layers have t
 that publishes one key twice, leaves the key empty, or breaks a declared unique cannot be built, and
 the lake says so at startup rather than serving it.
 
+**`EXPLAIN <statement>`** answers for what the gateway will actually run, which is not always what
+was sent. Where that is a single query — every read, and a keyed write against a materialized table —
+it is DuckDB's own plan, cost and all. Where it is several, it lists them in order, because a step
+reads temp tables the step before it makes and there is nothing to explain until it has run. Either
+way it works through both doors, which is the only way to see a rewrite short of a profiler.
+
 The write directory is still a layer on the way in, so a delta a previous run left is read back and
 collapsed with the rest, but nothing is kept while the lake runs. When it stops cleanly, what it holds
 goes out once as a delta in the write layer's own format — the rows that are not what the layers said,

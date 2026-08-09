@@ -85,6 +85,7 @@ sealed class TSqlParser
 
     Statement Statement()
     {
+        if (Peek.Is("explain")) return Explain();
         if (Peek.Is("select") || Peek.Is("with") || Peek.Is("values")) return SelectOrInto();
         if (Peek.Is("insert")) return Insert();
         if (Peek.Is("drop")) return Drop();
@@ -96,6 +97,15 @@ sealed class TSqlParser
         if (Peek.Is("begin") || Peek.Is("commit") || Peek.Is("rollback") || Peek.Is("save")) return Transaction();
 
         throw new TSqlException($"unsupported statement `{Peek.Text}`", Peek.Position);
+    }
+
+    /// `ANALYZE` is read before the statement rather than after it, since it belongs to the EXPLAIN
+    /// and the statement it explains starts with its own first word.
+    Statement Explain()
+    {
+        Take();
+        var analyze = Accept("analyze");
+        return new ExplainStatement(Statement(), analyze);
     }
 
     /// A query, unless it names somewhere to put the rows: `SELECT … INTO` creates a table, which
