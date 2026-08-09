@@ -107,13 +107,18 @@ public static class DuckPgServiceCollectionExtensions
         // binding nothing.
         services.TryAddSingleton(p => p.GetRequiredService<IOptions<Config>>().Value);
 
+        // Before the connection, so it is disposed after it: a scratch copy cannot be deleted while
+        // DuckDB still holds it open.
+        services.TryAddSingleton<BakedBase>();
+
         // One DuckDB behind the whole lake: the catalog is built on it and every session borrows
         // from it, so it is the one thing that cannot be transient.
-        // A store makes it a database on disk rather than one in memory; everything else about it
-        // is the same, including that every session borrows a connection from this one.
+        // A store makes it a database on disk rather than one in memory, and a base makes it the
+        // copy of one somebody baked; everything else about it is the same, including that every
+        // session borrows a connection from this one.
         services.TryAddSingleton(p => new DuckDBConnection(
-            p.GetRequiredService<Config>().Store is { Length: > 0 } store
-                ? $"Data Source={store}"
+            p.GetRequiredService<BakedBase>().Path is { Length: > 0 } file
+                ? $"Data Source={file}"
                 : "Data Source=:memory:"));
         services.TryAddSingleton<WriteLayer>();
         services.TryAddSingleton<DacpacSchema>();

@@ -111,6 +111,33 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {WriteLayer.Schema}");
         if (config.Materialize) Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {BaseSchema}");
 
+        if (config.Base is { Length: > 0 }) Adopt(conn); else FromLayers(conn);
+
+        Types = Tables.ToDictionary(
+            table => table.Key,
+            table => (IReadOnlyDictionary<string, string>)table.Value.Columns.ToDictionary(
+                column => column.Name, column => column.Type, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase);
+
+        // A baked database already holds the views and the macros a dacpac declared -- they were
+        // created when it was baked, and a copy of the file carries them. What has to be found again
+        // is which macros those are, since that is what decides whether a call resolves onto the
+        // lake or is left as the caller wrote it.
+        if (config.Base is { Length: > 0 }) Adopted(conn);
+        else { Declared(); Macros(conn); Declared(conn); }
+
+        Empty();
+
+        // DuckDB writes table data uncompressed and compresses it at a checkpoint, which no WAL
+        // drives an in-memory database to -- so what a materialized lake collapsed its layers into
+        // stays in the widest form of every column until something asks. Asked once here rather
+        // than per table: a checkpoint is the whole database's, so it also covers the tables a YAML
+        // or JSON layer was read into.
+        if (config.Compress) Exec(conn, "CHECKPOINT");
+    }
+
+    void FromLayers(DuckDBConnection conn)
+    {
         foreach (var (name, sources, declaredWrite) in Sources())
         {
             var settings = config.Table(name);
@@ -141,8 +168,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             var table = new Table(config.Schema, name, layers, columns,
                                   Virtuals(name, settings, columns),
                                   KeyFor(name, settings, columns, partitions),
-                                  writable || config.Materialize, writeSource, settings.Filter,
-                                  config.Materialize);
+                                  writable || config.Collapsed, writeSource, settings.Filter,
+                                  config.Collapsed);
             Diagnose(table);
 
             if (table.Materialized)
@@ -163,24 +190,262 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (carries) foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             Tables[name] = table;
         }
+    }
 
-        Types = Tables.ToDictionary(
-            table => table.Key,
-            table => (IReadOnlyDictionary<string, string>)table.Value.Columns.ToDictionary(
-                column => column.Name, column => column.Type, StringComparer.OrdinalIgnoreCase),
-            StringComparer.OrdinalIgnoreCase);
+    // ---- a baked database ------------------------------------------------------------------------
 
-        Declared();
-        Macros(conn);
-        Declared(conn);
-        Empty();
+    /// A lake taken from a database somebody baked rather than built from layers. Everything a start
+    /// otherwise pays for -- describing every file, parsing a dacpac, evaluating the defaults,
+    /// collapsing the stack, building the keys -- has already been paid, once, and what is left is
+    /// to read back what it came to. The copy this is reading is the run's own, so it is served and
+    /// written to directly, exactly as a materialized lake's tables are.
+    ///
+    /// DuckDB's own catalog answers for the shape, the keys and the indexes. What it has nowhere to
+    /// hold, `Bake` wrote down beside them.
+    void Adopt(DuckDBConnection conn)
+    {
+        Exec(conn, $"ATTACH {SqlText.Literal(config.Base!)} AS {BaseCatalog} (READ_ONLY)");
 
-        // DuckDB writes table data uncompressed and compresses it at a checkpoint, which no WAL
-        // drives an in-memory database to -- so what a materialized lake collapsed its layers into
-        // stays in the widest form of every column until something asks. Asked once here rather
-        // than per table: a checkpoint is the whole database's, so it also covers the tables a YAML
-        // or JSON layer was read into.
-        if (config.Compress) Exec(conn, "CHECKPOINT");
+        // Any DuckDB file will attach; only one this wrote can be served, and the difference is
+        // everything DuckDB has nowhere to hold. Said by name rather than surfacing later as a
+        // missing table nobody named.
+        if (Scalar(conn, $"SELECT count(*) FROM duckdb_tables() WHERE database_name = " +
+                         $"{SqlText.Literal(BaseCatalog)} AND schema_name = {SqlText.Literal(Bake.Schema)} " +
+                         $"AND table_name = 'meta'") is not { } found || Convert.ToInt64(found) == 0)
+            throw new DuckPgConfigurationException(
+                $"{config.Base} is a DuckDB database but not a baked one -- it carries no " +
+                $"`{Bake.Meta}`, so nothing in it says what a lake is to publish. `duckpg bake " +
+                "--out <file>.duckdb` writes one that does");
+
+        if (Stamp(conn, "version") is { } version && version != "1")
+            throw new DuckPgConfigurationException(
+                $"{config.Base} was baked as version {version} and this duckpg speaks 1 -- bake it again");
+
+        if (Stamp(conn, "schema") is { } baked && !Same(baked, config.Schema))
+            throw new DuckPgConfigurationException(
+                $"the base publishes into `{baked}` and this lake publishes into `{config.Schema}` -- " +
+                "a baked database holds its tables in the schema it was baked with, so serve it as " +
+                $"that one or bake it again as `{config.Schema}`");
+
+        var identities = Identities(conn);
+        var keys = Keys(conn);
+        var shapes = Shapes(conn, identities);
+        var counted = Counted(conn);
+        var writes = Written();
+
+        foreach (var name in Adopting(conn))
+        {
+            var settings = config.Table(name);
+            var columns = shapes.GetValueOrDefault(name) ?? [];
+            var key = settings.Key is { Length: > 0 } configured ? configured
+                    : keys.GetValueOrDefault(name) ?? [];
+
+            // The one layer a base still has under -- over, rather -- is the write layer, which is
+            // where the run before this one left what it did. Without its source a table carries
+            // only the keys that were deleted, since those are a sidecar the scan finds anyway.
+            var written = writes.GetValueOrDefault(name);
+            var writeSource = Layer.Keyed(written, MappingKey(name, settings), Layer.Shapes(written));
+
+            var table = new Table(config.Schema, name, [], columns, Virtuals(name, settings, columns),
+                                  key, settings.Writable ?? true, writeSource, settings.Filter,
+                                  Materialized: true);
+
+            // Nothing is earned: the branch a write would make is the table itself, which is there.
+            promoted.Add(name);
+            // Counted before the write layer goes in and grown by what it adds, since asking a
+            // table how many rows it has is a scan and this is 300 of them: 126 ms against the 2 of
+            // reading what the storage already knows. It is a bound rather than a tally anyway --
+            // one that is too low costs a sort in DuckDB rather than an answer that is wrong.
+            rows[name] = counted.GetValueOrDefault(name);
+            Apply(conn, table);
+            Tables[name] = table;
+        }
+    }
+
+    /// How many rows each table holds, out of what DuckDB already recorded when the bake wrote it.
+    Dictionary<string, long> Counted(DuckDBConnection conn)
+    {
+        var counted = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        using var command = conn.CreateCommand();
+        command.CommandText = "SELECT table_name, estimated_size FROM duckdb_tables() " +
+                              "WHERE database_name = current_database() AND schema_name = ?";
+        command.Parameters.Add(new DuckDBParameter(config.Schema));
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read()) counted[reader.GetString(0)] = Convert.ToInt64(reader.GetValue(1));
+        return counted;
+    }
+
+    /// What the write directory holds, by table. A write layer is scanned like any other -- it is
+    /// one -- and it is the only directory a base is served with.
+    Dictionary<string, LayerSource> Written()
+    {
+        var written = new Dictionary<string, LayerSource>(StringComparer.OrdinalIgnoreCase);
+        if (write.Directory is not { Length: > 0 } directory) return written;
+
+        System.IO.Directory.CreateDirectory(directory);
+        foreach (var (name, source) in Layer.Scan(directory, write.Seq, logger)) written[name] = source;
+        return written;
+    }
+
+    /// What a run's own copy owes the write layer before it serves: the rows a previous run left in
+    /// it, and the keys it hid. A baked database is the state as it was baked, so a delta beside it
+    /// is a delta that has not been applied yet -- and applying it is the whole of what makes a
+    /// restart mean anything.
+    void Apply(DuckDBConnection conn, Table table)
+    {
+        var stacked = table with { Materialized = false };
+        if (!table.Writable || !write.Carries(stacked)) return;
+
+        write.Prepare(conn, stacked);
+        var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
+
+        if (table.Key.Length > 0)
+        {
+            var match = string.Join(" AND ", table.Key.Select(k =>
+                $"t.{SqlText.Quote(k)} IS NOT DISTINCT FROM d.{SqlText.Quote(k)}"));
+
+            // A tombstone hides a row of the base, which here means the row goes.
+            Exec(conn, $"DELETE FROM {table.QualifiedName} t WHERE EXISTS " +
+                       $"(SELECT 1 FROM {stacked.TombstoneName} d WHERE {match})");
+            // And a written row shadows one of the base, which here means it replaces it.
+            Exec(conn, $"DELETE FROM {table.QualifiedName} t WHERE EXISTS " +
+                       $"(SELECT 1 FROM {stacked.WriteName} d WHERE {match})");
+        }
+
+        Exec(conn, $"INSERT INTO {table.QualifiedName} ({columns}) SELECT {columns} FROM {stacked.WriteName}");
+        rows[table.Name] = Count(conn, table);
+
+        // Past whatever the base handed out, since the write layer may have taken keys of its own --
+        // and replaced rather than left alone, which `IF NOT EXISTS` would do to one already there.
+        foreach (var column in table.Columns.Where(c => c.Identity))
+            Exec(conn, $"CREATE OR REPLACE SEQUENCE {Sequence(table, column)} START " +
+                       $"{Convert.ToInt64(Scalar(conn, $"SELECT coalesce(max({SqlText.Quote(column.Name)}), 0) + 1 FROM {table.QualifiedName}"))}");
+    }
+
+    /// The references the bake wrote down, and the macros the copy already carries. Both are what
+    /// `Declared` works out from a dacpac for a lake built from layers; here the answer is in the
+    /// file, which is the point of the file.
+    void Adopted(DuckDBConnection conn)
+    {
+        pointing.Clear();
+        using (var command = conn.CreateCommand())
+        {
+            command.CommandText = $"SELECT name, \"table\", columns, parent, parent_columns, on_delete " +
+                                  $"FROM {BaseCatalog}.{Bake.Referenced}";
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var reference = new Reference(reader.GetString(0), reader.GetString(1), Strings(reader, 2),
+                                              reader.GetString(3), Strings(reader, 4), reader.GetString(5));
+                if (Tables.ContainsKey(reference.Table) && Tables.ContainsKey(reference.Parent))
+                    Pointing(reference.Parent).Add(reference);
+            }
+        }
+
+        macros.Clear();
+        foreach (var name in Query(conn,
+            "SELECT function_name FROM duckdb_functions() WHERE database_name = current_database() " +
+            "AND schema_name = " + SqlText.Literal(config.Schema) + " AND function_type = 'macro'"))
+            macros.Add(name);
+    }
+
+    /// Tables rather than views: a declared view the bake published is served by the copy as it is,
+    /// and is nothing this has to publish again.
+    ///
+    /// Scoped to the database being served, like everything else that reads the catalog here. The
+    /// base is attached under the same schema name holding the same tables, and DuckDB's catalog
+    /// views span every attached database -- so without this each table is found twice and each of
+    /// its columns arrives twice with it.
+    IEnumerable<string> Adopting(DuckDBConnection conn) =>
+        Query(conn, "SELECT table_name FROM information_schema.tables WHERE table_catalog = current_database() " +
+                    "AND table_schema = " + SqlText.Literal(config.Schema) +
+                    " AND table_type = 'BASE TABLE' ORDER BY table_name");
+
+    /// Every table's columns, in one question. Asked per table instead it is the slowest thing a
+    /// baked lake does by an order of magnitude: DuckDB answers `information_schema.columns` by
+    /// scanning the whole catalog, so 300 tables asking about themselves cost 4.3 s against the
+    /// 17 ms of one query naming none of them.
+    Dictionary<string, List<Column>> Shapes(DuckDBConnection conn, Dictionary<string, string[]> identities)
+    {
+        var shapes = new Dictionary<string, List<Column>>(StringComparer.OrdinalIgnoreCase);
+
+        using var command = conn.CreateCommand();
+        command.CommandText =
+            "SELECT table_name, column_name, data_type FROM information_schema.columns " +
+            "WHERE table_catalog = current_database() AND table_schema = ? ORDER BY table_name, ordinal_position";
+        command.Parameters.Add(new DuckDBParameter(config.Schema));
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            var (table, column) = (reader.GetString(0), reader.GetString(1));
+            if (!shapes.TryGetValue(table, out var columns)) shapes[table] = columns = [];
+            columns.Add(new Column(column, reader.GetString(2), Identity:
+                (identities.GetValueOrDefault(table) ?? []).Contains(column, StringComparer.OrdinalIgnoreCase)));
+        }
+        return shapes;
+    }
+
+    /// The key DuckDB is already holding, which is the one the bake put there.
+    Dictionary<string, string[]> Keys(DuckDBConnection conn)
+    {
+        var keys = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        using var command = conn.CreateCommand();
+        command.CommandText = "SELECT table_name, constraint_column_names FROM duckdb_constraints() " +
+                              "WHERE database_name = current_database() AND schema_name = ? " +
+                              "AND constraint_type = 'PRIMARY KEY'";
+        command.Parameters.Add(new DuckDBParameter(config.Schema));
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read()) keys[reader.GetString(0)] = Strings(reader, 1);
+        return keys;
+    }
+
+    Dictionary<string, string[]> Identities(DuckDBConnection conn)
+    {
+        var identities = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        using var command = conn.CreateCommand();
+        command.CommandText = $"SELECT \"table\", \"column\" FROM {BaseCatalog}.{Bake.Identified}";
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (!identities.TryGetValue(reader.GetString(0), out var columns))
+                identities[reader.GetString(0)] = columns = [];
+            columns.Add(reader.GetString(1));
+        }
+        return identities.ToDictionary(i => i.Key, i => i.Value.ToArray(), StringComparer.OrdinalIgnoreCase);
+    }
+
+    string? Stamp(DuckDBConnection conn, string key)
+    {
+        using var command = conn.CreateCommand();
+        command.CommandText = $"SELECT value FROM {BaseCatalog}.{Bake.Meta} WHERE key = ?";
+        command.Parameters.Add(new DuckDBParameter(key));
+        return command.ExecuteScalar() as string;
+    }
+
+    static string[] Strings(DbDataReader reader, int column) =>
+        reader.GetFieldValue<List<string>>(column).ToArray();
+
+    static List<string> Query(DuckDBConnection conn, string sql)
+    {
+        using var command = conn.CreateCommand();
+        command.CommandText = sql;
+        using var reader = command.ExecuteReader();
+
+        var answers = new List<string>();
+        while (reader.Read()) answers.Add(reader.GetString(0));
+        return answers;
+    }
+
+    static object? Scalar(DuckDBConnection conn, string sql)
+    {
+        using var command = conn.CreateCommand();
+        command.CommandText = sql;
+        return command.ExecuteScalar();
     }
 
     /// A lake holding nothing answers every query with "no such table", and nothing in that answer
@@ -1088,8 +1353,16 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     }
 
     /// What the layers said before anything was written to them, for the shutdown delta.
-    static string Baseline(Table table) =>
-        $"{SqlText.Quote(BaseSchema)}.{SqlText.Quote(table.Name)}";
+    string Baseline(Table table) =>
+        config.Base is { Length: > 0 }
+            ? $"{SqlText.Quote(BaseCatalog)}.{SqlText.Quote(config.Schema)}.{SqlText.Quote(table.Name)}"
+            : $"{SqlText.Quote(BaseSchema)}.{SqlText.Quote(table.Name)}";
+
+    /// What the baked database is attached as while a run serves its copy. Read-only, and read only
+    /// at shutdown: it is the state this run started from, which is exactly what the delta is
+    /// measured against -- the same thing `base` holds for a lake cut from layers, except that here
+    /// somebody else already wrote it down.
+    public const string BaseCatalog = "duckpg_base";
 
     /// What a materialized lake leaves behind: the rows that are not what the layers said, and the
     /// keys that were there and are not. Written in the write layer's own format, so the next run --
@@ -1102,7 +1375,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // A store that is the state keeps what it was given by keeping it, so there is nothing to
         // work out at shutdown -- and a delta beside it would be a second answer to the same
         // question. One that is only where the tables live answers like any other materialized lake.
-        if (!config.Materialize || write.Directory is null || Keeping || flushed) return;
+        if (!config.Collapsed || write.Directory is null || Keeping || flushed) return;
         flushed = true;
 
         foreach (var table in Tables.Values.Where(t => t.Writable))
