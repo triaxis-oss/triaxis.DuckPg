@@ -76,7 +76,9 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   bit on the first message it sends over a connection it took back out of the pool; only an older
   client calls `sp_reset_connection`, so a server that answers just the procedure never hears about
   the reuse. `TdsWire.ReadMessage` surfaces the bit and `TdsSession.Reset` acts on it, which is what
-  keeps one session's `#table` out of the next one's.
+  keeps one session's `#table` out of the next one's -- and since that happens before every statement
+  an ORM sends, what it does has to be free when there is nothing to do.
+  [performance](performance.md#what-a-pooled-checkout-costs)
 - **A COLMETADATA name is counted in one byte**, so a name of 256 characters announces itself as
   empty and the client reads the bytes after it as the next token -- which surfaces as
   "Internal connection fatal error" from the parser, with the server looking innocent. DuckDB names
