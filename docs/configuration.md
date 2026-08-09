@@ -1,10 +1,13 @@
 # Configuration
 
-`duckpg.yaml` next to the working directory, bound through `IConfiguration` — so environment
-variables and the tool's usual override files layer over it for free. Every key here has a command
-line flag or is positional, and the flag wins where both are given; argument paths are relative to
-the working directory, file paths to the file. A file named explicitly with `--config` must exist, so
-a typo is an error rather than a silent fallback to defaults.
+A YAML file named with `--config`, bound through `IConfiguration` — so environment variables and the
+tool's usual override files layer over it for free. Every key here has a command line flag or is
+positional, and the flag wins where both are given; argument paths are relative to the working
+directory, file paths to the file.
+
+**Nothing is read unless it is named.** There is no default file: a tool that helped itself to a
+`duckpg.yaml` from whatever directory it was started in would be serving a lake nobody pointed it at.
+A file that is named has to exist, so a typo is an error rather than a silent fall back to defaults.
 
 ## Keys
 

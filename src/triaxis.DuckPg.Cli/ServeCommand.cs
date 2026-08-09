@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.CommandLine.Parsing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,16 +8,14 @@ namespace triaxis.DuckPg.Cli;
 [Command(Description = "Serves a stack of YAML, JSON and parquet layers over the PostgreSQL wire protocol.")]
 public class ServeCommand : LoggingCommand
 {
-    const string DefaultConfig = "duckpg.yaml";
-
     /// The command's own default; the library opens nothing it was not asked to.
     const string DefaultListen = "127.0.0.1:55432";
 
     [Argument(Description = "Layer directories, lowest first. Overrides the configuration.")]
     public string[] Layers { get; set; } = [];
 
-    [Option("--config", "-c", Description = "Configuration file.")]
-    public string ConfigPath { get; set; } = DefaultConfig;
+    [Option("--config", "-c", Description = "Configuration file. None is read unless one is named.")]
+    public string? ConfigPath { get; set; }
 
     [Option("--pgwire", "-l", Description = "Listen address for the PostgreSQL front door. Default 127.0.0.1:55432 unless only --tds is given.")]
     public string? PgWire { get; set; }
@@ -82,18 +79,21 @@ public class ServeCommand : LoggingCommand
     [Inject] private readonly IDuckDbInstaller _installer = null!;
     [Inject] private readonly IDuckPgLakeFactory _lakes = null!;
 
-    /// The configuration file is named on the command line, so the source can only be added once
-    /// the arguments are parsed. Defaults alone are enough to serve a directory, so the file is
-    /// only required when it was actually asked for.
+    /// A configuration file is read when one is named, and never otherwise. Arguments alone are
+    /// enough to serve a directory, and a tool that helped itself to a `duckpg.yaml` from whatever
+    /// directory it happened to start in would be serving a lake nobody pointed it at. Named, the
+    /// file has to exist: a typo is an error rather than a silent fall back to defaults.
+    ///
+    /// It is named on the command line, so the source can only be added once the arguments are
+    /// parsed. Optional here and required in `ExecuteAsync`, which is the only difference between a
+    /// sentence naming the file and a FileNotFoundException out of the configuration provider,
+    /// thrown while the host is still being built and caught by nothing.
     public static void Configure(IToolBuilder builder)
     {
         builder.ConfigureConfiguration((context, configuration) =>
         {
-            var parsed = context.GetInvocationContext().ParseResult;
-            configuration.AddYamlFile(
-                Path.GetFullPath(parsed.GetValue<string>("--config") ?? DefaultConfig),
-                optional: parsed.GetResult("--config") is not OptionResult { Implicit: false },
-                reloadOnChange: false);
+            if (context.GetInvocationContext().ParseResult.GetValue<string?>("--config") is { Length: > 0 } path)
+                configuration.AddYamlFile(Path.GetFullPath(path), optional: true, reloadOnChange: false);
         });
 
         // The factory rather than a lake: what to serve is only known once the arguments have won
@@ -109,10 +109,20 @@ public class ServeCommand : LoggingCommand
             return;
         }
 
+        // The same answer a missing layer directory gets, for the same reason: what was named is not
+        // there, and falling back to defaults would serve something nobody asked for.
+        if (ConfigPath is { } named && !File.Exists(named))
+            throw new CommandErrorException("configuration file not found: {Path}", Path.GetFullPath(named))
+            { ExitCode = 64 };
+
         var config = _configuration.Get<Config>() ?? new Config();
         // `layers:` may be written as a single directory; only the list form binds on its own.
         if (_configuration["layers"] is { Length: > 0 } single) config.Layers = [single];
-        config.ResolvePaths(Path.GetDirectoryName(Path.GetFullPath(ConfigPath))!);
+        // Paths in a file are relative to that file; with no file there are none, and an argument's
+        // path is the working directory's either way.
+        config.ResolvePaths(ConfigPath is { } path
+            ? Path.GetDirectoryName(Path.GetFullPath(path))!
+            : Directory.GetCurrentDirectory());
 
         // Arguments win over the file, and are relative to the working directory rather than to it.
         if (Layers.Length > 0) config.Layers = [.. Layers.Select(Path.GetFullPath)];
