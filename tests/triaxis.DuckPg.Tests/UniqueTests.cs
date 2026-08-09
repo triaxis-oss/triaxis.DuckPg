@@ -100,4 +100,65 @@ public class UniqueTests
 
         Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 3)"));
     }
+
+    /// A column no read layer carries is the same value in every row those layers produce -- a
+    /// declared default is frozen at build, so `(newid())` is one id for the whole run. There is
+    /// nothing there to be unique, and refusing the lake for it would be refusing it for data it was
+    /// never given: the rule is dropped instead.
+    [Fact]
+    public void AUniqueOverAColumnNoLayerCarriesIsDropped()
+    {
+        using var lake = new TestLake(nameof(AUniqueOverAColumnNoLayerCarriesIsDropped))
+            .Json("base", "codes", """[{"code_id": 1}, {"code_id": 2}]""")
+            .Stack("base")
+            .WriteTo("local");
+
+        var table = new Dacpac.TableModel("codes", [("code_id", "int"), ("token", "uniqueidentifier")], ["code_id"],
+                                          [("token", "(newid())")],
+                                          Uniques: [("UQ_codes_token", ["token"], false)]);
+
+        Assert.Equal(2, Started(lake, table).Query("SELECT code_id FROM lake.codes").Count);
+        lake.Dispose();
+    }
+
+    /// The whole rule goes, not the columns it can still see: uniqueness over two columns is not
+    /// uniqueness over the one of them the layers happen to carry, and holding that would refuse
+    /// rows the schema allows.
+    [Fact]
+    public void ACompositeUniqueGoesWithAnyColumnNoLayerCarries()
+    {
+        using var lake = new TestLake(nameof(ACompositeUniqueGoesWithAnyColumnNoLayerCarries))
+            .Json("base", "codes", """[{"code_id": 1, "label": "a"}, {"code_id": 2, "label": "a"}]""")
+            .Stack("base")
+            .WriteTo("local");
+
+        var table = new Dacpac.TableModel("codes",
+            [("code_id", "int"), ("label", "nvarchar"), ("token", "uniqueidentifier")], ["code_id"],
+            [("token", "(newid())")], Uniques: [("UQ_codes_label_token", ["label", "token"], false)]);
+
+        Assert.Equal(2, Started(lake, table).Query("SELECT code_id FROM lake.codes").Count);
+        lake.Dispose();
+    }
+
+    /// A lake with no read layers has nothing frozen -- every row arrives as a write, stamped as it
+    /// is written -- so the rule is worth keeping and is kept.
+    [Fact]
+    public void ATableNoLayerCarriesAtAllStillHoldsItsUniques()
+    {
+        using var lake = new TestLake(nameof(ATableNoLayerCarriesAtAllStillHoldsItsUniques))
+            .Json("base", "other", """[{"id": 1}]""")
+            .Stack("base")
+            .WriteTo("local");
+
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            new Dacpac.TableModel("other", [("id", "int")], ["id"]),
+            new Dacpac.TableModel("codes", [("code_id", "int"), ("label", "nvarchar")], ["code_id"],
+                                  Uniques: [("UQ_codes_label", ["label"], false)]));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Materialized().Start();
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label) VALUES (1, 'a')"));
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label) VALUES (2, 'a')"));
+    }
 }

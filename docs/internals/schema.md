@@ -56,7 +56,17 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   as one, so a lake refuses a shade less here than SQL Server would. It is skipped where the table
   does not publish every column the rule is over -- a lake showing a subset of a declared table loses
   the rule rather than failing on it, the same bargain `KeyFor` strikes -- and where the rule is the
-  key again under another name. A partition column joins it for the reason it joins the key: rows are
+  key again under another name, or where a column it is over is one no read layer carries. That last
+  is `Catalog.Carried`, and it exists because a declared default is *frozen at build*: a column no
+  file produces is the same value in every row the read layers produce, so `(newid())` is one id for
+  the whole run, and a rule over it would refuse the entire lake at startup for data it was never
+  given. A lake with no read layers has nothing frozen -- every row arrives as a write, stamped as it
+  is written -- so it keeps its rules. The whole rule goes rather than the column, since uniqueness
+  over two columns is not uniqueness over whichever one the layers happen to carry. What this does
+  *not* cover is a column some layer carries and another does not: those gaps are filled by the same
+  frozen value, and two of them collide. That is the layers disagreeing about a column that is
+  genuinely in the lake, and it stays a startup failure. A partition column joins it for the reason
+  it joins the key: rows are
   only unique *within* a partition, and a rule that forgot that would refuse a lake for holding the
   row it was partitioned to hold. **A layered lake keeps none of this**: it publishes views, and
   `Gateway.Duplicates` asks about the key alone. Asking about a declared unique too would be another

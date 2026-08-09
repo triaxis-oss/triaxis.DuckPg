@@ -26,7 +26,10 @@ warning and the column keeps its `NULL`.
 **Uniqueness past the key.** A `UNIQUE` constraint and a unique index both declare that no two rows
 share those columns, and both are kept — on a materialized lake, where the table is a table and
 DuckDB can hold the rule. A plain, non-unique index declares nothing and is read as nothing. The rule
-is dropped for a table the lake publishes without every column it is over, and a partition column
+is dropped for a table the lake publishes without every column it is over — and for one over a column
+no layer carries at all, since a declared default is frozen when the lake is built and `(newid())` is
+then one id for the whole run rather than one per row. If those values were wanted they would be in
+the input. A partition column
 joins it as it joins the key, since rows are only unique within a partition. Two NULLs count as
 different here, as they do in PostgreSQL and unlike SQL Server, which allows one such row rather than
 many. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.
