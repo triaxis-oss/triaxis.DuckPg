@@ -146,8 +146,16 @@ sealed class TestLake : IDisposable
     public TestLake Baked(string directory = "baked")
     {
         Logged.Clear();
-        using var loggers = LoggerFactory.Create(builder => builder.AddProvider(new Capture(Logged)));
-        triaxis.DuckPg.Bake.RunAsync(Config, At(directory), loggers).GetAwaiter().GetResult();
+
+        // Through the service a consumer would use, not the internals behind it: baking from a
+        // fixture is the embedding case, so the fixture is the one that has to keep working.
+        var services = new ServiceCollection();
+        services.AddLogging(builder => builder.AddProvider(new Capture(Logged)));
+        services.AddDuckPgBaker();
+
+        using var provider = services.BuildServiceProvider();
+        provider.GetRequiredService<IDuckPgBaker>()
+                .BakeAsync(Config, At(directory)).GetAwaiter().GetResult();
         return this;
     }
 

@@ -256,7 +256,7 @@ public class BakeTests
 
         // What makes copying one cheap, and it cannot be changed after the file is created: a block
         // is allocated whole, so a lake of many small tables is mostly blocks.
-        Assert.Equal([Bake.DefaultBlockSize.ToString()], Rows(duck, "SELECT block_size FROM pragma_database_size()"));
+        Assert.Equal([IDuckPgBaker.DefaultBlockSize.ToString()], Rows(duck, "SELECT block_size FROM pragma_database_size()"));
 
         // In a schema of its own rather than in `main`, which is in every session's search path:
         // nothing here is a client's to find.

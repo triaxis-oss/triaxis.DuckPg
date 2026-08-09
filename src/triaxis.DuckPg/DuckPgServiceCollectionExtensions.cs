@@ -52,6 +52,15 @@ public static class DuckPgServiceCollectionExtensions
         return services;
     }
 
+    /// Bakes a lake out to files rather than serving one -- the pair to `AddDuckPgFactory`, and
+    /// registered the same way, since a bake takes its configuration per call too.
+    public static IServiceCollection AddDuckPgBaker(this IServiceCollection services)
+    {
+        services.AddDuckPgCommon();
+        services.TryAddSingleton<IDuckPgBaker, DuckPgBaker>();
+        return services;
+    }
+
     /// What every entry point needs before anything else: the bindings find the machine's DuckDB
     /// through a resolver, which has to be in place before the first native call rather than at
     /// some point after it.
