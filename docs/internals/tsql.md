@@ -122,6 +122,24 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
 
 ## Rewriting a write
 
+- **A materialized table needs none of this, and saying so is worth 7 ms a write.** The plan exists
+  to stand a write branch over the layers below: rows are collected, tombstoned where a key moved,
+  evicted from the branch and re-inserted. A materialized table *is* the whole of what the lake
+  publishes -- which the same method already relies on when it turns tombstoning off -- so there is
+  nothing below for an old row to show through and nothing for a written row to shadow. What is left
+  is DuckDB's own UPDATE, keyed by the table's own index rather than by a temp table standing in for
+  one. `Gateway.RewriteUpdate` sends the statement as it arrived, with the target renamed to the
+  physical table, when the target is materialized and the statement has no `FROM`, no row limit and
+  assigns no key column -- the three things the plan is still for. `RewriteDelete` does the same,
+  with a cascade counting against it too, since a cascade reads the keys back one table down.
+  Measured on a 414-table lake, one row by key: 8.0 ms as four statements, against 1.05 ms for
+  DuckDB doing the same update directly on that lake spilled to a store. As one statement, on a
+  one-table lake, it is 1.2 ms -- beside 0.85 for a `SELECT` by key on the same lake, which is the
+  floor a round trip cannot go below. **~95% of the difference was statement preparation** -- a CPU sampling profile put two thirds in `PrepareMultiple` alone -- so
+  what four statements cost is mostly that there are four of them: the cost was flat in table size
+  (5.8 ms over 164k rows, 10.2 over 490) and most of it survived on a one-table lake with no dacpac.
+  An INSERT was already one statement and did not move; what it pays past the write is
+  `Gateway.Duplicates`, measured at 3.23 ms against 1.49 with `checkKeys` off.
 - **`MERGE ... WHEN MATCHED THEN UPDATE` is an update joined to its source**, and the parser
   desugars it to exactly that -- target, alias, `USING` as `From`, `ON` as `Where`. That is why
   `UpdateStatement` carries an alias at all, and why `Gateway.RewriteUpdate` had to learn the
