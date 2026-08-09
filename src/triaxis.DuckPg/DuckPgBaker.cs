@@ -45,7 +45,16 @@ sealed class DuckPgBaker(ILoggerFactory loggers) : IDuckPgBaker
                                 CancellationToken cancellation = default)
     {
         var database = (format ?? Inferred(target)) == BakeFormat.Database;
-        if (database) config = Materialized(config, target);
+        if (database)
+        {
+            // Against what was handed over rather than the copy: `Materialized` turns it into a
+            // store, and a complaint about a `store` nobody set names something the caller cannot
+            // find. The session-dependent check is spelled out here for the same reason -- run over
+            // the copy it would call itself `materialize`.
+            config.ValidateShape();
+            config.ValidateSessionless("a baked database");
+            config = Materialized(config, target);
+        }
 
         // A container of its own rather than a scope: each bake is configured differently, and a
         // scope cannot bring its own registrations. A fresh container inherits nothing, so the one
@@ -87,6 +96,11 @@ sealed class DuckPgBaker(ILoggerFactory loggers) : IDuckPgBaker
         if (Directory.Exists(target))
             throw new DuckPgConfigurationException(
                 $"{target} is a directory, and a bake into a database writes one file");
+
+        // As the parquet bake makes the directory it was pointed at: what is named is where the
+        // output goes, not somewhere that has to be there first.
+        if (Path.GetDirectoryName(Path.GetFullPath(target)) is { Length: > 0 } parent)
+            Directory.CreateDirectory(parent);
 
         var baked = config.Copy();
         baked.Materialize = true;

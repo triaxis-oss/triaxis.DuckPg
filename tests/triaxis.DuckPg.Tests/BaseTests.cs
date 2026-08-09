@@ -114,6 +114,45 @@ public class BaseTests
         Assert.Contains("not a baked one", refused.Message);
     }
 
+    /// The file is copied by every run that serves it, so what the build needed and the serving does
+    /// not is weight on every one of them -- and a YAML layer left behind is every row twice.
+    [Fact]
+    public void ABakedDatabaseCarriesNoneOfTheBuildsScaffolding()
+    {
+        using var lake = Seeded();
+        lake.Baked("baked.duckdb");
+
+        using var duck = new DuckDB.NET.Data.DuckDBConnection($"Data Source={lake.At("baked.duckdb")}");
+        duck.Open();
+
+        using var command = duck.CreateCommand();
+        command.CommandText =
+            "SELECT DISTINCT table_schema FROM information_schema.tables " +
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY 1";
+        using var reader = command.ExecuteReader();
+
+        var schemas = new List<string>();
+        while (reader.Read()) schemas.Add(reader.GetString(0));
+
+        // What it serves and what says how, and nothing of how it was built: no `layer` table
+        // holding a second copy of every YAML row, and no baseline view naming this machine's paths.
+        Assert.Equal(["duckpg", "lake", "main"], schemas);
+    }
+
+    /// DuckDB names the database after the file, and the copy keeps the base's name -- so this is
+    /// the ambiguity the same rule already refuses for a store.
+    [Fact]
+    public void ABaseNamedAfterTheSchemaIsRefused()
+    {
+        using var lake = Seeded();
+        lake.Baked("baked.duckdb");
+        File.Move(lake.At("baked.duckdb"), lake.At("lake.duckdb"));
+
+        lake.FromBase("lake.duckdb");
+        var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("cannot tell the two apart", refused.Message);
+    }
+
     [Fact]
     public void LayersUnderABaseAreRefused()
     {

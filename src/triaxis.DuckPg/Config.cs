@@ -211,6 +211,15 @@ public sealed class Config
             // have to be merged with it, which is the work it exists to have done already -- and the
             // rows it holds came from layers of its own, so this is nearly always the stack it was
             // baked from, left behind.
+            // The copy keeps the base's file name, and DuckDB names the database after the file --
+            // so `base: lake.duckdb` under the `lake` schema leaves every `lake.orders` ambiguous
+            // between the two, exactly as a store named that way does.
+            if (string.Equals(Path.GetFileNameWithoutExtension(baked), Schema, StringComparison.OrdinalIgnoreCase))
+                throw new DuckPgConfigurationException(
+                    $"the base names the database `{Path.GetFileNameWithoutExtension(baked)}`, which is " +
+                    $"also the schema this lake publishes into -- DuckDB cannot tell the two apart, so " +
+                    $"name the file something else or set `schema`");
+
             if (Layers.Length > 0)
                 throw new DuckPgConfigurationException(
                     $"`base` serves {baked}, which is a whole lake already collapsed, and " +
