@@ -21,8 +21,47 @@
     <PackageReference Include="triaxis.CommandLine.Tool" Version="2.5.1" />
   </ItemGroup>
 
+  <PropertyGroup>
+    <_SourceReadme>$(MSBuildThisFileDirectory)../../README.md</_SourceReadme>
+    <_PackedReadme>$(MSBuildProjectDirectory)/$(BaseIntermediateOutputPath)README.md</_PackedReadme>
+    <!-- The published package outlives the commit it was built from, so a release passes its own
+         tag and the links keep saying what the package says. -->
+    <ReadmeLinkRef Condition="'$(ReadmeLinkRef)' == ''">main</ReadmeLinkRef>
+    <_ReadmeLinkBase>$(RepositoryUrl)/blob/$(ReadmeLinkRef)/</_ReadmeLinkBase>
+  </PropertyGroup>
+
   <ItemGroup>
-    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <!-- The rewritten copy, not the original: nuget.org resolves a relative link against itself,
+         so an unrewritten one takes the reader back to the package page. -->
+    <None Include="$(_PackedReadme)" Pack="true" PackagePath="/" Visible="false" />
   </ItemGroup>
+
+  <UsingTask TaskName="AbsolutizeMarkdownLinks" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Source ParameterType="System.String" Required="true" />
+      <Destination ParameterType="System.String" Required="true" />
+      <BaseUrl ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var text = Regex.Replace(
+            File.ReadAllText(Source),
+            @"(?<=\]\()(?![a-zA-Z][a-zA-Z0-9+.-]*:|[#/])",
+            BaseUrl);
+        Directory.CreateDirectory(Path.GetDirectoryName(Destination));
+        if (!File.Exists(Destination) || File.ReadAllText(Destination) != text)
+        {
+            File.WriteAllText(Destination, text);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="RewriteReadmeLinks" BeforeTargets="_GetPackageFiles;GenerateNuspec">
+    <AbsolutizeMarkdownLinks Source="$(_SourceReadme)" Destination="$(_PackedReadme)"
+                             BaseUrl="$(_ReadmeLinkBase)" />
+  </Target>
 
 </Project>

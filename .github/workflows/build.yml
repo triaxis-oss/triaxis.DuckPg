@@ -19,11 +19,12 @@ jobs:
       # The tests carry their own DuckDB, so nothing has to be installed here.
       - run: dotnet test -c Release --logger "console;verbosity=normal"
 
-      # A tag names the version; anything else packs the version in the project.
+      # A tag names the version and the ref the readme's links point at; anything else packs the
+      # version in the project, against main.
       - name: pack
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            dotnet pack -c Release -o artifacts -p:Version="${GITHUB_REF_NAME#v}"
+            dotnet pack -c Release -o artifacts -p:Version="${GITHUB_REF_NAME#v}" -p:ReadmeLinkRef="$GITHUB_REF_NAME"
           else
             dotnet pack -c Release -o artifacts
           fi
