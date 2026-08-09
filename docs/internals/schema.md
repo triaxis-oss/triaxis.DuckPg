@@ -44,6 +44,24 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   serving a row nobody can name. It also outlives `Config.CheckKeys`: turning the rule off drops the
   scan of the merge, and materialized the key still refuses the row, with DuckDB's own message
   instead of `23505`.
+- **Uniqueness declared past the key is a rule too, and DuckDB holds that one alone.** A `UNIQUE`
+  constraint and a unique index say the same thing about the rows, so `DacpacSchema.ReadUnique` reads
+  both into one list: the two differ only in which relationship names the table -- `DefiningTable`
+  for a constraint, `IndexedObject` for an index, which carries the table in its own name besides --
+  and in that an index has to say it is unique with a property DacFx *omits* rather than writes false,
+  so an absent one is a plain index and reading it the other way would turn every index in a real
+  dacpac into a constraint. `Catalog.Uniques` then creates one unique index per rule on a
+  materialized table. Unlike the key this is an index and not a constraint, because that is what it
+  is: the columns may be NULL, and DuckDB counts two NULLs as different where SQL Server counts them
+  as one, so a lake refuses a shade less here than SQL Server would. It is skipped where the table
+  does not publish every column the rule is over -- a lake showing a subset of a declared table loses
+  the rule rather than failing on it, the same bargain `KeyFor` strikes -- and where the rule is the
+  key again under another name. A partition column joins it for the reason it joins the key: rows are
+  only unique *within* a partition, and a rule that forgot that would refuse a lake for holding the
+  row it was partitioned to hold. **A layered lake keeps none of this**: it publishes views, and
+  `Gateway.Duplicates` asks about the key alone. Asking about a declared unique too would be another
+  scan of the merge per rule per write, and the key's scan is already most of what a write costs.
+  That divergence is a decision and not a gap left open -- see below.
 - **The foreign keys DuckDB offers are not the ones a lake needs, materialized or not.**
   `ALTER TABLE ... ADD FOREIGN KEY` is unimplemented, so a constraint has to be declared in
   `CREATE TABLE` -- which costs `Materialize` its CTAS and demands the tables be built in dependency
@@ -77,6 +95,14 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   opt-out for a lake whose writers are known to send fresh keys, and it is one condition in
   `Gateway.Duplicates` rather than a second path. What it gives back is the scan and not the rule:
   materialized, the index still holds the key, so only a layered lake is left with nothing.
+- **The two modes enforce differently because they are asked different things, and closing that is
+  not the improvement it looks like.** Layered is how a lake is read: many layers, few or no writers,
+  questions that scan. Materialized is how one is written against -- a test suite standing a lake up,
+  writing to it, and expecting a store's answers -- so it is the mode where a refusal has anything to
+  refuse. That is why every rule DuckDB can hold is handed to it there and only the key is paid for
+  over the merge here, why a stack breaking a declared rule is a startup failure rather than a
+  warning, and why the layered side is not made to answer for a declared unique. A scan per rule per
+  write would tax the mode that has no writes to tax, to enforce a rule against nobody.
 
 ## References and cascades
 

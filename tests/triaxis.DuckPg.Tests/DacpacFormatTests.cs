@@ -172,6 +172,24 @@ public class DacpacFormatTests : IDisposable
                      schema.References.Select(r => $"{r.Name}={r.OnDelete}").Order());
     }
 
+    /// The two forms are written differently enough that reading one says nothing about the other: a
+    /// constraint names its table through `DefiningTable` and an index through `IndexedObject`,
+    /// carrying the table in its own name besides. And a plain index is told from a unique one by a
+    /// property DacFx omits rather than writes false -- so it is pinned here too, since a reader that
+    /// took an absent property for unique would turn every index in a real dacpac into a rule.
+    [Fact]
+    public void ReadsBothFormsOfUniquenessDacFxWrites()
+    {
+        var schema = new DacpacSchema(
+            new Config { Dacpac = Path.Combine(AppContext.BaseDirectory, "Schema", "sample.dacpac") },
+            warnings);
+
+        Assert.Equal(["IX_codes_slot=slot", "UQ_codes_label=label", "UQ_codes_region_slot=region,slot"],
+                     schema.Uniques.Where(u => u.Table == "codes")
+                           .Select(u => $"{u.Name}={string.Join(",", u.Columns)}").Order());
+        Assert.DoesNotContain(schema.Uniques, u => u.Name == "IX_codes_region");
+    }
+
     [Fact]
     public void ReadsTheColumnsAndTheKey()
     {

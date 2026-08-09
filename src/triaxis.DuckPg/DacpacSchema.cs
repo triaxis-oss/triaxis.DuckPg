@@ -10,6 +10,10 @@ namespace triaxis.DuckPg;
 sealed record Reference(string Name, string Table, string[] Columns,
                         string Parent, string[] ParentColumns, string OnDelete);
 
+/// Declared uniqueness that is not the key: which columns of which table, under the name the
+/// constraint or the index was given.
+sealed record Unique(string Name, string Table, string[] Columns);
+
 /// A declared scalar function: what it is called, what it takes in order, what it returns, and the
 /// body it was written with. The `CREATE FUNCTION` header is not in the model at all -- `BodyScript`
 /// holds the `BEGIN … END` alone -- so the parameters and the return type come from the model's own
@@ -31,6 +35,7 @@ sealed class DacpacSchema
     readonly Dictionary<(string Table, string Column), string> defaults = new();
     readonly Dictionary<string, string> views = new(StringComparer.OrdinalIgnoreCase);
     readonly List<Reference> references = [];
+    readonly List<Unique> uniques = [];
     readonly List<ScalarFunction> functions = [];
 
     public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
@@ -58,6 +63,9 @@ sealed class DacpacSchema
     /// What the declared schema says points at what.
     public IReadOnlyList<Reference> References => references;
 
+    /// Every uniqueness rule it declares that is not a table's key.
+    public IReadOnlyList<Unique> Uniques => uniques;
+
     /// The scalar functions it declares, in the order the model lists them.
     public IReadOnlyList<ScalarFunction> Functions => functions;
 
@@ -79,6 +87,8 @@ sealed class DacpacSchema
             {
                 "SqlTable" => ReadTable(element),
                 "SqlPrimaryKeyConstraint" => ReadKey(element),
+                "SqlUniqueConstraint" => ReadUnique(element),
+                "SqlIndex" => ReadIndex(element),
                 "SqlDefaultConstraint" => ReadDefault(element),
                 "SqlView" => ReadView(element),
                 "SqlForeignKeyConstraint" => ReadReference(element),
@@ -126,19 +136,43 @@ sealed class DacpacSchema
         var name = Unqualify(Reference(constraint, "DefiningTable"));
         if (name is null) return false;
 
-        var key = Related(constraint, "ColumnSpecifications")
-            .SelectMany(c => c.Elements(Dac + "Relationship")
-                .Where(r => r.Attribute("Name")?.Value == "Column")
-                .Descendants(Dac + "References"))
-            .Select(r => Unqualify(r.Attribute("Name")?.Value))
-            .OfType<string>()
-            .ToArray();
-
+        var key = Indexed(constraint);
         if (key.Length == 0) return false;
 
         keys[name] = key;
         return true;
     }
+
+    /// A `UNIQUE` constraint, which the model writes exactly as it writes the key -- the same column
+    /// specifications under the same relationship, differing only in the element's type.
+    bool ReadUnique(XElement constraint) => ReadUnique(constraint, "DefiningTable");
+
+    /// A unique index says the same thing about the rows as a `UNIQUE` constraint, so it is read as
+    /// one. A plain index says nothing about them, and DacFx leaves the property out rather than
+    /// writing it false -- so an absent one is not unique, and is understood rather than unread.
+    bool ReadIndex(XElement index) =>
+        Property(index, "IsUnique") != "True" || ReadUnique(index, "IndexedObject");
+
+    /// An index carries the table in its own name and a constraint does not, so which relationship
+    /// names the table is the only thing the two differ by.
+    bool ReadUnique(XElement element, string relationship)
+    {
+        var table = Unqualify(Reference(element, relationship));
+        var columns = Indexed(element);
+        if (table is null || columns.Length == 0) return false;
+
+        uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns));
+        return true;
+    }
+
+    /// The columns a key, a unique constraint or an index is over, in the order the model lists them.
+    static string[] Indexed(XElement element) =>
+        [.. Related(element, "ColumnSpecifications")
+            .SelectMany(c => c.Elements(Dac + "Relationship")
+                .Where(r => r.Attribute("Name")?.Value == "Column")
+                .Descendants(Dac + "References"))
+            .Select(r => Unqualify(r.Attribute("Name")?.Value))
+            .OfType<string>()];
 
     /// A declared reference: which columns of which table point at which columns of another, and the
     /// name the constraint was given -- an application matching on the message it fails with reads

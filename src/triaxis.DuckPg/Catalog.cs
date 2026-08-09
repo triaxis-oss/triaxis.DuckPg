@@ -881,13 +881,46 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// being published without the `QUALIFY` that dedupes, there being nothing to shadow -- or one
     /// that leaves the key empty. Both are the lake saying the layers are wrong at startup rather
     /// than serving a row nobody can name.
-    static void Keyed(DuckDBConnection conn, Table table)
+    void Keyed(DuckDBConnection conn, Table table)
     {
-        if (table.Key.Length == 0 || Holds(conn, table)) return;
+        if (table.Key.Length > 0 && !Holds(conn, table))
+            Exec(conn, $"ALTER TABLE {table.QualifiedName} ADD PRIMARY KEY " +
+                       $"({string.Join(", ", table.Key.Select(SqlText.Quote))})");
 
-        Exec(conn, $"ALTER TABLE {table.QualifiedName} ADD PRIMARY KEY " +
-                   $"({string.Join(", ", table.Key.Select(SqlText.Quote))})");
+        foreach (var (name, columns) in Uniques(table))
+            Exec(conn, $"CREATE UNIQUE INDEX IF NOT EXISTS {SqlText.Quote($"{table.Name}_{name}")} " +
+                       $"ON {table.QualifiedName} ({string.Join(", ", columns.Select(SqlText.Quote))})");
     }
+
+    /// The uniqueness the dacpac declares past the key -- a `UNIQUE` constraint or a unique index,
+    /// which say the same thing about the rows and are held the same way. Unlike the key this is an
+    /// index and not a constraint, because that is what it is: the columns may be NULL, and DuckDB
+    /// counts two NULLs as different where SQL Server counts them as one, so what a lake refuses
+    /// here is a shade narrower than what SQL Server would.
+    ///
+    /// Only where the table publishes every column the rule is over -- a lake showing a subset of a
+    /// declared table should lose the rule rather than fail on it -- and never the key again under
+    /// another name. A partition column joins these for the same reason it joins the key: rows are
+    /// only unique *within* a partition, and a rule that forgot that would refuse a lake for holding
+    /// the row it was partitioned to hold.
+    IEnumerable<(string Name, string[] Columns)> Uniques(Table table)
+    {
+        var partitions = table.Layers.SelectMany(l => l.Source.Partitions)
+                              .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var unique in schema.Uniques.Where(u => Same(u.Table, table.Name)))
+        {
+            if (!unique.Columns.All(table.Has)) continue;
+
+            string[] columns = [.. unique.Columns,
+                                .. partitions.Where(p => table.Has(p) && !unique.Columns.Any(c => Same(c, p)))];
+            if (!Covers(table.Key, columns)) yield return (unique.Name, columns);
+        }
+    }
+
+    /// Whether two column lists say the same thing about a row, which order does not change.
+    static bool Covers(string[] key, string[] columns) =>
+        key.Length == columns.Length && key.All(k => columns.Any(c => Same(k, c)));
 
     /// Whether DuckDB is already holding this table's key, which a store carrying the table from a
     /// previous run is -- and asking for it twice is an error rather than a no-op.
