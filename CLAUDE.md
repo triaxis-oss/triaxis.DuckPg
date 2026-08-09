@@ -27,7 +27,8 @@ publish a temp-directory convention as API.
 | `Lake.cs` | The composition root: DuckDB connection, schema, catalog, gateway, listeners. Tests use it too. |
 | `Layer.cs` | Scanning a layer directory, reading a source, writing one back. YAML ↔ JSON. |
 | `Catalog.cs` | The published shape: which tables exist, their columns, keys, the view SQL, and the dacpac's own views. |
-| `Bake.cs` | `duckpg bake`: the same catalog with no doors, copied out as one parquet a table. |
+| `Bake.cs` | `duckpg bake`: the same catalog with no doors, written out as one parquet a table or as the database a materialized lake would hold. |
+| `BakedBase.cs` | The copy of a baked database a run serves, and the scratch file it goes in when there is no store. |
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
 | `DacpacSchema.cs` | The declared schema as a service: finds the dacpac, reads `model.xml` for columns, keys, uniques, defaults and views. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
@@ -80,6 +81,10 @@ Each of these is the short form; the note behind it is where the argument is.
   layer, why a virtual column and a declared default are left to the run that reads the file, why a
   partitioned layer is written back partitioned -- and why what cannot be kept identical is refused
   rather than written. [lake](docs/internals/lake.md#baking)
+- **A baked database is a materialized lake somebody else already collapsed**, served from a copy
+  and never written to, with the shutdown delta measured against it -- and it freezes the defaults a
+  materialized lake freezes. `Config.Collapsed`, not `config.Materialize`, is what the catalog asks.
+  [lake](docs/internals/lake.md#baking-a-database-and-serving-one)
 - **A declared default is a value in the read layers and an expression in the write layer.**
   [schema](docs/internals/schema.md#defaults)
 - **The dialect is translated on the tree, never on the text**, and a statement the parser does not

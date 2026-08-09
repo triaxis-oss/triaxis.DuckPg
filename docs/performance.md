@@ -146,6 +146,56 @@ Nothing is deleted: what an earlier bake left for a table this one no longer pub
 warning and left where it is, because a layer directory is read for whatever is in it and that
 directory is yours.
 
+## Baking the whole lake as a database
+
+`--out` ending in `.duckdb` writes what a materialized lake *holds* rather than the layer it
+publishes: the collapsed tables, their keys and indexes, the declared views and macros. `--base`
+serves it.
+
+```shell
+duckpg bake ./common ./tenant --dacpac schema.dacpac --out seed.duckdb
+duckpg --base seed.duckdb --write ./local
+```
+
+Nothing is scanned, described, parsed, merged or keyed on the way up, because all of it is in the
+bytes already. On a 300-table lake holding 1500 rows between them:
+
+| to serving | |
+|---|---|
+| the process, the host and DuckDB, publishing nothing | 383 ms |
+| **`--base seed.duckdb`** | **643 ms** |
+| layers + dacpac | 1371 ms |
+| layers + dacpac + `--materialize` | 3543 ms |
+
+Most of what a start costs is finishing the schema rather than reading the rows, which is why the
+gap barely moves with the data and why this is the mode for serving one initial state over and over.
+A base also needs no dacpac, no key and no configuration: everything DuckDB can hold is in its
+catalog, and what it cannot — a declared reference with its `ON DELETE`, and the columns a schema
+says the store fills in — is in a `duckpg` schema in the same file.
+
+**The base is never written to.** The run copies it — to the `--store` if there is one and to a
+scratch file otherwise — and serves the copy, so a thousand runs share one file and each gets the
+state it was baked with. Copying is the whole cost, which is why the file is created with a small
+block size: a block is allocated whole, so a lake of many small tables is mostly blocks. Those 300
+tables came to 159 MB at DuckDB's own 256 KB and 18.7 MB at the 16 KB this uses, which is 9 ms to
+copy against 172. `--block-size` raises it where the tables are big enough to want the bigger one.
+
+**Writes persist exactly as they do without a bake.** The base stays attached read-only and is what
+the delta at shutdown is measured against — the same thing the `base` schema holds for a lake cut
+from layers. A write directory beside it is read on the way up and applied over the copy: a tombstone
+deletes the row it names, and a written row replaces the one it shadows, since a materialized table
+has nothing to shadow *with*. So a restart reads its own delta back, and the run after that one too.
+
+What is refused rather than guessed at: layers under a base, which is a whole lake already collapsed;
+a file that is not a bake; one baked into a different schema than this lake publishes; and one
+stamped with a version this duckpg does not speak.
+
+**A baked database freezes what a materialized lake freezes.** Its tables hold every declared default
+already stamped and there is no reader left to stamp one, so `(getdate())` is the moment the bake ran
+— exactly as in a `--store`, and unlike the parquet bake, which leaves the column empty because a
+view still reads it. `--derive-ids` is the answer for the ids among them: derived from the key rather
+than generated, so the value is the same whoever works it out.
+
 ## Compressing what is held
 
 **`--compress`** is the other answer to a materialized lake's memory, and it keeps the tables where

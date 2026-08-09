@@ -139,3 +139,7 @@ one parquet a table — merged, shadowed, tombstones applied — and `./baked` i
 other. It is how a stack stops being re-read on every start, and how a write layer that has grown
 large is flattened back into the files below it; the shape of the output and what it does not carry
 are in [performance](performance.md#baking-the-layers-once).
+
+Name the output `.duckdb` instead and what comes out is not a layer at all but the whole lake as a
+database, served with `--base` and needing no dacpac, key or configuration beside it —
+[performance](performance.md#baking-the-whole-lake-as-a-database) again.
