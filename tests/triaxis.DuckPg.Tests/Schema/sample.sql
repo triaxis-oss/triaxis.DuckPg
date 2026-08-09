@@ -96,3 +96,23 @@ CREATE TABLE [dbo].[tags] (
     CONSTRAINT [FK_tags_orders] FOREIGN KEY ([order_id]) REFERENCES [dbo].[orders] ([order_id]) ON DELETE SET DEFAULT
 );
 GO
+
+-- Uniqueness past the key, in both the forms DacFx writes it: a UNIQUE constraint names its table
+-- through a relationship, a unique index carries the table in its own name. The plain index is here
+-- so that "not unique" is read off an absent property rather than off a false one.
+CREATE TABLE [dbo].[codes] (
+    [code_id] INT           NOT NULL,
+    [label]   NVARCHAR (20) NOT NULL,
+    [region]  NVARCHAR (10) NOT NULL,
+    [slot]    INT           NULL,
+    CONSTRAINT [PK_codes] PRIMARY KEY CLUSTERED ([code_id] ASC),
+    CONSTRAINT [UQ_codes_label] UNIQUE ([label] ASC),
+    CONSTRAINT [UQ_codes_region_slot] UNIQUE ([region] ASC, [slot] ASC)
+);
+GO
+
+CREATE UNIQUE INDEX [IX_codes_slot] ON [dbo].[codes] ([slot] ASC);
+GO
+
+CREATE INDEX [IX_codes_region] ON [dbo].[codes] ([region] ASC);
+GO

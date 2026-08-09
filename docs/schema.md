@@ -1,7 +1,8 @@
 # The schema, from a dacpac
 
 `dacpac: app.dacpac` (or `--dacpac`) makes the declared schema authoritative: column names, order and
-types, plus the primary key, read out of the dacpac directly and without DacFx. Columns no layer
+types, plus the keys and the uniqueness past them, read out of the dacpac directly and without
+DacFx. Columns no layer
 carries are published as typed `NULL`s, layer columns are cast to the declared type rather than to
 whatever inference guessed, and the declared primary key means `--key` is unnecessary. A declared
 table no layer carries is published as well — empty, with its declared shape — and is writable like
@@ -21,6 +22,16 @@ afterwards, so a row written with an explicit `NULL` stays null. `SUSER_SNAME()`
 `ORIGINAL_LOGIN()` answer with the session's login name, or with the account duckpg runs as for a
 default. A default DuckDB cannot answer at all (`NEWSEQUENTIALID()` and friends) is dropped with a
 warning and the column keeps its `NULL`.
+
+**Uniqueness past the key.** A `UNIQUE` constraint and a unique index both declare that no two rows
+share those columns, and both are kept — on a materialized lake, where the table is a table and
+DuckDB can hold the rule. A plain, non-unique index declares nothing and is read as nothing. The rule
+is dropped for a table the lake publishes without every column it is over, and a partition column
+joins it as it joins the key, since rows are only unique within a partition. Two NULLs count as
+different here, as they do in PostgreSQL and unlike SQL Server, which allows one such row rather than
+many. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.
+Where the layers already break a declared rule, the lake says so at startup rather than serving rows
+it would go on to refuse.
 
 **References.** A `DELETE` of a row something still points at fails the way SQL Server fails it —
 error 547, naming the constraint — rather than quietly leaving an orphan. The check is over the

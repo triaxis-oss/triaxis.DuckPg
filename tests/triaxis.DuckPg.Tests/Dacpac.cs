@@ -10,7 +10,8 @@ static class Dacpac
 
     public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key,
                             (string Column, string Expression)[]? Defaults = null,
-                            string[]? Identity = null);
+                            string[]? Identity = null,
+                            (string Name, string[] Columns, bool AsIndex)[]? Uniques = null);
 
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
@@ -32,6 +33,7 @@ static class Dacpac
             new XElement(Dac + "Model",
                 tables.Select(Element)
                       .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
+                      .Concat(tables.SelectMany(Uniques))
                       .Concat(tables.SelectMany(Defaults))
                       .Concat(views.Select(View))
                       .Concat(references.Select(Reference))));
@@ -89,8 +91,25 @@ static class Dacpac
     static XElement Key(TableModel table) =>
         El("SqlPrimaryKeyConstraint", $"[dbo].[PK_{table.Name}]",
             Rel("DefiningTable", Ref($"[dbo].[{table.Name}]")),
-            Rel("ColumnSpecifications", [.. table.Key.Select(k =>
-                El("SqlIndexedColumnSpecification", null, Rel("Column", Ref($"[dbo].[{table.Name}].[{k}]"))))]));
+            Over(table, table.Key));
+
+    /// A `UNIQUE` constraint and a unique index say the same thing and are written differently: the
+    /// constraint names its table through a relationship, the index carries it in its own name and
+    /// says it is unique with a property DacFx leaves out altogether when it is not.
+    static IEnumerable<XElement> Uniques(TableModel table) =>
+        (table.Uniques ?? []).Select(u => u.AsIndex
+            ? El("SqlIndex", $"[dbo].[{table.Name}].[{u.Name}]",
+                new XElement(Dac + "Property", new XAttribute("Name", "IsUnique"), new XAttribute("Value", "True")),
+                Over(table, u.Columns),
+                Rel("IndexedObject", Ref($"[dbo].[{table.Name}]")))
+            : El("SqlUniqueConstraint", $"[dbo].[{u.Name}]",
+                Over(table, u.Columns),
+                Rel("DefiningTable", Ref($"[dbo].[{table.Name}]"))));
+
+    /// The columns a key, a constraint or an index is over, as the specifications all three share.
+    static XElement Over(TableModel table, string[] columns) =>
+        Rel("ColumnSpecifications", [.. columns.Select(c =>
+            El("SqlIndexedColumnSpecification", null, Rel("Column", Ref($"[dbo].[{table.Name}].[{c}]"))))]);
 
     /// Everything in this format is an Element reached through a named Relationship, one Entry deep.
     static XElement El(string type, string? name, params object[] content) =>

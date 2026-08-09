@@ -30,9 +30,10 @@ than quietly stopping.
 A keyed table also carries its key as a real `PRIMARY KEY`, which a layered lake has nowhere to put.
 That is what makes a lookup by key a lookup rather than a scan — 0.47 ms against 4.2 ms on a 10M-row
 table whose rows are in no particular order, and about a fifth where they happen to arrive keyed and
-the zone maps had already done the pruning. It also means the layers have to be right: a stack that
-publishes one key twice, or leaves the key empty, cannot be keyed, and the lake says so at startup
-rather than serving it.
+the zone maps had already done the pruning. Any `UNIQUE` constraint or unique index the dacpac
+declares past the key becomes an index here too. It also means the layers have to be right: a stack
+that publishes one key twice, leaves the key empty, or breaks a declared unique cannot be built, and
+the lake says so at startup rather than serving it.
 
 The write directory is still a layer on the way in, so a delta a previous run left is read back and
 collapsed with the rest, but nothing is kept while the lake runs. When it stops cleanly, what it holds
