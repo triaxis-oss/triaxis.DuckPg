@@ -33,13 +33,14 @@ namespace triaxis.DuckPg;
 sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDbInstaller installer,
                   ILogger<Bake> logger)
 {
-    /// What a bake writes into rather than a directory of parquet: one DuckDB database holding the
-    /// collapsed tables, which a later run copies and serves without reading a layer or a dacpac at
-    /// all. Decided by the name, the way a layer's format is decided by the file's.
+    /// What a name says a bake is to write, for a caller that did not say. A layer's format is a
+    /// property of the file, and this is the same reading applied to the output: `.duckdb` is one
+    /// thing and nothing else is. Only ever a default -- `BakeFormat` is what decides.
     public const string DatabaseExtension = ".duckdb";
 
-    public static bool IsDatabase(string target) =>
-        Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase);
+    public static BakeFormat Inferred(string target) =>
+        Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase)
+            ? BakeFormat.Database : BakeFormat.Parquet;
 
     /// The same lake, collapsed into the file being written rather than served from views. A store
     /// that is the state is exactly what a baked database is, so `Keep` is what it is built as --

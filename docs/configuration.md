@@ -49,8 +49,11 @@ so it reads the same keys and the same arguments — `layers`, `write`, `default
 It has flags for those keys and for nothing else: serving's own options belong to `duckpg` and are
 refused in front of the verb rather than silently dropped there.
 
-`--out` ending in `.duckdb` writes a database rather than a directory, and `--block-size` is what
-that one is created with — small, because a block is allocated whole and a lake of many small tables
+`--format` says which of the two a bake writes: `Parquet` for a directory of one file a table, read
+back as an ordinary layer, or `Database` for the whole lake as a DuckDB file. Unset it is taken from
+the name — `.duckdb` is a database and anything else a directory — which is a default and not the
+mechanism, so a caller that names one gets it whatever the file is called. `--block-size` is what a
+database is created with — small, because a block is allocated whole and a lake of many small tables
 is mostly blocks. Serving one takes `--base` and nothing else: no `layers`, no `defaultKey`, no
 `dacpac`, since the file carries all three. Layers under a base are refused, as is a file that is not
 a bake, one baked into another schema, and one stamped with a version this duckpg does not speak.

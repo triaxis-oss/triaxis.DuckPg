@@ -105,7 +105,8 @@ Each of these is the short form; the note behind it is where the argument is.
   both front doors are opt-in, and a lake needs one.
   [lake](docs/internals/lake.md#starting-stopping-and-what-a-lake-owns)
 - **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckPgBaker, IDuckDbInstaller,
-  LayerFormat, StoreMode, DuckPgConfigurationException and DuckDbLibrary -- nothing else.**
+  LayerFormat, BakeFormat, StoreMode, DuckPgConfigurationException and DuckDbLibrary -- nothing
+  else.**
   The catalog, the gateway, the two protocols and `TSql/` are internal, which is why `Lake`'s
   constructor is internal and `AddDuckPg` assembles it by hand: a public constructor would have to
   take public parameters, and that would make every part of a lake an API. `InternalsVisibleTo`
