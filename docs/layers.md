@@ -131,3 +131,11 @@ Two sessions writing at once is a matter for the front doors rather than for the
 
 `CALL duckpg_reload()` rebuilds the catalog from the filesystem, picking up files that appeared since
 startup.
+
+## Baking a stack down to one layer
+
+`duckpg bake ./common ./tenant --write ./local --out ./baked` writes what those layers publish out as
+one parquet a table — merged, shadowed, tombstones applied — and `./baked` is then a layer like any
+other. It is how a stack stops being re-read on every start, and how a write layer that has grown
+large is flattened back into the files below it; the shape of the output and what it does not carry
+are in [performance](performance.md#baking-the-layers-once).

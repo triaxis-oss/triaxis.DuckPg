@@ -139,6 +139,18 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// The layers written out as the parquet layer they publish, into a directory of the fixture's
+    /// own. What the bake said lands in `Logged`, exactly as a start's own lines do -- and pointing
+    /// `Stack` at the same directory afterwards is how a test tells a baked lake from the one it
+    /// was baked from.
+    public TestLake Baked(string directory = "baked")
+    {
+        Logged.Clear();
+        using var loggers = LoggerFactory.Create(builder => builder.AddProvider(new Capture(Logged)));
+        triaxis.DuckPg.Bake.RunAsync(Config, At(directory), loggers).GetAwaiter().GetResult();
+        return this;
+    }
+
     public void Stop()
     {
         lake?.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
