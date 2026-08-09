@@ -18,20 +18,41 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
 
 ## Keys
 
-- **A declared key is a rule over the merged view too, and neither constraint DuckDB offers keeps
-  it.** The write branch's `PRIMARY KEY` sees only the rows this process wrote, so an INSERT of a key
-  a file below already holds is let through -- and the row then shadows that file's row, which is an
-  UPDATE nobody asked for rather than the refusal a client expects. A materialized table has no
-  constraint at all: `Catalog.Materialize` builds it with `CREATE TABLE AS`, and CTAS keeps no key,
-  so the same key goes in as many times as it is sent. `Gateway.Duplicates` asks both halves as one
-  `Plan.Checks` query over the rows about to be written -- a key the table already publishes, and one
-  the statement repeats -- for the same reason a reference is asked there: a statement outside a
-  transaction commits each step as it goes, and the RETURNING path writes the rows down before it can
-  answer. It is asked only where the statement carries every key column, since a key the store
-  generates cannot collide with one it generated before. Giving the materialized table a `UNIQUE`
-  index instead is the obvious fix and the wrong one: a single-layer table is published without the
-  `QUALIFY` that dedupes -- there is nothing to shadow -- so a file already holding a key twice is a
-  lake that starts today and would stop.
+- **A declared key is a rule over the merged view, and only a materialized lake can hand any of it
+  to DuckDB.** The write branch's `PRIMARY KEY` sees only the rows this process wrote, so an INSERT
+  of a key a file below already holds is let through -- and the row then shadows that file's row,
+  which is an UPDATE nobody asked for rather than the refusal a client expects. So for a layered lake
+  `Gateway.Duplicates` is the whole of the rule. It asks both halves as one `Plan.Checks` query over
+  the rows about to be written -- a key the table already publishes, and one the statement repeats --
+  for the same reason a reference is asked there: a statement outside a transaction commits each step
+  as it goes, and the RETURNING path writes the rows down before it can answer. It is asked only
+  where the statement carries every key column, since a key the store generates cannot collide with
+  one it generated before.
+- **A materialized table is keyed by DuckDB as well, because it is a table and there is nothing
+  below it.** `Catalog.Keyed` issues `ALTER TABLE ... ADD PRIMARY KEY` once the table is built --
+  `Catalog.Holds` first, since a `--store` carrying the table from a previous run already has it and
+  asking twice is an error rather than a no-op. Both halves of the rule are then held twice, which is
+  the price of the index being worth having on its own: it is an ART, and it turns a lookup on the
+  key from a scan into a lookup -- 4.2 ms a point query against 0.47 over 10M rows in no particular
+  order, though only about a fifth where the rows arrive in key order and the zone maps had already
+  done the work. The key itself rather than a unique index over the same columns: they build the same
+  ART and differ only in whether a key column may be NULL, and a row whose key is not there has no
+  identity -- which is what the write branch of a layered lake has said all along, its own
+  `PRIMARY KEY` refusing exactly that. What it refuses at startup is a stack that publishes one key
+  twice -- a single-layer table is published without the `QUALIFY` that dedupes, there being nothing
+  to shadow -- or leaves the key empty. Both are the lake saying the layers are wrong rather than
+  serving a row nobody can name. It also outlives `Config.CheckKeys`: turning the rule off drops the
+  scan of the merge, and materialized the key still refuses the row, with DuckDB's own message
+  instead of `23505`.
+- **The foreign keys DuckDB offers are not the ones a lake needs, materialized or not.**
+  `ALTER TABLE ... ADD FOREIGN KEY` is unimplemented, so a constraint has to be declared in
+  `CREATE TABLE` -- which costs `Materialize` its CTAS and demands the tables be built in dependency
+  order and torn down in reverse, since `CREATE OR REPLACE TABLE` on a parent is refused while a
+  child points at it. `ON DELETE CASCADE` is refused by the parser outright. Two of them
+  are fatal rather than merely expensive: a self-referencing table cannot be loaded at all, because
+  the constraint is checked per row against committed state and a hierarchy's parent is in the same
+  statement as its child; and `Gateway.RewriteUpdate` evicts a row before re-inserting it, which a
+  child pointing at it refuses outside a transaction -- which is where plans run.
 - **An UPDATE writes rows too, and the only two ways it can write two under one key are worth
   exactly one query.** A moved key may land on one the lake already publishes; a join around the
   target may match a row twice and write it twice. Anything else reads the merged view, which is
@@ -54,8 +75,8 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   statement, so a thousand-row batch pays it once -- and it is not asked at all of a keyless table,
   a key the store generates, an ordinary UPDATE, a DELETE or any read. `Config.CheckKeys` is the
   opt-out for a lake whose writers are known to send fresh keys, and it is one condition in
-  `Gateway.Duplicates` rather than a second path: what comes back with it is the behaviour above,
-  including the part where the two modes disagree about what a duplicate even looks like.
+  `Gateway.Duplicates` rather than a second path. What it gives back is the scan and not the rule:
+  materialized, the index still holds the key, so only a layered lake is left with nothing.
 
 ## References and cascades
 

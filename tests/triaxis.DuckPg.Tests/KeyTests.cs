@@ -218,21 +218,68 @@ public class KeyTests
         Assert.Equal(["1|10", "2|20"], lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id"));
     }
 
-    /// Turned off, the lake is what it was before the rule was kept -- and the two modes do not even
-    /// agree about what that is: layered, the written row shadows the one below it, so the key is
-    /// still one row; materialized, nothing is below anything and both stay. That divergence is the
-    /// reason the rule is on by default, and what the flag buys is the scan of the merge behind it.
-    [Theory]
-    [InlineData(false, new[] { "1|99", "2|20" })]
-    [InlineData(true, new[] { "1|10", "1|99", "2|20" })]
-    public void TheRuleCanBeTurnedOff(bool materialized, string[] published)
+    /// What the flag buys back is the scan of the merge, and on a layered lake that is the whole
+    /// rule: nothing else holds the key, so the written row shadows the one below it and the lake
+    /// answers with a row nobody wrote.
+    [Fact]
+    public void TurnedOffALayeredLakeShadowsInsteadOfRefusing()
     {
         using var lake = Lake();
         lake.Config.CheckKeys = false;
-        Started(lake, materialized);
+        Started(lake, materialized: false);
 
         Assert.Equal(1, lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 99)"));
-        Assert.Equal(published, lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id, amount"));
+        Assert.Equal(["1|99", "2|20"],
+                     lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id, amount"));
+    }
+
+    /// A materialized table is a table, and DuckDB holds its key whether or not the merge is
+    /// scanned -- so the flag drops the scan and the row is refused anyway, in DuckDB's own words
+    /// rather than the rule's.
+    [Fact]
+    public void TurnedOffAMaterializedLakeIsStillKeyedByDuckDb()
+    {
+        using var lake = Lake();
+        lake.Config.CheckKeys = false;
+        Started(lake, materialized: true);
+
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 99)"));
+        Assert.Equal(["1|10", "2|20"],
+                     lake.Query("SELECT order_id, amount FROM lake.orders ORDER BY order_id, amount"));
+    }
+
+    /// A single layer is published without the `QUALIFY` that dedupes -- there is nothing to shadow
+    /// -- so a file already holding a key twice is a stack that publishes it twice. Materialized,
+    /// that is a table DuckDB will not key, and the lake says so at startup rather than serving it.
+    [Fact]
+    public void AStackAlreadyHoldingAKeyTwiceRefusesToMaterialize()
+    {
+        using var lake = new TestLake(nameof(AStackAlreadyHoldingAKeyTwiceRefusesToMaterialize))
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1, 10.0::DOUBLE), (1, 99.0::DOUBLE)) t(order_id, amount)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+
+        Assert.ThrowsAny<Exception>(() => Started(lake, materialized: true));
+        lake.Dispose();
+    }
+
+    /// A row whose key is not there cannot be named, and the write branch of a layered lake has
+    /// refused one all along. Materialized, the same is asked of what the layers already hold.
+    [Fact]
+    public void AStackLeavingTheKeyEmptyRefusesToMaterialize()
+    {
+        using var lake = new TestLake(nameof(AStackLeavingTheKeyEmptyRefusesToMaterialize))
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1, 10.0::DOUBLE), (NULL, 99.0::DOUBLE)) t(order_id, amount)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+
+        Assert.ThrowsAny<Exception>(() => Started(lake, materialized: true));
+        lake.Dispose();
     }
 
     /// A table with no declared key has no rule to keep: a file's rows have no identity without one,
