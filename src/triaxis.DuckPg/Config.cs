@@ -148,6 +148,12 @@ public sealed class Config
 
     public Dictionary<string, TableConfig> Tables { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// A copy for a run that has to change what it was given: a bake into a database is a
+    /// materialized lake in a file, and the configuration it was handed describes neither. Shallow,
+    /// which is all it has to be -- what is overwritten is scalars, and the lists and dictionaries
+    /// mean the same thing to both copies.
+    internal Config Copy() => (Config)MemberwiseClone();
+
     /// Paths in the file are relative to the file itself, not to the working directory.
     public void ResolvePaths(string baseDirectory)
     {

@@ -77,8 +77,15 @@ public static class DuckPgServiceCollectionExtensions
     /// lake's own registrations rather than a second set of them, so a catalog that grows a
     /// dependency does not have to be remembered here too -- what listens is registered and never
     /// resolved, which costs a factory nobody calls.
-    internal static IServiceCollection AddDuckPgBake(this IServiceCollection services, Config config)
+    internal static IServiceCollection AddDuckPgBake(this IServiceCollection services, Config config,
+                                                     int blockSize = 0)
     {
+        // Before the lake's own connection rather than after: `TryAdd` leaves the first standing,
+        // and a database's block size is fixed when the file is created -- there is no setting it
+        // on a database that already exists.
+        if (blockSize > 0 && config.Store is { Length: > 0 } target)
+            services.AddSingleton(new DuckDBConnection($"Data Source={target};default_block_size={blockSize}"));
+
         services.AddDuckPgLake(config);
         services.TryAddSingleton<Bake>();
         return services;
