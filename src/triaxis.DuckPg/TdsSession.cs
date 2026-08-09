@@ -728,8 +728,13 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     void Reset()
     {
         prepared.Clear();
-        pendingWrites.Clear();
         transactions = 0;
+
+        // What an abandoned transaction meant to do is not the next session's to finish, so all
+        // three go together -- a promotion left here would be made by whatever that session commits.
+        pendingWrites.Clear();
+        pendingPromotions.Clear();
+        pendingTombstones.Clear();
 
         // A key is session state, and this connection is now somebody else's: whoever gets it next
         // asking `SCOPE_IDENTITY()` must not be handed a row the last session wrote.
