@@ -556,6 +556,20 @@ public class TSqlTests
     [InlineData("INSERT INTO #staged (id) VALUES (1)", """INSERT INTO "#staged" ("id") VALUES (1)""")]
     public void RendersTemporaryTables(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 
+    /// A pooled connection's reset finds what to drop by enumerating DuckDB's whole catalog, so it
+    /// only asks when something made a temporary table -- which means every way of making one has to
+    /// be recognised in what was rendered: the client's `#t` and the gateway's own scratch alike.
+    [Fact]
+    public void RecognisesWhatMakesATemporaryTable()
+    {
+        Assert.True(SqlText.MakesTemporary(Translate("SELECT a.id INTO #staged FROM orders a")));
+        Assert.True(SqlText.MakesTemporary("CREATE OR REPLACE TEMP TABLE duckpg_written AS SELECT 1"));
+
+        Assert.False(SqlText.MakesTemporary(Translate("DROP TABLE #staged")));
+        Assert.False(SqlText.MakesTemporary(Translate("SELECT s.id FROM #staged s")));
+        Assert.False(SqlText.MakesTemporary(Translate("SELECT 'CREATE TEMP TABLE' AS x")));
+    }
+
     /// Nested joins defer their conditions, closing in reverse: the ON belonging to the inner join
     /// arrives first. Read left-deep instead, the last ON has nothing left to attach to.
     [Theory]

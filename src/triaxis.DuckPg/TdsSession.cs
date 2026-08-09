@@ -48,6 +48,13 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// cleared by a rollback: SQL Server does not give a generated key back either.
     decimal? identity;
 
+    /// Whether anything on this connection has made a temporary table since the last reset. Asking
+    /// DuckDB instead means enumerating the entire catalog -- every layer's tables and every
+    /// published view, each one costing its own `CREATE` text -- and it costs that whether the
+    /// session made one or not. A pooled checkout resets before every statement an ORM sends, so
+    /// the common answer has to be free.
+    bool temporaries;
+
     public void Run()
     {
         while (true)
@@ -566,6 +573,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     DbCommand Command(string sql, IReadOnlyDictionary<string, Parameter> parameters)
     {
+        temporaries = temporaries || SqlText.MakesTemporary(sql);
         var command = duck.CreateCommand();
         command.CommandText = sql;
         foreach (var (name, parameter) in parameters)
@@ -740,7 +748,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         // asking `SCOPE_IDENTITY()` must not be handed a row the last session wrote.
         identity = null;
         Release();
-        DropTemporaryTables();
+        if (temporaries) DropTemporaryTables();
     }
 
     /// A connection given back to the pool comes out of it as a new session, and SQL Server drops
@@ -762,6 +770,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             command.CommandText = $"DROP TABLE IF EXISTS temp.main.{SqlText.Quote(table)}";
             command.ExecuteNonQuery();
         }
+
+        temporaries = false;
     }
 
     static string Text(List<Argument> arguments, int index) =>

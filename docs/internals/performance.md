@@ -205,3 +205,23 @@ Every number here was measured on this code. The user-facing summary is [perform
   Npgsql and SqlClient boxing on the *client* side of the tests. A reference does not box, which is
   why a string and a blob are typed only where it saves a type test, and `Objects` keeps the old
   behaviour for anything with no pair: read as it comes, converted from whatever it turns out to be.
+
+## What a pooled checkout costs
+
+- **`duckdb_tables()` costs the whole catalog, not the rows it is filtered to.** It is a table
+  function: every table in every attached database is materialized -- with its estimated size, its
+  column and constraint counts and its rendered `CREATE` text -- and only then does the `WHERE`
+  choose any of them. Measured on DuckDB 1.5.5 with a lake-shaped catalog, ~17 µs a table and flat
+  in what the filter keeps: 250 tables (50 published over three read layers, plus the write and
+  tombstone tables) answer `WHERE temporary` in 4--9 ms, and a thousand tables in 17 ms, against
+  ~0.3 ms for a trivial statement. Every other spelling costs the same, since they are the same
+  function underneath -- `information_schema.tables`, `SHOW ALL TABLES`, `SHOW TABLES FROM temp`,
+  and `duckdb_tables()` narrowed to `database_name = 'temp'` were all measured and none is cheaper.
+- **Which is why `TdsSession.Reset` asks only when the session made one.** SqlClient announces a
+  reset before the first statement of every pooled checkout, so an ORM that opens and closes around
+  each statement was paying a full catalog enumeration per statement -- growing with the lake and
+  unrelated to anything the client did. A `bool` set in `TdsSession.Command`, where every statement
+  this connection runs goes past, makes the answer free for the sessions that never make a `#table`:
+  `SqlText.MakesTemporary` is asked of SQL duckpg rendered itself, so a false yes only costs the
+  scan that used to be unconditional and a false no is not reachable. The catalog stays the
+  authority on *what* to drop -- the flag decides only whether to look.

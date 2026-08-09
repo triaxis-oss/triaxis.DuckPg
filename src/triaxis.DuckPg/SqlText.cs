@@ -127,6 +127,11 @@ static class SqlText
         };
     }
 
+    /// Whether a statement makes a table belonging to the connection rather than to the lake. Only
+    /// ever asked of SQL duckpg rendered itself -- a client's `#t` and the gateway's own scratch are
+    /// both written here -- so the keyword is known, and a false yes costs only a catalog scan.
+    public static bool MakesTemporary(string sql) => FirstWord(sql) == "CREATE" && FindKeyword(sql, "TEMP") >= 0;
+
     public static string Quote(string identifier) => '"' + identifier.Replace("\"", "\"\"") + '"';
 
     public static string Literal(string value) => '\'' + value.Replace("'", "''") + '\'';
