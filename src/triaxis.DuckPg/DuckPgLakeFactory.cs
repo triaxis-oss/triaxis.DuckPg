@@ -13,7 +13,7 @@ public interface IDuckPgLakeFactory
     Task<Lake> StartAsync(Config config, CancellationToken cancellation = default);
 }
 
-sealed class DuckPgLakeFactory(IServiceProvider parent) : IDuckPgLakeFactory
+sealed class DuckPgLakeFactory(ILoggerFactory loggers) : IDuckPgLakeFactory
 {
     public async Task<Lake> StartAsync(Config config, CancellationToken cancellation = default)
     {
@@ -21,9 +21,13 @@ sealed class DuckPgLakeFactory(IServiceProvider parent) : IDuckPgLakeFactory
         config.Validate();
 
         // A container of its own rather than a scope: each lake is configured differently, and a
-        // scope cannot bring its own registrations. What is worth sharing is shared explicitly.
+        // scope cannot bring its own registrations. A fresh container inherits nothing, so the one
+        // thing that has to cross is passed across -- without it every logger inside resolves to a
+        // null one and a consumer's own logging never hears from the lake.
+        // Injected rather than fetched out of the parent's provider: it is an ordinary dependency,
+        // and `AddDuckPgCommon` has always registered it.
         var services = new ServiceCollection();
-        if (parent.GetService<ILoggerFactory>() is { } loggers) services.AddSingleton(loggers);
+        services.AddSingleton(loggers);
         services.AddDuckPgLake(config);
 
         var provider = services.BuildServiceProvider();
