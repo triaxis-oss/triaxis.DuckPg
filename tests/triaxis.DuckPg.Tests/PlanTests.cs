@@ -24,7 +24,10 @@ public class PlanTests
         return lake.Start();
     }
 
-    static bool Rewritten(List<string> explained) => explained.Any(row => row.Contains("duckpg_"));
+    /// EXPLAIN answers with DuckDB's own plan where one query runs and with the queries themselves
+    /// where more than one does -- so which of the two came back *is* the question being asked here.
+    static bool Listed(List<string> explained) =>
+        explained.Any(row => row.StartsWith("step ") || row.StartsWith("check "));
 
     // ---- the one-statement path ------------------------------------------------------------------
 
@@ -35,18 +38,18 @@ public class PlanTests
 
         var explained = lake.Query("EXPLAIN UPDATE lake.orders SET note = 'probe' WHERE order_id = 1");
 
-        Assert.False(Rewritten(explained));
+        Assert.False(Listed(explained));
         Assert.Contains(explained, row => row.Contains("UPDATE"));
     }
 
     [Fact]
-    public void ALayeredUpdateIsStillRewritten()
+    public void ALayeredUpdateIsStillListed()
     {
         using var lake = Started(Lake(), materialized: false);
 
         var explained = lake.Query("EXPLAIN UPDATE lake.orders SET note = 'probe' WHERE order_id = 1");
 
-        Assert.True(Rewritten(explained));
+        Assert.True(Listed(explained));
         Assert.Contains(explained, row => row.Contains("duckpg_updated"));
     }
 
@@ -59,7 +62,7 @@ public class PlanTests
     {
         using var lake = Started(Lake());
 
-        Assert.True(Rewritten(lake.Query("EXPLAIN " + sql)));
+        Assert.True(Listed(lake.Query("EXPLAIN " + sql)));
     }
 
     [Fact]
@@ -69,16 +72,16 @@ public class PlanTests
 
         var explained = lake.Query("EXPLAIN DELETE FROM lake.orders WHERE order_id = 1");
 
-        Assert.False(Rewritten(explained));
+        Assert.False(Listed(explained));
         Assert.Contains(explained, row => row.Contains("DELETE"));
     }
 
     [Fact]
-    public void ALayeredDeleteIsStillRewritten()
+    public void ALayeredDeleteIsStillListed()
     {
         using var lake = Started(Lake(), materialized: false);
 
-        Assert.True(Rewritten(lake.Query("EXPLAIN DELETE FROM lake.orders WHERE order_id = 1")));
+        Assert.True(Listed(lake.Query("EXPLAIN DELETE FROM lake.orders WHERE order_id = 1")));
     }
 
     /// A delete that has to hand its keys to something else keeps the plan that writes them down.
@@ -89,7 +92,7 @@ public class PlanTests
     {
         using var lake = Started(Lake());
 
-        Assert.True(Rewritten(lake.Query("EXPLAIN " + sql)));
+        Assert.True(Listed(lake.Query("EXPLAIN " + sql)));
     }
 
     // ---- and it is still the same write ----------------------------------------------------------
@@ -139,6 +142,74 @@ public class PlanTests
 
         lake.Restart();
         Assert.Equal(["1|probe", "2|b"], lake.Query("SELECT order_id, note FROM lake.orders ORDER BY order_id"));
+    }
+
+    // ---- who asks about the key ------------------------------------------------------------------
+
+    /// The table's own PRIMARY KEY sees everything the lake publishes, so the scan that asks the
+    /// same question first is not run -- and what DuckDB refuses is reported in the words the
+    /// question would have refused in, down to the SQLSTATE.
+    [Fact]
+    public void AMaterializedInsertIsRefusedByTheTableInTheRulesOwnWords()
+    {
+        using var lake = Started(Lake());
+
+        Assert.False(Listed(lake.Query("EXPLAIN INSERT INTO lake.orders (order_id, amount) VALUES (1, 5)")));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 5)"));
+        Assert.Equal("23505", refused.SqlState);
+        Assert.Contains("Violation of PRIMARY KEY constraint on \"orders\"", refused.MessageText);
+    }
+
+    /// A layered lake has to ask, since the write branch's own key sees only what this process
+    /// wrote -- and the answer reads the same either way.
+    [Fact]
+    public void ALayeredInsertIsStillAskedFirst()
+    {
+        using var lake = Started(Lake(), materialized: false);
+
+        Assert.True(Listed(lake.Query("EXPLAIN INSERT INTO lake.orders (order_id, amount) VALUES (1, 5)")));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 5)"));
+        Assert.Equal("23505", refused.SqlState);
+    }
+
+    /// A write that takes rows away before putting them back has to be asked first even when DuckDB
+    /// would refuse it: the steps are not one transaction, so a refusal at the insert lands after
+    /// the eviction has committed and the rows are gone.
+    [Fact]
+    public void AMaterializedKeyMoveIsStillAskedFirstSoTheRowsSurvive()
+    {
+        using var lake = Started(Lake());
+
+        Assert.True(Listed(lake.Query("EXPLAIN UPDATE lake.orders SET order_id = 2 WHERE order_id = 1")));
+
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("UPDATE lake.orders SET order_id = 2 WHERE order_id = 1"));
+        Assert.Equal(["1|a", "2|b"], lake.Query("SELECT order_id, note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// A unique index the dacpac declared is a rule the gateway never had words for, so what DuckDB
+    /// says about one is what comes back -- dressing it as a key violation would name the wrong
+    /// constraint.
+    [Fact]
+    public void AUniqueThatIsNotTheKeyIsRefusedInDuckDbsOwnWords()
+    {
+        using var lake = new TestLake(nameof(AUniqueThatIsNotTheKeyIsRefusedInDuckDbsOwnWords))
+            .Json("base", "orders", """[{"order_id": 1, "note": "a"}, {"order_id": 2, "note": "b"}]""")
+            .Stack("base")
+            .WriteTo("local");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), new Dacpac.TableModel(
+            "orders", [("order_id", "int"), ("note", "nvarchar")], ["order_id"],
+            Uniques: [("UQ_orders_note", ["note"], false)]));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Materialized().Start();
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.orders (order_id, note) VALUES (3, 'a')"));
+        Assert.DoesNotContain("PRIMARY KEY", refused.MessageText);
     }
 
     // ---- EXPLAIN ---------------------------------------------------------------------------------

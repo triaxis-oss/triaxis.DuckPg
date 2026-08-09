@@ -138,8 +138,9 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   floor a round trip cannot go below. **~95% of the difference was statement preparation** -- a CPU sampling profile put two thirds in `PrepareMultiple` alone -- so
   what four statements cost is mostly that there are four of them: the cost was flat in table size
   (5.8 ms over 164k rows, 10.2 over 490) and most of it survived on a one-table lake with no dacpac.
-  An INSERT was already one statement and did not move; what it pays past the write is
-  `Gateway.Duplicates`, measured at 3.23 ms against 1.49 with `checkKeys` off.
+  An INSERT was already one statement, and what it paid past the write was `Gateway.Duplicates`
+  asking a question the table's own `PRIMARY KEY` answers -- 3.23 ms against 1.48 once it stopped
+  being asked. That is [a key's to explain](schema.md#keys), not a plan's.
 - **`MERGE ... WHEN MATCHED THEN UPDATE` is an update joined to its source**, and the parser
   desugars it to exactly that -- target, alias, `USING` as `From`, `ON` as `Where`. That is why
   `UpdateStatement` carries an alias at all, and why `Gateway.RewriteUpdate` had to learn the

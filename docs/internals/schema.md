@@ -105,6 +105,18 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   opt-out for a lake whose writers are known to send fresh keys, and it is one condition in
   `Gateway.Duplicates` rather than a second path. What it gives back is the scan and not the rule:
   materialized, the index still holds the key, so only a layered lake is left with nothing.
+- **A materialized table is not asked twice about a key it already holds.** Its `PRIMARY KEY` sees
+  everything the lake publishes, so `Gateway.Duplicates` runs no query for one and keeps only the
+  words: `Plan.Violation` carries the message and `23505` the check would have refused in, and a
+  session reports them in place of DuckDB's when a step is refused for a key. Measured, one insert:
+  3.23 ms asking first against 1.48 leaving it to the table. **Only where the statement writes
+  without first taking anything away** -- `replacing`, which is the update form. A plan that replaces
+  evicts before it re-inserts and its steps are not one transaction, so a key refused at the insert
+  is refused after the eviction has committed and the rows are simply gone. That is what a check
+  running *before* a plan is for, and a constraint underneath it does not change it. A declared
+  unique that is not the key keeps DuckDB's own words, since the gateway never had any for it and
+  `Violation.Caused` matches only a primary key: dressing one as the other would name the wrong
+  constraint.
 - **The two modes enforce differently because they are asked different things, and closing that is
   not the improvement it looks like.** Layered is how a lake is read: many layers, few or no writers,
   questions that scan. Materialized is how one is written against -- a test suite standing a lake up,

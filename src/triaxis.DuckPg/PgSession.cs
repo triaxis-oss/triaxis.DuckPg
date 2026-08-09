@@ -270,11 +270,8 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         if (plan.Kind != PlanKind.Rows) { wire.Send('n'); return; }
 
         // Executing here is what makes the row description available; Execute drains the reader.
-        Written(plan, portal.Arguments);
-        portal.Command = Command(plan.Steps[^1], portal.Arguments);
-        portal.Reader = Execute(portal.Command);
-        portal.Columns = Columns(portal.Reader, portal.ResultFormats);
-        SendRowDescription(portal.Reader, portal.Columns);
+        Open(plan, portal);
+        SendRowDescription(portal.Reader!, portal.Columns!);
     }
 
     /// Describing an unexecuted statement means binding it without values. DuckDB cannot do that
@@ -312,15 +309,9 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         // Execute never sends a row description -- the client already asked for one via Describe.
         if (plan.Kind == PlanKind.Rows)
         {
-            if (portal.Reader is null)
-            {
-                Written(plan, portal.Arguments);
-                portal.Command = Command(plan.Steps[^1], portal.Arguments);
-                portal.Reader = Execute(portal.Command);
-                portal.Columns = Columns(portal.Reader, portal.ResultFormats);
-            }
+            if (portal.Reader is null) Open(plan, portal);
 
-            var sent = Stream(portal.Reader, maxRows, portal.Columns!);
+            var sent = Stream(portal.Reader!, maxRows, portal.Columns!);
             if (maxRows > 0 && sent == maxRows) { wire.Send('s'); return; }
             portal.Reset();
             wire.Send('C', new Msg().Str($"SELECT {sent}"));
@@ -403,12 +394,34 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
     // ---- execution -------------------------------------------------------------------------------
 
+    /// A rows plan's writes, and the reader its answer comes off. The two belong together because a
+    /// plan can be both -- a keyed write against a materialized table is one statement that writes
+    /// and answers -- and because a key DuckDB refuses can come from either half.
+    void Open(Plan plan, Portal portal)
+    {
+        try
+        {
+            Written(plan, portal.Arguments);
+            portal.Command = Command(plan.Steps[^1], portal.Arguments);
+            portal.Reader = Execute(portal.Command);
+            portal.Columns = Columns(portal.Reader, portal.ResultFormats);
+        }
+        catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
+        {
+            throw new PgError(refused.SqlState, refused.Message);
+        }
+    }
+
     void RunPlan(Plan plan, object?[] arguments, short[] resultFormats)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
         try
         {
             Perform(plan, arguments, resultFormats);
+        }
+        catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
+        {
+            throw new PgError(refused.SqlState, refused.Message);
         }
         finally
         {

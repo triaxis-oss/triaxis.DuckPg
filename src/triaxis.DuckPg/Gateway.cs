@@ -38,9 +38,28 @@ sealed record Identity(string Table, string Column)
     }
 }
 
+/// What a rule DuckDB holds means to a client, carried beside the plan that can break it. A layered
+/// lake asks first, since DuckDB sees only the rows this process wrote; a materialized table is
+/// asked by DuckDB itself, and answers in its own words -- so the plan brings the words the client
+/// would have been given either way.
+sealed record Violation(string Message, string SqlState)
+{
+    /// Only a key. A unique index the dacpac declared is a rule the gateway never had words for,
+    /// and dressing one of those as a PRIMARY KEY violation would name the wrong constraint.
+    public bool Caused(Exception error) =>
+        error.Message.Contains("Constraint Error") && error.Message.Contains("primary key constraint");
+}
+
+/// The two ways one statement can be refused for a key: the question asked before it runs, and the
+/// words for what DuckDB refuses on its own. A lake uses one or the other and never both.
+readonly record struct KeyRule(Check[] Checks, Violation? Violation)
+{
+    public static readonly KeyRule None = new([], null);
+}
+
 sealed record Plan(PlanKind Kind, string[] Steps, string Tag, string? Affected = null, string[]? Dirty = null,
                    string[]? Promoted = null, string[]? Tombstoned = null, Check[]? Checks = null,
-                   Identity? Identity = null)
+                   Identity? Identity = null, Violation? Violation = null)
 {
     /// Which step returns that key: the last one, unless the plan answers with rows of its own --
     /// and then the one before the answer, since the write comes first and the answer is read off
@@ -320,7 +339,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // compare.
         var duplicates = table.Key.All(k => columns.Contains(k, StringComparer.OrdinalIgnoreCase))
             ? Duplicates(table, $"SELECT {KeyList(table)} FROM {Source(columns, returning > 0 ? rest[..returning] : rest)}")
-            : [];
+            : KeyRule.None;
 
         if (returning > 0)
             return RewriteReturning(table, columns, rest, returning, duplicates);
@@ -341,16 +360,27 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var identity = Identifying(table, generated);
 
         return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}{Returns(identity)}")
-            with { Dirty = [table.Name], Checks = duplicates, Identity = identity });
+            with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation, Identity = identity });
     }
 
-    /// A declared key is a rule about rows that may live in any layer, so it is kept here rather than
-    /// by DuckDB. The write branch's own PRIMARY KEY sees only what this process wrote -- a key a
-    /// file below already holds is one it lets through, and the row then quietly shadows the file's
-    /// instead of being refused. A materialized table carries no constraint at all: it is built as a
-    /// copy of the merge, and `CREATE TABLE AS` keeps no key. So both halves are asked of the rows
-    /// a statement is about to write: a key the table already publishes, and one the rows repeat
-    /// among themselves.
+    /// A declared key is a rule about rows that may live in any layer, so for a layered lake it is
+    /// kept here rather than by DuckDB. The write branch's own PRIMARY KEY sees only what this
+    /// process wrote -- a key a file below already holds is one it lets through, and the row then
+    /// quietly shadows the file's instead of being refused. So both halves are asked of the rows a
+    /// statement is about to write: a key the table already publishes, and one the rows repeat among
+    /// themselves.
+    ///
+    /// A materialized table holds its key as a real PRIMARY KEY, which sees everything the lake
+    /// publishes because that is all there is. Asking first is then asking twice, and the scan
+    /// behind the question is most of what a write costs -- 3.23 ms an insert against 1.49 without
+    /// it. So the question is not asked and only the answer is kept: `Violation` carries the words
+    /// this would have refused in, and a session reports them in place of DuckDB's.
+    ///
+    /// Only where the statement writes without first taking anything away, which is what `replacing`
+    /// says. A plan that replaces evicts the rows before it re-inserts them, and its steps are not
+    /// one transaction -- so a key DuckDB refuses at the insert is refused after the delete has
+    /// committed, and the rows are simply gone. That is the whole reason a check runs *before* a
+    /// plan rather than being left to the write, and it does not stop being true here.
     ///
     /// `keys` produces the key each row will land under, and -- where the statement replaces rows as
     /// it writes them, which an UPDATE does -- the key each is taking away beside it. A row landing
@@ -362,9 +392,15 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// merge and is the floor. Measured on a two-layer 25k-row lake: 6.95 ms for the insert form
     /// against 6.45 for a bare `count(*)` over the same view, where a correlated EXISTS cost 7.62;
     /// and 10.87 for the update form against 15.89 for the same question asked with three scans.
-    Check[] Duplicates(Table table, string keys, bool replacing = false)
+    KeyRule Duplicates(Table table, string keys, bool replacing = false)
     {
-        if (table.Key.Length == 0 || !Config.CheckKeys) return [];
+        if (table.Key.Length == 0 || !Config.CheckKeys) return KeyRule.None;
+
+        var refused = new Violation(
+            $"Violation of PRIMARY KEY constraint on \"{table.Name}\". Cannot insert duplicate key in object " +
+            $"\"{Config.Schema}.{table.Name}\".", "23505");
+
+        if (table.Materialized && !replacing) return new KeyRule([], refused);
 
         var matched = string.Join(" AND ", table.Key.Select(k =>
             $"t.{SqlText.Quote(k)} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"));
@@ -375,15 +411,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                   $"o.{SqlText.Quote(Was(k))} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"))
             : "";
 
-        return [new Check(
+        return new KeyRule([new Check(
             $"WITH \"_keys\" AS MATERIALIZED ({keys}) " +
             $"SELECT 1 FROM (SELECT {KeyList(table)}, count(*) AS \"_count\" FROM \"_keys\" " +
             $"GROUP BY {KeyList(table)}) AS r WHERE r.\"_count\" > 1 " +
             $"UNION ALL SELECT 1 FROM \"_keys\" AS r " +
             $"SEMI JOIN {table.QualifiedName} AS t ON {matched}{kept} LIMIT 1",
-            $"Violation of PRIMARY KEY constraint on \"{table.Name}\". Cannot insert duplicate key in object " +
-            $"\"{Config.Schema}.{table.Name}\".",
-            "23505")];
+            refused.Message, refused.SqlState)], refused);
     }
 
     static string KeyList(Table table) => string.Join(", ", table.Key.Select(SqlText.Quote));
@@ -400,7 +434,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// store-generated key back. The rows are materialized first, so what the store generates is
     /// decided once and can be both written down and answered from; the answer is the last step,
     /// which is what makes this a plan that returns rows with a write in front of it.
-    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning, Check[] duplicates)
+    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning, KeyRule duplicates)
     {
         var select = rest[(MatchingParen(rest) + 1)..returning];
         var from = SqlText.FindKeyword(select, "FROM");
@@ -448,7 +482,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $" {source}",
             $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written{Returns(identity)}",
             $"SELECT {answered} FROM duckpg_written"],
-            "INSERT") with { Dirty = [table.Name], Checks = duplicates, Identity = identity });
+            "INSERT") with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation, Identity = identity });
     }
 
     /// The declared identities a statement does not name, and so leaves to the store.
@@ -588,7 +622,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                              $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}")) +
                          $" FROM {scan} WHERE {checking}",
                          replacing: true)
-            : [];
+            : KeyRule.None;
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.
@@ -604,10 +638,14 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         if (answered is not null)
             return Promoting(table, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_updated"], "UPDATE")
-                with { Dirty = [table.Name], Checks = duplicates }, tombstones);
+                with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation }, tombstones);
 
         return Promoting(table, Plan.Count("UPDATE", steps)
-            with { Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name], Checks = duplicates },
+            with
+            {
+                Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name],
+                Checks = duplicates.Checks, Violation = duplicates.Violation,
+            },
             tombstones);
     }
 

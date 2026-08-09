@@ -45,6 +45,13 @@ all of what went was time spent *preparing* four statements rather than running 
 way. The plan is still what runs for a layered lake, and for an `UPDATE ... FROM`, a row-limited
 write, a moved key or a cascade, since each of those is something one statement cannot do.
 
+An `INSERT` was already one statement, and what it paid past the write was being asked about a key
+the table's own `PRIMARY KEY` already answers — 3.23 ms against 1.48 once it stopped being asked.
+What DuckDB refuses comes back in the same words and under the same `23505` the question used, so
+nothing about that changes but the time. A write that *replaces* rows is still asked first: its steps
+are not one transaction, so a key refused at the insert would be refused after the eviction had
+already committed.
+
 **`EXPLAIN <statement>`** answers for what the gateway will actually run, which is not always what
 was sent. Where that is a single query — every read, and a keyed write against a materialized table —
 it is DuckDB's own plan, cost and all. Where it is several, it lists them in order, because a step

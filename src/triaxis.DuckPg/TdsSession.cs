@@ -293,6 +293,10 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             Perform(msg, plan, parameters, doneToken, last, translated);
         }
+        catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
+        {
+            throw new PgError(refused.SqlState, refused.Message);
+        }
         finally
         {
             if (transactions == 0) Release();
