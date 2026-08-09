@@ -21,6 +21,10 @@ public class ServeCommand : LakeCommand
     [Option("--writable", Description = "Accept writes without a write directory; they are lost on exit.")]
     public bool Writable { get; set; }
 
+    [Option("--base", Description = "A baked database to serve instead of layers, copied on the way up and never written to. " +
+                                    "Needs no dacpac, no key and no configuration: the file carries them.")]
+    public string? Base { get; set; }
+
     [Option("--materialize", Description = "Collapse the layers into real DuckDB tables and serve those; nothing is kept but a delta at shutdown.")]
     public bool Materialize { get; set; }
 
@@ -82,6 +86,7 @@ public class ServeCommand : LakeCommand
         if (Tds is not null) config.Tds = Tds;
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;
+        if (Base is not null) config.Base = Path.GetFullPath(Base);
         if (Materialize) config.Materialize = true;
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;

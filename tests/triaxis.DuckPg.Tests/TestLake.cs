@@ -151,6 +151,16 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// Served from a database a bake wrote rather than from the layers it was baked from. The
+    /// layers go with it: a base is a whole lake already collapsed, and one underneath it would
+    /// have to be merged with it.
+    public TestLake FromBase(string file = "baked.duckdb")
+    {
+        Config.Base = At(file);
+        Config.Layers = [];
+        return this;
+    }
+
     public void Stop()
     {
         lake?.StopAsync(CancellationToken.None).GetAwaiter().GetResult();

@@ -35,6 +35,18 @@ public sealed class Config
     /// directory gets on a clean shutdown.
     public bool Materialize { get; set; }
 
+    /// A baked database served instead of layers: the tables a materialized lake would have built,
+    /// already built, with their keys, indexes, defaults and declared views in them. It is copied on
+    /// the way up and never written to -- what a run does to its copy goes out as a delta against it
+    /// at shutdown, exactly as a materialized lake's does against the layers it was cut from. So
+    /// nothing is scanned, described, parsed or merged to start one, which is what makes a fresh
+    /// instance of the same state cheap enough to take a thousand of.
+    public string? Base { get; set; }
+
+    /// Whether the lake is served as real tables rather than as views over layers. A base is a
+    /// materialized lake somebody else already collapsed, so everything true of one is true of it.
+    internal bool Collapsed => Materialize || Base is { Length: > 0 };
+
     /// Where a materialized lake's tables live, as a DuckDB database file, rather than in memory.
     /// Only meaningful with `Materialize`, which is what makes the tables tables. What the file then
     /// means is `StoreMode`'s.
@@ -159,6 +171,7 @@ public sealed class Config
     {
         Layers = [.. Layers.Select(l => Path.GetFullPath(l, baseDirectory))];
         if (Write is not null) Write = Path.GetFullPath(Write, baseDirectory);
+        if (Base is not null) Base = Path.GetFullPath(Base, baseDirectory);
         if (Store is not null) Store = Path.GetFullPath(Store, baseDirectory);
         if (Dacpac is not null) Dacpac = Path.GetFullPath(Dacpac, baseDirectory);
     }
@@ -189,10 +202,26 @@ public sealed class Config
         if (Dacpac is { Length: > 0 } dacpac && !File.Exists(dacpac))
             throw new DuckPgConfigurationException($"dacpac not found: {dacpac}");
 
+        if (Base is { Length: > 0 } baked)
+        {
+            if (!File.Exists(baked))
+                throw new DuckPgConfigurationException($"baked database not found: {baked}");
+
+            // A base is the whole of what the lake publishes, already merged. Layers under it would
+            // have to be merged with it, which is the work it exists to have done already -- and the
+            // rows it holds came from layers of its own, so this is nearly always the stack it was
+            // baked from, left behind.
+            if (Layers.Length > 0)
+                throw new DuckPgConfigurationException(
+                    $"`base` serves {baked}, which is a whole lake already collapsed, and " +
+                    $"{Layers.Length} layer {(Layers.Length == 1 ? "directory" : "directories")} " +
+                    "were given as well -- bake them in, or serve the layers instead of the base");
+        }
+
         // A store holds tables, and only a materialized lake has any: the views a layered one
         // publishes would be kept beside write-layer tables that the layer files also still hold,
         // and the next start would apply every write twice.
-        if (Store is { Length: > 0 } && !Materialize)
+        if (Store is { Length: > 0 } && !Collapsed)
             throw new DuckPgConfigurationException(
                 "`store` keeps a materialized lake, so it needs `materialize`: without it a lake " +
                 "publishes views over the layer files, and there is nothing in a database file to keep");
@@ -212,7 +241,7 @@ public sealed class Config
                 $"also the schema this lake publishes into -- DuckDB cannot tell the two apart, so " +
                 $"name the file something else or set `schema`");
 
-        if (Materialize) ValidateSessionless("materialize");
+        if (Collapsed) ValidateSessionless(Base is { Length: > 0 } ? "a baked database" : "materialize");
 
         // A cache inside a layer would be read back as part of the lake on the next build -- every
         // materialized table arriving a second time, as a layer of its own.
