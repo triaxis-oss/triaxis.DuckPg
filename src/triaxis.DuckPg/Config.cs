@@ -168,6 +168,14 @@ public sealed class Config
             throw new DuckPgConfigurationException(
                 "no front door to open: set `listen` for the PostgreSQL protocol, `tds` for SQL Server's, or both");
 
+        ValidateShape();
+    }
+
+    /// The same questions asked of a configuration nothing is served from: `duckpg bake` builds the
+    /// catalog these layers describe and opens no door at all, so everything but the door is its
+    /// question too.
+    internal void ValidateShape()
+    {
         foreach (var layer in Layers)
             if (!Directory.Exists(layer))
                 throw new DuckPgConfigurationException($"layer directory not found: {layer}");
@@ -198,39 +206,47 @@ public sealed class Config
                 $"also the schema this lake publishes into -- DuckDB cannot tell the two apart, so " +
                 $"name the file something else or set `schema`");
 
-        // A filter and a `getvariable()` column are answered per session, and a table shared by
-        // every session cannot carry either. Refused rather than dropped: a mode that silently
-        // stopped filtering rows would be the worst way to find this out.
-        if (Materialize)
-        {
-            foreach (var (name, table) in Tables)
-                if (table.Filter is { Length: > 0 })
-                    throw new DuckPgConfigurationException(
-                        $"table {name} declares a `filter`, which materialize cannot bake into a " +
-                        "table every session shares -- it is answered per session or not at all");
-
-            foreach (var column in Columns.Concat(Tables.Values.SelectMany(t => t.Columns)))
-                if (column.Expr is { } expr && expr.Contains("getvariable", StringComparison.OrdinalIgnoreCase))
-                    throw new DuckPgConfigurationException(
-                        $"column {column.Name} reads a session variable, which materialize cannot " +
-                        "bake into a table every session shares");
-        }
+        if (Materialize) ValidateSessionless("materialize");
 
         // A cache inside a layer would be read back as part of the lake on the next build -- every
         // materialized table arriving a second time, as a layer of its own.
-        if (Cache is { Length: > 0 } cache)
-            foreach (var directory in (string?[])[.. Layers, Write])
-                if (directory is not null && Under(cache, directory))
-                    throw new DuckPgConfigurationException(
-                        $"cache directory {cache} is inside the layer {directory}, " +
-                        "where the lake would read its own copies back");
+        if (Cache is { Length: > 0 } cache && Inside(cache) is { } inside)
+            throw new DuckPgConfigurationException(
+                $"cache directory {cache} is inside the layer {inside}, " +
+                "where the lake would read its own copies back");
     }
 
-    /// Compared as directories rather than as text, so `/lake-cache` is not a child of `/lake`.
-    static bool Under(string path, string directory)
+    /// A filter and a `getvariable()` column are answered per session, and rows every session shares
+    /// cannot carry either -- a materialized table and a baked parquet alike. Refused rather than
+    /// dropped: a mode that silently stopped filtering rows would be the worst way to find this out.
+    internal void ValidateSessionless(string mode)
     {
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory)) + Path.DirectorySeparatorChar;
-        return Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        foreach (var (name, table) in Tables)
+            if (table.Filter is { Length: > 0 })
+                throw new DuckPgConfigurationException(
+                    $"table {name} declares a `filter`, which {mode} cannot fold into rows every " +
+                    "session shares -- it is answered per session or not at all");
+
+        foreach (var column in Columns.Concat(Tables.Values.SelectMany(t => t.Columns)))
+            if (column.Expr is { } expr && expr.Contains("getvariable", StringComparison.OrdinalIgnoreCase))
+                throw new DuckPgConfigurationException(
+                    $"column {column.Name} reads a session variable, which {mode} cannot fold into " +
+                    "rows every session shares");
+    }
+
+    /// The layer directory a path lies in, itself included, or null when it lies outside all of
+    /// them. A copy of what the lake publishes written there is read back as part of the lake on the
+    /// next build.
+    internal string? Inside(string path) =>
+        ((string?[])[.. Layers, Write]).FirstOrDefault(d => d is { Length: > 0 } && Within(path, d));
+
+    /// Compared as directories rather than as text, so `/lake-cache` is not a child of `/lake`.
+    static bool Within(string path, string directory)
+    {
+        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+        var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+        return full.Equals(root, StringComparison.OrdinalIgnoreCase)
+            || full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 }
 

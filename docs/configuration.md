@@ -6,8 +6,10 @@ positional, and the flag wins where both are given; argument paths are relative 
 directory, file paths to the file.
 
 **Nothing is read unless it is named.** There is no default file: a tool that helped itself to a
-`duckpg.yaml` from whatever directory it was started in would be serving a lake nobody pointed it at.
-A file that is named has to exist, so a typo is an error rather than a silent fall back to defaults.
+`duckpg.yaml` from whatever directory it was started in would be serving a lake nobody pointed it at,
+and would hand `bake` the file describing the lake being *served* rather than the one being written
+out. A file that is named has to exist, so a typo is an error rather than a silent fall back to
+defaults.
 
 ## Keys
 
@@ -38,6 +40,28 @@ A file that is named has to exist, so a typo is an error rather than a silent fa
 | `tables.<name>.writable` | — | Opts one table out of a writable lake, or into a read-only one. |
 | `tables.<name>.columns` | — | Virtual columns for this table. |
 | `tables.<name>.filter` | — | Predicate ANDed into the view. |
+
+## The bake subcommand
+
+`duckpg bake … --out <dir>` builds the same lake and writes it out as parquet instead of serving it,
+so it reads the same keys and the same arguments — `layers`, `write`, `defaultKey`, `dacpac`,
+`installDuckDb` and the per-table `key` and `columns` blocks. `--out` is its own and is required.
+It has flags for those keys and for nothing else: serving's own options belong to `duckpg` and are
+refused in front of the verb rather than silently dropped there.
+
+Usually a bake needs no file at all, since what it merges by is `--key` and a dacpac. Name one with
+`-c` for a lake whose shape is in `tables:` blocks a flag cannot carry, and name the file describing
+the lake being *baked* — the one describing where the result is served from is a different lake, and
+it is the reason neither command reads a file it was not given.
+
+No door is opened, so `listen` and `tds` say nothing, and `cache` only decides how the rows are
+reached on the way out. `write` is read because a write layer is the only layer whose files do not
+say everything it holds — its deletes live in a `.deleted/` sidecar the layer scan skips — so a bake
+told about it applies those and a bake handed the same directory as a plain layer would bake the
+hidden rows back in. Two things are refused rather than baked: a table with a `filter:`, which is
+answered per session and cannot be a file every session reads, and `materialize` (and the `store` that
+needs it), since collapsing the layers is what a bake already does.
+See [performance](performance.md#baking-the-layers-once).
 
 ## Columns the files do not contain
 

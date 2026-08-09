@@ -873,14 +873,35 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     static string Scan(string file) =>
         $"read_parquet({SqlText.Literal(file)}, hive_partitioning=false)";
 
+    /// Whether a declared default decides which row shadows which. One on a key column does: the
+    /// merge partitions by that key, so a row whose file left the column empty is only under the
+    /// default's value once the default has been applied -- and a copy written without it would be
+    /// merged differently by whoever read it back.
+    bool KeyedByDefault(Table table) =>
+        table.Key.Any(k => table.Columns.Any(c => Same(c.Name, k) && c.Default is not null));
+
     /// Whether a declared default can be left out of the copy and applied by the view reading it.
-    /// It can where nothing in the merge depends on it: a default on a key column decides which row
-    /// shadows which, and a filter or a virtual column reads the merged row, defaults and all. A
-    /// copy is a file that outlives the process that wrote it, so a default it does not carry is
-    /// stamped by whoever reads it -- which is what `(getdate())` meant before there was a copy.
+    /// It can where nothing in the merge depends on it: a filter or a virtual column reads the
+    /// merged row, defaults and all. A copy is a file that outlives the process that wrote it, so a
+    /// default it does not carry is stamped by whoever reads it -- which is what `(getdate())` meant
+    /// before there was a copy.
     bool Deferrable(Table table) =>
-        table.Filter is null && table.Virtuals.Count == 0 &&
-        !table.Key.Any(k => table.Columns.Any(c => Same(c.Name, k) && c.Default is not null));
+        table.Filter is null && table.Virtuals.Count == 0 && !KeyedByDefault(table);
+
+    /// What a bake writes for a table: the merge exactly as it is published, with the declared
+    /// defaults left to whoever reads the file back. A default is a *value* in a read layer because
+    /// a row in a file that predates the question has to be stamped with something -- but a baked
+    /// file outlives the run that wrote it, so freezing `(getdate())` into it would answer every
+    /// later run with the moment this one started. Left empty, the next run stamps it, which is what
+    /// the default meant before there was a bake.
+    ///
+    /// Except where the default decides the merge rather than only filling a gap in it: a row is
+    /// identified by its key, and deferring a default on one would shadow the wrong row here instead
+    /// of later. That one is written out. A virtual column is not the same question it is for a
+    /// copy -- a bake does not write one, and the run that reads the file computes it from columns
+    /// that default in front of it, exactly as this one did.
+    public string Baked(Table table) =>
+        Merged(table, Promoted(table), Tombstoned(table), defaults: KeyedByDefault(table));
 
     /// The view over a copy: the stored column, with a deferred default over the top.
     string Over(Table table, string file) =>
@@ -1167,7 +1188,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (Underlay(table) is { } copy)
             return Wrap(table, writable, tombstones, [
                 "SELECT " + string.Join(", ", table.Columns.Select(c =>
-                     (Filled(table, c) is { } fill ? $"COALESCE({SqlText.Quote(c.Name)}, {fill})" : SqlText.Quote(c.Name))
+                     (defaults && Filled(table, c) is { } fill ? $"COALESCE({SqlText.Quote(c.Name)}, {fill})" : SqlText.Quote(c.Name))
                      + $" AS {SqlText.Quote(c.Name)}")) +
                  $", NULL::VARCHAR AS \"_file\", 0::BIGINT AS \"_seq\" FROM {Scan(copy)}",
                 .. writable

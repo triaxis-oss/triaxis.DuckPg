@@ -41,8 +41,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 
 Positional arguments are the layer directories, lowest first; everything else has both a flag and a
 key in a configuration file, which is read only when `-c` names one — see
-[configuration](docs/configuration.md). `--tds 127.0.0.1:1433` opens the
-SQL Server door beside the PostgreSQL one, and a lake needs at least one of them.
+[configuration](docs/configuration.md). `--tds 127.0.0.1:1433` opens the SQL Server door beside the
+PostgreSQL one, and a lake needs at least one of them.
 
 Tables are published into one schema, `lake` by default and `--schema` otherwise, and you never have
 to name it: it goes in front of every session's search path, so `SELECT * FROM orders` works on a
@@ -81,6 +81,30 @@ database file is needed anywhere.
 That merge is bound by DuckDB on every execution, which on a wide table over several layers is most
 of the cost of a read. `--cache` writes the merged rows out once as parquet, and `--materialize`
 collapses the stack into real tables at build — worth about 3.7× on a small ORM query.
+
+## Baking the layers
+
+Every start parses each YAML and JSON layer again and infers its types again. `duckpg bake` pays that
+once and leaves an ordinary layer directory behind:
+
+```shell
+duckpg bake ./common ./tenant --write ./local --key id --out ./baked
+duckpg ./baked --key id
+```
+
+One parquet a table, holding what the stack published, so the run that serves it has a single file to
+scan. It takes the same layer arguments as serving does, opens no port, and writes nothing but the
+output directory, which has to be outside the layers. Like serving, it reads a configuration file
+only when `-c` names one — so the file describing where the baked layer is *served* from is never the
+file describing what it was baked from.
+
+**Using the baked layer is the same lake as using the layers it came from** — that is the whole
+contract, and it is why the command is told the key and the write directory: without a key the layers
+concatenate instead of shadowing, and a write layer's deletes live in a `.deleted/` sidecar the layer
+scan skips, so a bake handed that directory as an ordinary layer would put the rows it hides back in.
+What the configuration adds *on top* of a table stays where it was: virtual columns and declared
+defaults belong to the run reading the file, not to the file. What cannot be kept identical is
+refused rather than written.
 
 ## Documentation
 
