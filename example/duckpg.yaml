@@ -1,7 +1,12 @@
-# Everything here has a command-line equivalent except the per-table blocks at the bottom,
-# which is what does not fit an argument.
+# Read only when it is named, which is what `-c` is for: nothing here is picked up by a bare
+# `duckpg` started in this directory.
 #
-#   duckpg ./common ./tenant --write ./local
+#   duckpg -c duckpg.yaml
+#
+# Everything here has a command-line equivalent except the per-table blocks at the bottom,
+# which is what does not fit an argument -- so most of this lake is also just:
+#
+#   duckpg ./common ./tenant ./warehouse --write ./local --key customer_id
 #
 listen: 127.0.0.1:55432
 # The same lake over the protocol SqlClient speaks; the connection string needs Encrypt=False.

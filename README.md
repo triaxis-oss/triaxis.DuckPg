@@ -40,7 +40,8 @@ psql -h 127.0.0.1 -p 55432 -U admin -d lake
 ```
 
 Positional arguments are the layer directories, lowest first; everything else has both a flag and a
-key in `duckpg.yaml` — see [configuration](docs/configuration.md). `--tds 127.0.0.1:1433` opens the
+key in a configuration file, which is read only when `-c` names one — see
+[configuration](docs/configuration.md). `--tds 127.0.0.1:1433` opens the
 SQL Server door beside the PostgreSQL one, and a lake needs at least one of them.
 
 Tables are published into one schema, `lake` by default and `--schema` otherwise, and you never have
@@ -53,7 +54,7 @@ wire messages in both directions. Ctrl+C and SIGTERM shut down cooperatively, an
 `CALL duckpg_reload()` rebuilds the catalog from the filesystem without one.
 
 See [`example/`](example) for a lake with all three formats, a `db=…` partitioned layer, a write
-layer, virtual columns and per-user filtering — `cd example && duckpg`.
+layer, virtual columns and per-user filtering — `cd example && duckpg -c duckpg.yaml`.
 
 ## What a lake is made of
 
