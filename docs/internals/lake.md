@@ -204,6 +204,42 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   where it is: the directory is the caller's, and a layer directory is read for whatever is in it --
   which is also why the warning is worth the enumeration.
 
+## Baking a database, and serving one
+
+- **A baked database is a materialized lake and nothing new**, which is why `Bake.Materialized`
+  builds it as exactly that -- `Materialize` into the named file, `StoreMode.Keep` -- on a
+  `Config.Copy`, since the configuration handed in describes a lake served from layers and is not the
+  bake's to rewrite. The file is deleted first or the kept-store rule opens what an earlier bake left
+  and writes nothing. `Config.Collapsed` is what the rest of the catalog asks instead of
+  `config.Materialize`, because a base is one somebody else already collapsed.
+- **The block size is most of what the mode is worth, and it cannot be set afterwards.** A block is
+  allocated whole, so 300 tables holding 1500 rows between them came to 159 MB at DuckDB's 256 KB and
+  18.7 MB at 16 KB -- 9 ms to copy against 172, paid by every run. It is fixed when the file is
+  created, so `AddDuckPgBake` registers the connection *before* `AddDuckPgLake` does, `TryAdd` leaving
+  the first standing.
+- **Attaching the base doubles the catalog, and DuckDB says nothing about it.** The base holds the
+  same schema name and the same table names as the copy being served, and `information_schema` and
+  the `duckdb_*` functions span every attached database -- so every table was found twice and every
+  column arrived twice with it, which surfaced three layers away as a write branch refusing to be
+  created for a duplicate column. Everything in `Adopt` names `current_database()`.
+- **Asked per table, the catalog is quadratic.** `information_schema.columns` is answered by scanning
+  the whole catalog, so 300 tables asking about their own columns cost 4.3 s against 17 ms for one
+  query naming none of them -- which had `--base` slower than the layers it replaces. `Shapes` asks
+  once. `Counted` is the same shape of mistake smaller: 300 `count(*)` scans for 126 ms, replaced by
+  `duckdb_tables().estimated_size`, which is safe because `rows` is a bound and one that is too low
+  costs a sort rather than a wrong answer.
+- **A base still has a write layer over it.** `Adopt` scans the write directory like `Sources` does,
+  since without a `WriteSource` a table carries only the keys that were deleted -- the tombstone
+  sidecar is found either way, so a delete persisted and an update silently did not. `Apply` then
+  deletes what a tombstone names and replaces what a written row shadows, because a materialized
+  table has nothing to shadow with, and re-creates the identity sequences past whatever the write
+  layer took.
+- **`Catalog.Baseline` is the attached base rather than the `base` schema**, which is the only change
+  the delta needed: it was always "what the layers said before anything was written", and here
+  somebody else wrote that down. `BakedBase` owns the copy and deletes only the scratch one -- a store
+  was named by whoever wanted it to outlive the run -- and is registered before the connection so it
+  is disposed after it.
+
 ## Two threads and one DuckDB
 
 - **A DuckDB connection is not two threads' to share.** Sessions have one each, but the lake keeps
