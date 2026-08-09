@@ -35,6 +35,16 @@ declares past the key becomes an index here too. It also means the layers have t
 that publishes one key twice, leaves the key empty, or breaks a declared unique cannot be built, and
 the lake says so at startup rather than serving it.
 
+A write by key is then sent as the one statement it already is. Over the layers, an `UPDATE` has to
+be rewritten into four — collect the rows, collect the keys, evict, re-insert — because a written row
+has to stand over the ones below it. A materialized table has nothing below it, so DuckDB's own
+`UPDATE` is that same operation, finding its rows through the key. Measured on a 414-table lake, one
+row by key: 8.0 ms as four statements, against 1.05 ms for DuckDB doing the same update directly. As
+one statement it lands beside a `SELECT` by key — 1.2 ms against 0.85 on the same lake — and nearly
+all of what went was time spent *preparing* four statements rather than running them. `DELETE` goes the same
+way. The plan is still what runs for a layered lake, and for an `UPDATE ... FROM`, a row-limited
+write, a moved key or a cascade, since each of those is something one statement cannot do.
+
 **`EXPLAIN <statement>`** answers for what the gateway will actually run, which is not always what
 was sent. Where that is a single query — every read, and a keyed write against a materialized table —
 it is DuckDB's own plan, cost and all. Where it is several, it lists them in order, because a step
