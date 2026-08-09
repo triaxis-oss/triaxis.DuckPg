@@ -91,6 +91,11 @@ sealed class TSqlWriter(TSqlContext context)
                 Query(select.Query);
                 return;
 
+            case ExplainStatement explain:
+                Put(explain.Analyze ? "EXPLAIN ANALYZE " : "EXPLAIN ");
+                Statement(explain.Inner);
+                return;
+
             // The values are produced like any other query's; who they go to is the session's,
             // since a variable is the caller's and not the database's.
             case AssignStatement assign:

@@ -350,7 +350,10 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         {
             Checked(plan, arguments);
             Steps(plan, arguments, plan.Steps.Length - 1);
-            if (plan.Steps.Length > 1) Persist(plan);
+            // Whether a plan wrote is what `Dirty` says and never what it is made of: a write that
+            // needs no rewriting is one statement answering with `RETURNING`, and counting steps
+            // would leave what it wrote unpersisted. `Persist` reads that itself.
+            Persist(plan);
         }
         finally
         {

@@ -171,6 +171,28 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   counted: DuckDB ignores one it was handed and does not want, which is what lets every step take
   the same arguments — and is what the TDS door was always doing, `@p0` rendering as `$p0`.
 
+## Seeing what was sent
+
+- **The log said what a client asked for and nothing said what was run.** `Gateway.Translate` logs
+  the incoming statement, so at any verbosity a four-statement plan read as a plain UPDATE -- which
+  is worse than logging nothing, since it reads as proof that the gateway passed the statement
+  through. `Gateway.Logged` now logs each check, each step and the affected-count query, and only
+  where the plan is more than the statement itself, so an ordinary query still costs one line.
+- **`EXPLAIN` is answered here rather than handed to DuckDB, for the same reason.** Explaining what
+  the client sent explains a statement that is not the one that runs -- and against a layered lake it
+  explains an UPDATE of a view, which DuckDB refuses outright. `Gateway.PlanExplain` translates the
+  inner statement and explains *that*: one query, and it is DuckDB's own plan with its costs;
+  anything else, and it is the statements themselves in order. It has to be, since every step but the
+  first reads temp tables the one before it makes and none of them exist until it runs. A check
+  counts as a query for that test even though it is not a step: it runs, and hiding it would leave
+  the same gap between what is said and what happens that the log had. `ExplainStatement` carries it
+  through the T-SQL door, which refused the word outright -- it is not T-SQL, and a caller debugging
+  a lake through the SQL Server door had no way to ask at all.
+- **What persists is what `Dirty` says, never how many steps a plan has.** Both sessions used to
+  persist a rows-returning plan only when it had more than one step, on the reasoning that one step
+  is a SELECT. A keyed write against a materialized table is one step *and* returns rows, so that
+  reasoning quietly stopped being true and what it wrote would not have reached the files.
+
 ## Answering in .NET
 
 - **A function is answered in .NET when its meaning is .NET's.** `CONVERT`'s styles are
