@@ -148,9 +148,10 @@ directory is yours.
 
 ## Baking the whole lake as a database
 
-`--out` ending in `.duckdb` writes what a materialized lake *holds* rather than the layer it
-publishes: the collapsed tables, their keys and indexes, the declared views and macros. `--base`
-serves it.
+`--format Database` writes what a materialized lake *holds* rather than the layer it publishes: the
+collapsed tables, their keys and indexes, the declared views and macros. `--base` serves it. The
+format is taken from the name when it is not given, so an `--out` ending in `.duckdb` means the same
+thing without saying it.
 
 ```shell
 duckpg bake ./common ./tenant --dacpac schema.dacpac --out seed.duckdb

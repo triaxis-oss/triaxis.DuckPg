@@ -108,8 +108,9 @@ refused rather than written.
 
 ### Baking a whole database
 
-Name the output `.duckdb` and the bake writes what a materialized lake holds instead — the collapsed
-tables, their keys and indexes, the declared views and macros — and `--base` serves it:
+`--format Database` writes what a materialized lake holds instead — the collapsed tables, their keys
+and indexes, the declared views and macros — and `--base` serves it. Name the output `.duckdb` and it
+is assumed:
 
 ```shell
 duckpg bake ./common ./tenant --dacpac schema.dacpac --out seed.duckdb
