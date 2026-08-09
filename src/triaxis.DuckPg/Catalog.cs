@@ -910,13 +910,25 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
         foreach (var unique in schema.Uniques.Where(u => Same(u.Table, table.Name)))
         {
-            if (!unique.Columns.All(table.Has)) continue;
+            if (!unique.Columns.All(c => table.Has(c) && Carried(table, c))) continue;
 
             string[] columns = [.. unique.Columns,
                                 .. partitions.Where(p => table.Has(p) && !unique.Columns.Any(c => Same(c, p)))];
             if (!Covers(table.Key, columns)) yield return (unique.Name, columns);
         }
     }
+
+    /// Whether the lake holds values for a column, as against the schema merely declaring it. A
+    /// column no read layer carries is the same in every row those layers produce -- a declared
+    /// default, frozen at build, or a typed NULL -- so it tells one row from another only by
+    /// accident of there being one row. `(newid())` is the case that makes this plain: one id for
+    /// the run, stamped onto every row a file did not carry, which a rule over that column would
+    /// then refuse the whole lake for. If the values were wanted they would be in the input.
+    ///
+    /// A lake with no read layers has nothing frozen: its rows arrive as writes, and the write
+    /// table's own default stamps each as it is written.
+    bool Carried(Table table, string column) =>
+        table.Layers.Count == 0 || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column)));
 
     /// Whether two column lists say the same thing about a row, which order does not change.
     static bool Covers(string[] key, string[] columns) =>
