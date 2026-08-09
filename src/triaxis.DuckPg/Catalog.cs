@@ -98,7 +98,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     bool flushed;
 
     /// Schema holding the materialized YAML and JSON layers.
-    const string LayerSchema = "layer";
+    public const string LayerSchema = "layer";
 
     /// Where a materialized lake keeps the merge it was cut from -- unread while it serves, and the
     /// baseline the shutdown delta is measured against.
@@ -257,7 +257,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             // reading what the storage already knows. It is a bound rather than a tally anyway --
             // one that is too low costs a sort in DuckDB rather than an answer that is wrong.
             rows[name] = counted.GetValueOrDefault(name);
-            Apply(conn, table);
+            // Not into a store that is the state: its delta was applied the run it was written, and
+            // applying it again would put those rows back over whatever has been written since.
+            if (!Keeping) Apply(conn, table);
             Tables[name] = table;
         }
     }

@@ -44,9 +44,6 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
     /// `--derive-ids` is the answer for the ids among them, being derived rather than generated.
     public async Task WriteDatabaseAsync(string target, CancellationToken cancellation)
     {
-        config.ValidateShape();
-        config.ValidateSessionless("a baked database");
-
         // Replaced rather than opened: the baker configures this as a store that is the state, and
         // a store that is already there is kept rather than rebuilt.
         foreach (var stale in (string[])[target, target + ".wal"])
@@ -66,6 +63,8 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
         catalog.Build(duck);
         Declare();
 
+        Scaffolding();
+
         // What a lake would otherwise pay for on every start, paid once here: DuckDB writes table
         // data uncompressed until something checkpoints it, and a file nobody has checkpointed is a
         // file every later run copies in full.
@@ -73,6 +72,33 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
 
         logger.LogInformation("baked {Tables} into {Target}",
             catalog.Tables.Count == 1 ? "1 table" : $"{catalog.Tables.Count} tables", target);
+    }
+
+    /// What building the lake needed and the file must not carry. A YAML or JSON layer is read into
+    /// a table of its own before the merge collapses it, so leaving those behind ships every such row
+    /// twice -- 20k of them came to 1.07 MB against the 0.68 the same rows cost from parquet, and
+    /// every run that serves this copies the difference. The baseline views go for a second reason as
+    /// well as that one: their SQL names the absolute parquet paths of the machine that baked them,
+    /// which is a path leak and would not bind anywhere else. A served base takes its baseline from
+    /// the attached file instead.
+    ///
+    /// The write layer's tables go the same way, having been folded into the tables themselves. Not
+    /// the sequences beside them: a declared identity carries on from where the bake left it.
+    void Scaffolding()
+    {
+        Exec($"DROP SCHEMA IF EXISTS {Catalog.LayerSchema} CASCADE");
+        Exec($"DROP SCHEMA IF EXISTS {Catalog.BaseSchema} CASCADE");
+
+        using var command = duck.CreateCommand();
+        command.CommandText = "SELECT table_name FROM duckdb_tables() WHERE database_name = " +
+                              $"current_database() AND schema_name = {SqlText.Literal(WriteLayer.Schema)}";
+        using var reader = command.ExecuteReader();
+        var written = new List<string>();
+        while (reader.Read()) written.Add(reader.GetString(0));
+        reader.Close();
+
+        foreach (var table in written)
+            Exec($"DROP TABLE IF EXISTS {SqlText.Quote(WriteLayer.Schema)}.{SqlText.Quote(table)}");
     }
 
     /// The part of a lake DuckDB has nowhere to hold. Columns, keys, uniques, defaults, sequences,
@@ -209,10 +235,6 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
         [.. table.Layers.SelectMany(l => l.Source.Partitions)
                  .Distinct(StringComparer.OrdinalIgnoreCase).Where(table.Has)];
 
-    /// What the output directory holds that this bake did not write. A bake into a directory an
-    /// earlier one filled leaves that one's tables behind, and a layer directory is read for
-    /// whatever is in it -- so a table this lake no longer publishes would go on being published by
-    /// the file nobody replaced. Said rather than deleted: the directory is the caller's.
     void Exec(string sql)
     {
         using var command = duck.CreateCommand();
@@ -220,6 +242,10 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
         command.ExecuteNonQuery();
     }
 
+    /// What the output directory holds that this bake did not write. A bake into a directory an
+    /// earlier one filled leaves that one's tables behind, and a layer directory is read for
+    /// whatever is in it -- so a table this lake no longer publishes would go on being published by
+    /// the file nobody replaced. Said rather than deleted: the directory is the caller's.
     void Strays(string directory, List<string> written)
     {
         var mine = new HashSet<string>(written, StringComparer.OrdinalIgnoreCase);
