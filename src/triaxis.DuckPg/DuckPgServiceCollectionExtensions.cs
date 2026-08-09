@@ -73,6 +73,17 @@ public static class DuckPgServiceCollectionExtensions
         return services;
     }
 
+    /// A bake, which is the same catalog over the same layers with nothing in front of it. The
+    /// lake's own registrations rather than a second set of them, so a catalog that grows a
+    /// dependency does not have to be remembered here too -- what listens is registered and never
+    /// resolved, which costs a factory nobody calls.
+    internal static IServiceCollection AddDuckPgBake(this IServiceCollection services, Config config)
+    {
+        services.AddDuckPgLake(config);
+        services.TryAddSingleton<Bake>();
+        return services;
+    }
+
     /// The lake itself, with the configuration it is to be built from.
     internal static IServiceCollection AddDuckPgLake(this IServiceCollection services, Config config)
     {

@@ -17,7 +17,9 @@ publish a temp-directory convention as API.
 
 | File | What it owns |
 |---|---|
-| `ServeCommand.cs` | The CLI: arguments, the config file, argument-over-file precedence. |
+| `LakeCommand.cs` | What both commands take: the layers, the config file (read only when named), argument-over-file precedence, and the answer for a missing DuckDB. |
+| `ServeCommand.cs` | The `duckpg` command itself: the doors and everything only a running lake has. |
+| `BakeCommand.cs` | `duckpg bake`: the same lake, written out instead of served. |
 | `DuckPgServiceCollectionExtensions.cs` | `AddDuckPg` and `AddDuckPgFactory`: what a lake is made of, as registrations. |
 | `DuckPgLakeFactory.cs` | Lakes on demand, each owning the container it came out of. |
 | `DuckDbInstaller.cs` | `IDuckDbInstaller`: fetching DuckDB, for a lake starting and for `--install-duckdb` alike. |
@@ -25,6 +27,7 @@ publish a temp-directory convention as API.
 | `Lake.cs` | The composition root: DuckDB connection, schema, catalog, gateway, listeners. Tests use it too. |
 | `Layer.cs` | Scanning a layer directory, reading a source, writing one back. YAML ↔ JSON. |
 | `Catalog.cs` | The published shape: which tables exist, their columns, keys, the view SQL, and the dacpac's own views. |
+| `Bake.cs` | `duckpg bake`: the same catalog with no doors, copied out as one parquet a table. |
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
 | `DacpacSchema.cs` | The declared schema as a service: finds the dacpac, reads `model.xml` for columns, keys, uniques, defaults and views. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
@@ -72,6 +75,11 @@ Each of these is the short form; the note behind it is where the argument is.
 - **A declared key, a reference and a cascade are rules over the merged view**, not constraints on a
   table -- DuckDB's own would see only the rows this process wrote.
   [schema](docs/internals/schema.md#keys)
+- **Using a baked layer is semantically identical to using the layers it was baked from.** That is
+  the whole of what `duckpg bake` promises: it is why the command is told the key and the write
+  layer, why a virtual column and a declared default are left to the run that reads the file, why a
+  partitioned layer is written back partitioned -- and why what cannot be kept identical is refused
+  rather than written. [lake](docs/internals/lake.md#baking)
 - **A declared default is a value in the read layers and an expression in the write layer.**
   [schema](docs/internals/schema.md#defaults)
 - **The dialect is translated on the tree, never on the text**, and a statement the parser does not

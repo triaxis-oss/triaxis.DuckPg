@@ -87,6 +87,65 @@ lake. Use it when a lake is larger than the RAM you want to give it and the laye
 source of truth; use the default `keep` when the file is. The two must not share a path — nothing in a
 DuckDB file says which mode wrote it, so a `spill` start would rebuild a kept store from the layers.
 
+## Baking the layers once
+
+Everything above buys the merge back inside a run that is starting anyway. **`duckpg bake`** takes it
+out of the runs altogether: it builds the same catalog over the same layers, writes what each table
+publishes out as one ZSTD parquet, and stops.
+
+```shell
+duckpg bake ./common ./tenant --write ./local --key id --out ./baked
+duckpg ./baked --key id
+```
+
+What that saves is not only the merge. A parquet layer is scanned where it lies, but YAML and JSON
+are read through a converted copy and materialized into a table on every start, with their types
+inferred from the values each time — the one cost a lake pays that has nothing to do with what is
+asked of it. Bake once and a later run scans a file that already carries a real schema.
+
+**Using the baked layer is semantically identical to using the layers it was baked from.** That is
+the whole contract; everything below is what it takes to keep it.
+
+**It is told the key, and so the dacpac.** Without one the layers concatenate instead of shadowing,
+and a later `--key id` over the single file that produced would answer differently than the same key
+over the stack.
+
+**It is told the write directory rather than handed it as a layer.** A write layer is the only layer
+whose files do not say everything it holds: its deletes are keys in a `.deleted/` sidecar that the
+layer scan skips, so naming that directory as an ordinary layer would bake the rows it hides straight
+back into the lake and lose the deletes without a word. Named as what it is, it is folded in like the
+top of the stack it is, tombstones applied — which is also how a write layer that has outgrown the
+files below it is flattened back into them. Point the next run at a fresh write directory; the old
+one's rows are in the bake.
+
+**It writes the table's own columns and nothing the configuration adds on top of them**, because that
+configuration is still there on the next run. The virtual columns a `columns:` block adds are
+projected by the run reading the file exactly as they were by this one, and a **declared default is
+left empty** rather than written out: the file outlives the run that wrote it, so a `(getdate())`
+baked into it would answer every later run with the moment this one started. The next run stamps it,
+which is what the default meant before there was a bake — the same bargain `--cache` makes with the
+same defaults. The exception is a default on a *key* column, which the merge itself reads: deferring
+that one would shadow the wrong row, so it is written out. An id answered per row under
+`--derive-ids` is deferred like any other default, and safely, because it is derived and not
+generated: the run reading the file works the same id out of the same key.
+
+**It writes a partitioned layer back partitioned**, as `<table>/db=…/`, since a partition column
+joins the key and one flattened into an ordinary column would let one database's row 1 shadow
+another's. Everything else is `<table>.parquet`. The directory must live outside the layers, or the
+next run reads the copies back as a layer of their own — the same refusal `--cache` gets, for the
+same reason.
+
+**What cannot be kept identical is refused rather than written.** A table carrying a `filter:`,
+because that is answered per session and a file every session reads cannot carry one — which is what
+`--materialize` says about it too. And `materialize:` itself, since collapsing the layers is what a
+bake *is*: doing it into memory first is the same work twice, and a materialized table holds every
+declared default already stamped, which is the one thing a baked file must not. `store:` goes with
+it. Both are keys rather than flags here — `bake` has no option for either, so they only arrive when
+`-c` names a file written for the run that serves, and being refused by name beats being obeyed.
+Nothing is deleted: what an earlier bake left for a table this one no longer publishes is named in a
+warning and left where it is, because a layer directory is read for whatever is in it and that
+directory is yours.
+
 ## Compressing what is held
 
 **`--compress`** is the other answer to a materialized lake's memory, and it keeps the tables where

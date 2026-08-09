@@ -1,30 +1,19 @@
 using System.Runtime.InteropServices;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 
 namespace triaxis.DuckPg.Cli;
 
 [Command(Description = "Serves a stack of YAML, JSON and parquet layers over the PostgreSQL wire protocol.")]
-public class ServeCommand : LoggingCommand
+public class ServeCommand : LakeCommand
 {
     /// The command's own default; the library opens nothing it was not asked to.
     const string DefaultListen = "127.0.0.1:55432";
-
-    [Argument(Description = "Layer directories, lowest first. Overrides the configuration.")]
-    public string[] Layers { get; set; } = [];
-
-    [Option("--config", "-c", Description = "Configuration file. None is read unless one is named.")]
-    public string? ConfigPath { get; set; }
 
     [Option("--pgwire", "-l", Description = "Listen address for the PostgreSQL front door. Default 127.0.0.1:55432 unless only --tds is given.")]
     public string? PgWire { get; set; }
 
     [Option("--tds", Description = "Listen address for the TDS front door, which SqlClient speaks.")]
     public string? Tds { get; set; }
-
-    [Option("--write", "-w", Description = "Directory holding the topmost layer, which accepts writes.")]
-    public string? Write { get; set; }
 
     [Option("--write-format", Description = "Format a table is persisted in when the write layer has no file for it yet.")]
     public LayerFormat? WriteFormat { get; set; }
@@ -60,41 +49,18 @@ public class ServeCommand : LoggingCommand
     [Option("--schema", Description = "Schema the published views live in.")]
     public string? Schema { get; set; }
 
-    [Option("--key", "-k", Description = "Column identifying a row, for tables that name no key of their own. Repeatable.")]
-    public string[] Key { get; set; } = [];
-
-    [Option("--dacpac", Description = "A .dacpac to take column names, order, types and keys from.")]
-    public string? Dacpac { get; set; }
-
     [Option("--cache", Description = "Directory to write merged copies of multi-layer tables into, as ZSTD parquet. Trades build time and disk for read speed.")]
     public string? Cache { get; set; }
-
-    [Option("--install-duckdb", Description = "Download the DuckDB library on the way up if none is found, rather than failing.")]
-    public bool InstallDuckDb { get; set; }
 
     [Option("--install-duckdb-only", Description = "Download the DuckDB library if none is found, and exit without serving.")]
     public bool InstallDuckDbOnly { get; set; }
 
-    [Inject] private readonly IConfiguration _configuration = null!;
     [Inject] private readonly IDuckDbInstaller _installer = null!;
     [Inject] private readonly IDuckPgLakeFactory _lakes = null!;
 
-    /// A configuration file is read when one is named, and never otherwise. Arguments alone are
-    /// enough to serve a directory, and a tool that helped itself to a `duckpg.yaml` from whatever
-    /// directory it happened to start in would be serving a lake nobody pointed it at. Named, the
-    /// file has to exist: a typo is an error rather than a silent fall back to defaults.
-    ///
-    /// It is named on the command line, so the source can only be added once the arguments are
-    /// parsed. Optional here and required in `ExecuteAsync`, which is the only difference between a
-    /// sentence naming the file and a FileNotFoundException out of the configuration provider,
-    /// thrown while the host is still being built and caught by nothing.
     public static void Configure(IToolBuilder builder)
     {
-        builder.ConfigureConfiguration((context, configuration) =>
-        {
-            if (context.GetInvocationContext().ParseResult.GetValue<string?>("--config") is { Length: > 0 } path)
-                configuration.AddYamlFile(Path.GetFullPath(path), optional: true, reloadOnChange: false);
-        });
+        AddConfigFile(builder);
 
         // The factory rather than a lake: what to serve is only known once the arguments have won
         // over the file, which is after the host has been built.
@@ -109,26 +75,11 @@ public class ServeCommand : LoggingCommand
             return;
         }
 
-        // The same answer a missing layer directory gets, for the same reason: what was named is not
-        // there, and falling back to defaults would serve something nobody asked for.
-        if (ConfigPath is { } named && !File.Exists(named))
-            throw new CommandErrorException("configuration file not found: {Path}", Path.GetFullPath(named))
-            { ExitCode = 64 };
-
-        var config = _configuration.Get<Config>() ?? new Config();
-        // `layers:` may be written as a single directory; only the list form binds on its own.
-        if (_configuration["layers"] is { Length: > 0 } single) config.Layers = [single];
-        // Paths in a file are relative to that file; with no file there are none, and an argument's
-        // path is the working directory's either way.
-        config.ResolvePaths(ConfigPath is { } path
-            ? Path.GetDirectoryName(Path.GetFullPath(path))!
-            : Directory.GetCurrentDirectory());
+        var config = Configured();
 
         // Arguments win over the file, and are relative to the working directory rather than to it.
-        if (Layers.Length > 0) config.Layers = [.. Layers.Select(Path.GetFullPath)];
         if (PgWire is not null) config.Listen = PgWire;
         if (Tds is not null) config.Tds = Tds;
-        if (Write is not null) config.Write = Path.GetFullPath(Write);
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;
         if (Materialize) config.Materialize = true;
@@ -140,14 +91,13 @@ public class ServeCommand : LoggingCommand
         if (DeriveIds) config.DeriveIds = true;
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
-        if (Key.Length > 0) config.DefaultKey = Key;
-        if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
         if (Cache is not null) config.Cache = Path.GetFullPath(Cache);
-        if (InstallDuckDb) config.InstallDuckDb = true;
         if (config.Listen is not { Length: > 0 } && config.Tds is not { Length: > 0 })
             config.Listen = DefaultListen;
 
-        await using var lake = await Start(config, cancellation);
+        // Started inside the guard: `installDuckDb` fetches a missing library there, and asking what
+        // is loaded before that would be the native call that fails instead of the one that works.
+        await using var lake = await Guarded(() => _lakes.StartAsync(config, cancellation));
 
         foreach (var table in lake.Catalog.Tables.Values)
             Logger.LogInformation("{Schema}.{Table} <- {Layers}{Writable}{Virtual}",
@@ -186,48 +136,4 @@ public class ServeCommand : LoggingCommand
         // materialized lake was given is on disk before the process ends.
         await lake.StopAsync(CancellationToken.None);
     }
-
-    /// The tool links against the machine's own DuckDB, and the first native call is where a
-    /// missing one would otherwise surface: a DllNotFoundException out of the bindings, naming a
-    /// library the reader never asked for by that name. Say where it was looked for instead, and
-    /// what the ways out are.
-    async Task<Lake> Start(Config config, CancellationToken cancellation)
-    {
-        try
-        {
-            // Started first: `installDuckDb` fetches a missing library here, and asking what is
-            // loaded before that would be the native call that fails instead of the one that works.
-            var lake = await _lakes.StartAsync(config, cancellation);
-
-            if (DuckDbLibrary.LoadedVersion is { } loaded && loaded != DuckDbLibrary.Version)
-                Logger.LogWarning(
-                    "DuckDB {Loaded} loaded from {Path}, where these bindings speak {Expected}'s C " +
-                    "API -- `--install-duckdb` fetches a matching one",
-                    loaded,
-                    DuckDbLibrary.LoadedFrom ?? "the loader's own search path",
-                    DuckDbLibrary.Version);
-
-            return lake;
-        }
-        catch (DuckPgConfigurationException problem)
-        {
-            // EX_USAGE: what it was told to serve does not add up, and the message names the part.
-            throw new CommandErrorException("{Problem}", problem.Message) { ExitCode = 64 };
-        }
-        catch (DllNotFoundException)
-        {
-            throw new CommandErrorException(
-                "DuckDB {Version} was not found. Looked in:" + Environment.NewLine + "{Searched}" +
-                Environment.NewLine +
-                "Install it (`brew install duckdb`, `apt install libduckdb-dev`), point " +
-                DuckDbLibrary.PathVariable + " at the library, or add `--install-duckdb` to fetch " +
-                "it into {Downloaded} on the way up.",
-                DuckDbLibrary.Version,
-                string.Join(Environment.NewLine, DuckDbLibrary.SearchPath.Select(path => "  " + path)),
-                DuckDbLibrary.Downloaded)
-            { ExitCode = 69 }; // EX_UNAVAILABLE: the tool is fine, what it needs is not here
-        }
-    }
-
-
 }

@@ -129,6 +129,81 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   sessions simply never get a connection, and every client times out in the pre-login handshake
   while the listener sits there accepting.
 
+## Baking
+
+- **Using a baked layer is semantically identical to using the layers it was baked from.** Every
+  other note here is a consequence, and a change that cannot hold this one is a change that has to
+  refuse instead. It is also the test the suite is written to: `BakeTests` bakes a lake, points a
+  second one at the output, and asks the same questions of both.
+- **A bake is the catalog with nothing in front of it, and that is the whole design.** `Bake` builds
+  the same `Catalog` over the same `Config` and then does one `COPY (SELECT … FROM <view>)` a table.
+  There is no second merge and no bake-specific SQL: whatever the view says a client would read is
+  what lands in the file, so a change to the merge cannot leave the bake behind. It is registered
+  through `AddDuckPgBake`, which is `AddDuckPgLake` plus `Bake` -- the servers and the gateway are
+  registered and never resolved, which costs a factory nobody calls and means a catalog that grows a
+  dependency does not have to be remembered in two places.
+- **It is not a lake, so it does not need a door.** `Config.Validate` is what makes "no front door"
+  an error, and everything else it asks is a bake's question too -- hence the split into
+  `ValidateShape`, which the bake calls and `Validate` wraps. `Config.ValidateSessionless` is the
+  other half of that split: a `filter:` and a `getvariable()` column were already refused for
+  `materialize`, and rows written to a file every session reads are the same problem with the same
+  answer.
+- **`Config.Inside` is why the output cannot be a layer**, and it answers "is this directory, or one
+  above it, a layer" rather than the strictly-below question `--cache` used to ask -- baking into the
+  layer being read is the worse version of the same mistake and was the one case the old comparison
+  let through.
+- **The write layer is named rather than listed, because it is the one layer whose files do not say
+  everything it holds.** Its deletes are keys in a `.deleted/` sidecar, and `Layer.Entries` skips
+  dot-directories on purpose -- so a write directory handed to a bake as an ordinary layer bakes the
+  rows it hides back into the lake and loses the deletes silently. There is no way to bake a lake
+  that has a write layer without knowing which directory it is; told, `Catalog.Baked` folds it in
+  through the same `Promoted`/`Tombstoned` state the served view uses, which is also what makes a
+  bake the way an overgrown write layer is flattened back into the files below it. It is the same
+  argument as `--key`: what a bake may not know, it may not merge.
+- **Virtual columns and declared defaults are left out of what is written.** A baked directory stands
+  in for the layers and not for the `duckpg.yaml` above them, so the bake copies `table.Columns` and
+  not `table.Virtuals`. Baking those in would be wrong twice over: a table-level `columns:` entry is
+  projected unconditionally, so the next run would emit the column a second time and DuckDB would
+  refuse the view outright, and an `expr` over `_file` would have been frozen against a file that is
+  no longer the one being read. A default is the same bargain `Cache` already makes -- `(getdate())`
+  written into a file that outlives the run answers every later run with the moment this one started
+  -- which is why `Catalog.Baked` passes `defaults: KeyedByDefault(table)` rather than `Deferrable`:
+  a bake defers more than a copy can. A copy is read *through* a wrapper that recomputes the virtual
+  columns from it, so a gap where a default should be reaches them; a bake writes no virtual column
+  at all, and the run reading the file defaults in the branch before the projection sees it. What
+  neither can defer is a default on a key column, which the `QUALIFY` reads -- hence the predicate
+  split out of `Deferrable` rather than a second copy of it. `Merged`'s underlay branch had the
+  `COALESCE` hardcoded, which made `defaults: false` a lie whenever a cache was configured.
+- **A subcommand cannot decline what the root accepts, so `LakeCommand.Stray` refuses it instead.**
+  Serving is the root command -- `[Command]` with no name -- so its layer argument and every option
+  it has are also what stands in front of any verb, and stock System.CommandLine binds a token there
+  to the root without an error: `duckpg ./common bake ./tenant` bakes half a lake, and
+  `duckpg --materialize bake` bakes without it. Nothing declarative prevents it, and `Configure`
+  runs after the parse, so the tree cannot be changed by then either. What is left is to read
+  `ParseResult.RootCommandResult` -- registered as a service by `AddConfigFile`, since a command is
+  otherwise handed only its own slice of the parse -- and refuse what is explicitly sitting on it.
+  triaxis.CommandLine 2.6.0-beta.2 answers the positional half: a layer directory in front of a verb
+  is now `Unrecognized command or argument`, and the subcommand's usage line stops advertising its
+  parent's. The option half is still the parser's to give away, which is the whole of what `Stray`
+  is now for. A recursive option is the exception and has to be: `-v` lands on the subcommand after
+  the verb and on the root before it, and means the same thing either way.
+- **`materialize` is refused rather than tolerated.** It produced the same rows -- `Catalog.Baked`
+  would have had to un-materialize the table to build its merge anyway -- but a materialized table
+  holds every declared default already stamped, which is exactly what a bake must not write. `store`
+  needs `materialize`, so one refusal answers for both.
+- **A partitioned layer is written back partitioned**, with `PARTITION_BY` over the columns
+  `LayerSource.Partitions` contributed. Flat, `db` would be an ordinary column and `KeyFor` would
+  stop adding it to the key, so one database's row 1 would shadow another's -- the hazard
+  `PartitionTests` exists for, reached by a different road. DuckDB writes the value into the
+  directory name and leaves it out of the file, which is exactly what the hive scan expects, so the
+  round trip is the layout `Layer.Entries` already reads.
+- **A COPY answers with the rows it wrote**, but only through `ExecuteNonQuery` -- `ExecuteScalar`
+  returns null for it, and `Convert.ToInt64(null)` is a zero that looks like an empty table. Counting
+  the view instead would be the whole merge a second time.
+- **Nothing in the output is deleted.** A stray from an earlier bake is warned about by name and left
+  where it is: the directory is the caller's, and a layer directory is read for whatever is in it --
+  which is also why the warning is worth the enumeration.
+
 ## Two threads and one DuckDB
 
 - **A DuckDB connection is not two threads' to share.** Sessions have one each, but the lake keeps
