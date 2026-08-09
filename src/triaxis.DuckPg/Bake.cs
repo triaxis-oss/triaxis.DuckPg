@@ -41,44 +41,11 @@ sealed class Bake(Config config, Catalog catalog, DuckDBConnection duck, IDuckDb
     public static bool IsDatabase(string target) =>
         Path.GetExtension(target).Equals(DatabaseExtension, StringComparison.OrdinalIgnoreCase);
 
-    /// Everything a bake is made of, released when it is done. A bake outlives nothing, so it owns
-    /// its container the way a factory-built lake owns its own.
-    ///
-    /// A database bake is a materialized lake written into the file it is named after, so it is that
-    /// configuration that gets built -- on a copy, since the one it was handed describes a lake
-    /// served from layers and is nobody's to rewrite.
-    /// What a baked database is written with, and why it is not DuckDB's own 256 KB. A block is the
-    /// unit a file is allocated in, so a lake of many small tables pays for one whichever way it is
-    /// filled: 300 tables holding 1500 rows between them came to 159 MB at the default and 18.7 MB
-    /// at this, which is 9 ms to copy against 172. Since copying is what serving one costs, that is
-    /// most of what the mode is for -- an experiment wanting a fresh instance a thousand times over
-    /// is paying it a thousand times. Raise it with `--block-size` for a bake whose tables are big
-    /// enough for the metadata of small blocks to be the cost instead.
-    public const int DefaultBlockSize = 16384;
-
-    public static async Task RunAsync(Config config, string target, ILoggerFactory? loggers,
-                                      int blockSize = DefaultBlockSize,
-                                      CancellationToken cancellation = default)
-    {
-        var database = IsDatabase(target);
-        if (database) config = Materialized(config, target);
-
-        var services = new ServiceCollection();
-        if (loggers is not null) services.AddSingleton(loggers);
-        services.AddDuckPgBake(config, database ? blockSize : 0);
-
-        await using var provider = services.BuildServiceProvider();
-        var bake = provider.GetRequiredService<Bake>();
-
-        if (database) await bake.WriteDatabaseAsync(target, cancellation);
-        else await bake.WriteAsync(target, cancellation);
-    }
-
     /// The same lake, collapsed into the file being written rather than served from views. A store
     /// that is the state is exactly what a baked database is, so `Keep` is what it is built as --
     /// and the file is deleted first, or that same rule would have this build open what an earlier
     /// bake left and keep it instead of replacing it.
-    static Config Materialized(Config config, string target)
+    internal static Config Materialized(Config config, string target)
     {
         if (Directory.Exists(target))
             throw new DuckPgConfigurationException(

@@ -22,6 +22,7 @@ publish a temp-directory convention as API.
 | `BakeCommand.cs` | `duckpg bake`: the same lake, written out instead of served. |
 | `DuckPgServiceCollectionExtensions.cs` | `AddDuckPg` and `AddDuckPgFactory`: what a lake is made of, as registrations. |
 | `DuckPgLakeFactory.cs` | Lakes on demand, each owning the container it came out of. |
+| `DuckPgBaker.cs` | `IDuckPgBaker`: the same, for a lake written down instead of served. |
 | `DuckDbInstaller.cs` | `IDuckDbInstaller`: fetching DuckDB, for a lake starting and for `--install-duckdb` alike. |
 | `Config.cs` | The bound configuration. Every property here is part of the contract. |
 | `Lake.cs` | The composition root: DuckDB connection, schema, catalog, gateway, listeners. Tests use it too. |
@@ -103,8 +104,8 @@ Each of these is the short form; the note behind it is where the argument is.
 - **The lake's schema goes in front of every session's search path, and `main` stays behind it**;
   both front doors are opt-in, and a lake needs one.
   [lake](docs/internals/lake.md#starting-stopping-and-what-a-lake-owns)
-- **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckDbInstaller, LayerFormat, StoreMode,
-  DuckPgConfigurationException and DuckDbLibrary -- nothing else.**
+- **The public surface is Config, Lake, IDuckPgLakeFactory, IDuckPgBaker, IDuckDbInstaller,
+  LayerFormat, StoreMode, DuckPgConfigurationException and DuckDbLibrary -- nothing else.**
   The catalog, the gateway, the two protocols and `TSql/` are internal, which is why `Lake`'s
   constructor is internal and `AddDuckPg` assembles it by hand: a public constructor would have to
   take public parameters, and that would make every part of a lake an API. `InternalsVisibleTo`

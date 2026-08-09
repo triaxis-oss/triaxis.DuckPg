@@ -56,3 +56,32 @@ the part that is wrong, rather than a lake that starts empty and a binder error 
 `DuckDB.NET.Data.Full` in your project brings the native for every RID, or `installDuckDb: true`
 fetches the matching version the first time a lake finds none — see
 [the native library](duckdb.md).
+
+## Baking a lake from your own process
+
+`IDuckPgBaker` is the pair to `IDuckPgLakeFactory`: it takes a `Config` per call and writes what that
+lake publishes out instead of serving it. A directory takes one parquet a table and is read back as
+an ordinary layer; a path ending in `.duckdb` takes the whole lake as a database, which `Config.Base`
+then serves without a dacpac, a key or a configuration of its own.
+
+```csharp
+var services = new ServiceCollection().AddLogging().AddDuckPgBaker();
+await using var provider = services.BuildServiceProvider();
+
+await provider.GetRequiredService<IDuckPgBaker>()
+              .BakeAsync(new Config { Layers = [seed], Dacpac = dacpac }, "seed.duckdb");
+```
+
+Which is what a fixture wants when the same initial state is served over and over — bake once, then
+give every test its own lake over the same file:
+
+```csharp
+services.AddDuckPg(new Config { Base = "seed.duckdb", Writable = true, Listen = "127.0.0.1:0" });
+```
+
+Nothing is scanned, described, parsed, merged or keyed to start one, which on a 300-table lake is
+643 ms against 1371 from its layers and a dacpac. The base is copied on the way up and never written
+to, so the runs cannot see each other; with `Writable` the copy goes at exit, and with `Write` the
+delta goes out as a layer beside it. See
+[performance](performance.md#baking-the-whole-lake-as-a-database).
+
