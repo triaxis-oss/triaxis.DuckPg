@@ -89,6 +89,27 @@ public sealed class Config
     /// than the rule's. Nothing else changes: reads, deletes and ordinary updates never asked.
     public bool CheckKeys { get; set; } = true;
 
+    /// Give every row its own value for a `NEWID()` default, instead of the one value the whole run
+    /// shares. A declared default is evaluated once when the lake is built -- a view is bound on
+    /// every execution, so a `uuid()` in one would answer differently every scan -- which leaves a
+    /// column no file carries holding the same id in every row. That is honest for `(getdate())`,
+    /// where a row in a file cannot say when it was written, and useless for an id, whose whole
+    /// point is that no two rows share one.
+    ///
+    /// So the value is *derived* rather than generated: the row's key written into the low half of
+    /// a uuid whose high half is fixed for the column. Consecutive keys give consecutive ids under a
+    /// shared prefix, which is what `NEWSEQUENTIALID()` means and what an index likes. Being
+    /// deterministic is what makes it usable at all -- the same id on every scan, across a restart,
+    /// and equal to what the shutdown delta measures against, which a generated one would not be.
+    ///
+    /// Off, because it costs a scan of that column roughly 190 ms a million rows against 1 ms for
+    /// the frozen value. Materialized that is paid once when the table is built and reads are free;
+    /// layered it is paid by every read, and a lake serving analytics has nothing to spend it on.
+    /// A table with no declared key is left alone with a warning: there is no identity to derive
+    /// from, and one `--derive-ids` across a mixed lake should leave the odd table out rather than
+    /// refuse to start.
+    public bool DeriveIds { get; set; }
+
     /// Let one transaction run at a time, the next waiting for the one in front of it. A DuckDB
     /// transaction takes its catalog snapshot when it begins, so a write branch created by anybody
     /// after that is invisible to it for as long as it lives -- and it cannot create one itself

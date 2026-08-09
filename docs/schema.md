@@ -16,12 +16,31 @@ left the column out or spelled out a null. The expression is T-SQL and goes thro
 they say. In the
 read layers it is evaluated once, when the lake is built — `GETDATE()` is the moment duckpg started
 and `NEWID()` one id for the run, since a table scanned twice has to answer the same both times and a
-row already in a file never said when it was written. A written row is stamped as it is written, the
+row already in a file never said when it was written — `--derive-ids` below gives every row its own. A written row is stamped as it is written, the
 write layer declaring the expression rather than the frozen value; nothing fills that layer in
 afterwards, so a row written with an explicit `NULL` stays null. `SUSER_SNAME()`, `USER_NAME()` and
 `ORIGINAL_LOGIN()` answer with the session's login name, or with the account duckpg runs as for a
 default. A default DuckDB cannot answer at all (`NEWSEQUENTIALID()` and friends) is dropped with a
 warning and the column keeps its `NULL`.
+
+**Ids per row.** A declared default is evaluated once when the lake is built, so a column no file
+carries holds the same value in every row — honest for `(getdate())`, where a row in a file cannot say
+when it was written, and useless for `(newid())`, whose whole point is that no two rows share one.
+`--derive-ids` answers those per row instead: the row's key written into the low half of a uuid whose
+high half is fixed for the column, so ids come out under a shared prefix with the key counting up
+beneath it — the shape `NEWSEQUENTIALID()` has, and the one an index likes.
+
+They are *derived* rather than generated, which is what makes them usable: a view is bound on every
+execution, so a generated id would differ on every scan. Derived, the same row answers the same way
+twice, after a restart, and to the baseline the shutdown delta is measured against. A row written
+while the lake runs is stamped with a real `uuid()` instead, as it always was — it has an identity of
+its own, and the row it might shadow is one no read sees.
+
+Only `NEWID()`, and only for a table with a declared key; one without keeps the run's single value and
+is named in a warning at startup, since one flag across a mixed lake should leave the odd table out
+rather than refuse to start. It costs about 190 ms a million rows on a scan of that column against 1
+ms for the frozen value — paid once at build for a [materialized](performance.md) lake, and by every
+read for a layered one, which is why it is off unless asked for.
 
 **Uniqueness past the key.** A `UNIQUE` constraint and a unique index both declare that no two rows
 share those columns, and both are kept — on a materialized lake, where the table is a table and
@@ -29,7 +48,8 @@ DuckDB can hold the rule. A plain, non-unique index declares nothing and is read
 is dropped for a table the lake publishes without every column it is over — and for one over a column
 no layer carries at all, since a declared default is frozen when the lake is built and `(newid())` is
 then one id for the whole run rather than one per row. If those values were wanted they would be in
-the input. A partition column
+the input, or `--derive-ids` would be on: with it, such a column *is* per row and the rule holds over
+it. A partition column
 joins it as it joins the key, since rows are only unique within a partition. Two NULLs count as
 different here, as they do in PostgreSQL and unlike SQL Server, which allows one such row rather than
 many. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.
