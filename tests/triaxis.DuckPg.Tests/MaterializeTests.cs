@@ -380,3 +380,81 @@ public class MaterializedShutdownTests
         Directory.Delete(root, true);
     }
 }
+
+/// A lake checkpointed once it is built. DuckDB writes table data uncompressed and compresses it at
+/// a checkpoint, which nothing drives an in-memory database to -- so this is the only thing between
+/// a materialized lake and holding every column in its widest form.
+public class CompressTests
+{
+    static TestLake Lake(bool compress)
+    {
+        var lake = new TestLake($"compress-{compress}")
+            .Json("base", "orders", """
+                [{"order_id": 1, "note": "base"}, {"order_id": 2, "note": "base"}, {"order_id": 3, "note": "base"}]
+                """)
+            .Stack("base")
+            .Materialized();
+        if (compress) lake.Compressed();
+        lake.Config.DefaultKey = ["order_id"];
+        return lake.Start();
+    }
+
+    /// What a table's segments are held as, counted by kind. Never empty: a table DuckDB knows
+    /// nothing about answers with no rows, which every assertion below would read as a pass.
+    static List<string> Segments(TestLake lake, string table)
+    {
+        var segments = lake.Query(
+            $"SELECT compression, count(*) FROM pragma_storage_info('{table}') GROUP BY 1 ORDER BY 1");
+        Assert.NotEmpty(segments);
+        return segments;
+    }
+
+    /// Every segment of the collapsed table is held as something narrower than it was written as,
+    /// and the table still says what it said.
+    [Fact]
+    public void WhatTheBuildLeftIsCompressed()
+    {
+        using var lake = Lake(compress: true);
+
+        Assert.DoesNotContain(Segments(lake, "lake.orders"), s => s.StartsWith("Uncompressed"));
+        Assert.Equal(["1", "2", "3"], lake.Query("SELECT order_id FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// And without it nothing is, which is what says the test above measures the option rather than
+    /// something DuckDB was doing anyway.
+    [Fact]
+    public void WithoutItNothingIs()
+    {
+        using var lake = Lake(compress: false);
+
+        Assert.All(Segments(lake, "lake.orders"), s => Assert.StartsWith("Uncompressed", s));
+    }
+
+    /// A checkpoint is the whole database's, so the tables a JSON layer was read into are compressed
+    /// too -- a layered lake keeps those in memory just as a materialized one keeps its own.
+    [Fact]
+    public void SoAreTheTablesALayerWasReadInto()
+    {
+        using var lake = new TestLake("compress-layers")
+            .Json("base", "orders", """[{"order_id": 1, "note": "base"}]""")
+            .Stack("base")
+            .Compressed()
+            .Start();
+
+        Assert.DoesNotContain(Segments(lake, @"layer.""orders#0"""),
+                              s => s.StartsWith("Uncompressed"));
+    }
+
+    /// Only what was there when the build ended: a row written after it is held as it arrived, and
+    /// nothing checkpoints a second time. What matters is that it is still the row.
+    [Fact]
+    public void AWriteAfterTheBuildIsStillARow()
+    {
+        using var lake = Lake(compress: true);
+        lake.Execute("INSERT INTO lake.orders (order_id, note) VALUES (4, 'new')");
+        lake.Execute("UPDATE lake.orders SET note = 'written' WHERE order_id = 1");
+
+        Assert.Equal(["1=written", "2=base", "3=base", "4=new"],
+                     lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id"));
+    }
+}

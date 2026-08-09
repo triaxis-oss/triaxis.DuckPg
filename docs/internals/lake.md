@@ -118,6 +118,10 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   behaves in every other way like an in-memory materialized lake, so `SpillTests` restarts twice for
   the same reason `DeltaTests` does. Nothing in a DuckDB file says which mode wrote it, so the two
   cannot share a path -- and there is no check that could tell.
+- **What a materialized lake holds is uncompressed until something checkpoints it**, and
+  `Config.Compress` is the only thing that does -- one `CHECKPOINT` at the end of `Catalog.Build`,
+  worth 4.4x the memory and a wager on the read.
+  [performance](performance.md#compressing-what-is-held)
 - **DuckDB.NET duplicates an in-memory connection and no other.** `Duplicate()` throws
   "Duplication of the connection is only supported for in-memory connections", which is why
   `DuckDbSession.Of` opens the file again for a stored lake -- the driver holds one instance per

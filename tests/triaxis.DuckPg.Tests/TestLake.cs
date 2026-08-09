@@ -93,6 +93,13 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// Checkpointed once the build is over, which is what makes DuckDB compress what it holds.
+    public TestLake Compressed()
+    {
+        Config.Compress = true;
+        return this;
+    }
+
     public TestLake WithTds()
     {
         Config.Tds = "127.0.0.1:0";

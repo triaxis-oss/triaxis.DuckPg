@@ -45,6 +45,22 @@ public sealed class Config
     /// and discarding it silently would be the worse surprise.
     public StoreMode StoreMode { get; set; } = StoreMode.Keep;
 
+    /// Ask DuckDB to compress what it is holding once the lake is built. Table data is written
+    /// uncompressed and stays that way until a checkpoint, which nothing drives an in-memory
+    /// database to -- so a materialized lake holds every column in its widest form. One checkpoint
+    /// at the end of the build is what buys that back: over 5M rows of a five-column table, 280 MB
+    /// down to 64 MB for ~0.4 s of build.
+    ///
+    /// Off, because what it does to a read depends on the column. Filtering on a dictionary-encoded
+    /// string gets faster, the comparison being against the dictionary rather than against every
+    /// row -- 4.3 ms against 14.6 -- and aggregating over a bit-packed one gets slower, 6.5 ms
+    /// against 3.5, since every vector is unpacked on the way out. Lookups by key and writes are
+    /// unmoved. So this is memory, and a wager on which of those two a lake is read for.
+    ///
+    /// Only what is there when the build ends. A row written after that is held uncompressed, and
+    /// nothing checkpoints a second time.
+    public bool Compress { get; set; }
+
     /// Sort and limit a small materialized table's rows here rather than in DuckDB. DuckDB's sort
     /// costs what a row is *wide* rather than what a table is long -- ~1.3 ms plus ~50 µs a column,
     /// unchanged between twelve rows and twelve hundred -- so on the table an ORM keeps asking about

@@ -44,6 +44,9 @@ public class ServeCommand : LoggingCommand
     [Option("--store-mode", Description = "Whether the store is the lake's state (keep, the default) or only where its tables live (spill).")]
     public StoreMode? StoreMode { get; set; }
 
+    [Option("--compress", Description = "Checkpoint once the lake is built, so DuckDB compresses what it holds in memory.")]
+    public bool Compress { get; set; }
+
     [Option("--no-sort-small-tables", Description = "Leave a small materialized table's sorting and limiting to DuckDB, which is on by default.")]
     public bool NoSortSmallTables { get; set; }
 
@@ -117,6 +120,7 @@ public class ServeCommand : LoggingCommand
         if (Materialize) config.Materialize = true;
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;
+        if (Compress) config.Compress = true;
         if (NoSortSmallTables) config.SortSmallTables = false;
         if (NoCheckKeys) config.CheckKeys = false;
         if (SerializeTransactions) config.SerializeTransactions = true;

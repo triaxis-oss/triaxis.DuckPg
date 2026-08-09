@@ -63,3 +63,31 @@ into the file on every start and the delta goes out at shutdown, as for an in-me
 lake. Use it when a lake is larger than the RAM you want to give it and the layers are still the
 source of truth; use the default `keep` when the file is. The two must not share a path — nothing in a
 DuckDB file says which mode wrote it, so a `spill` start would rebuild a kept store from the layers.
+
+## Compressing what is held
+
+**`--compress`** is the other answer to a materialized lake's memory, and it keeps the tables where
+they are. DuckDB writes table data uncompressed and compresses it at a checkpoint, which nothing
+drives an in-memory database to — so a lake that collapsed its layers holds every column in its
+widest form until something asks. This asks, once, when the build ends. Measured over 5M rows of a
+five-column table, medians through the wire:
+
+| | as built | compressed |
+|---|---|---|
+| held in memory | 279.7 MB | **64.0 MB** |
+| build | 0.7 s | 1.1 s |
+| `count(*) WHERE note = 'order-42'` | 14.6 ms | **4.3 ms** |
+| `sum(amount) WHERE bucket = 3` | **3.5 ms** | 6.5 ms |
+| a row by its key | 0.63 ms | 0.60 ms |
+| a one-row `UPDATE` | 9.9 ms | 10.0 ms |
+
+So it is off by default, because it is a wager rather than a win: filtering a string is compared
+against the dictionary instead of against every row and gets ~3.4× faster, while an aggregate over a
+bit-packed column is unpacked a vector at a time and gets ~1.9× slower. Lookups by key and writes
+never notice either way. Turn it on for the memory, and for a lake read mostly by predicates over
+repetitive text; leave it off for one that scans numbers.
+
+A checkpoint is the whole database's, so the tables a YAML or JSON layer was read into are
+compressed too and a layered lake can ask for this as well — though there it is only those tables,
+parquet being scanned where it lies. Only what is there when the build ends is covered: a row
+written after that is held as it arrived, and nothing checkpoints a second time.
