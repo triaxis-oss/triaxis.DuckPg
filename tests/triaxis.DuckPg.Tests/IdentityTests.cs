@@ -91,6 +91,33 @@ public class IdentityTests
         Assert.Equal(["42|23|True"], lake.Query("SELECT id, amount, flag FROM lake.orders WHERE id = 42"));
     }
 
+    /// The same asked of a base, which has no dacpac to read a default off: the bake put it on the
+    /// table, so the copy is holding it and the answer is the one the layers would have given.
+    [Fact]
+    public void ABaseAnswersForItsDefaultsToo()
+    {
+        using var lake = Lake();
+        Dacpac.Write(lake.At("schema", "test.dacpac"), Orders("bigint"));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Baked("baked.duckdb");
+
+        lake.Config.Dacpac = null;
+        lake.FromBase().Start();
+
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        using var command = new SqlCommand(
+            "INSERT INTO [orders] ([amount]) OUTPUT INSERTED.[id], INSERTED.[flag] VALUES (23)", connection);
+        using (var reader = command.ExecuteReader())
+        {
+            Assert.True(reader.Read());
+            Assert.Equal(42L, Convert.ToInt64(reader.GetValue(0)));
+            Assert.True(reader.GetBoolean(1));
+        }
+
+        Assert.Equal(["42|23|True"], lake.Query("SELECT id, amount, flag FROM lake.orders WHERE id = 42"));
+    }
+
     /// A default that is not a constant has to be the same value in both places, or the row a caller
     /// holds is not the row the lake wrote.
     [Fact]

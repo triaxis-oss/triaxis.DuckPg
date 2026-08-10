@@ -163,4 +163,70 @@ public class BaseTests
         var refused = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
         Assert.Contains("already collapsed", refused.Message);
     }
+
+    /// The same layers, served the three ways a lake can serve them. Whatever reads one has to be
+    /// able to swap `Layers` for a `Base` cut from them without its answers changing: a caller
+    /// capturing rows from one and comparing them against rows from the other reads every difference
+    /// as a row that changed. So the three are asked the same question rather than each being asked
+    /// its own, and each is written to first, since a mode can also disagree about what it was just
+    /// given.
+    ///
+    /// Every way a nullable column can come by a value is in here at once, because they are what the
+    /// three modes can disagree about: `given` is what a layer file holds, `written` is what a client
+    /// sends -- zero among them, which is the value a mode that lost it would answer NULL for -- and
+    /// `stamped` is what a declared default fills in, both over a file's null and over a write that
+    /// left the column out.
+    [Fact]
+    public void TheSameLayersAnswerAlikeServedEveryWay()
+    {
+        using var layered = Readings();
+        using var materialized = Readings();
+        using var based = Readings();
+
+        layered.Start();
+        materialized.Materialized().Start();
+        based.Baked("baked.duckdb");
+        // Nothing of what it was baked from: a base answers out of its own file or it cannot agree.
+        based.Config.Dacpac = null;
+        based.FromBase().Start();
+
+        foreach (var lake in (TestLake[])[layered, materialized, based])
+        {
+            lake.Execute("UPDATE lake.readings SET written = 0 WHERE reading_id = 2");
+            lake.Execute("INSERT INTO lake.readings (reading_id, given, written) VALUES (3, 7, 0)");
+            lake.Execute("INSERT INTO lake.readings (reading_id) VALUES (4)");
+        }
+
+        string[] expected = [
+            "1|4|11|kept",          // as the layer file has it
+            "2|<null>|0|none",      // a written zero over a file's null, and the default over another
+            "3|7|0|none",           // a written zero on a row no file carries
+            "4|<null>|<null>|none", // and a write that named neither
+        ];
+        Assert.Equal(expected, Readings(layered));
+        Assert.Equal(expected, Readings(materialized));
+        Assert.Equal(expected, Readings(based));
+    }
+
+    static TestLake Readings([System.Runtime.CompilerServices.CallerMemberName] string name = "")
+    {
+        var lake = new TestLake(name)
+            .Json("base", "readings", """
+                [{"reading_id": 1, "given": 4, "written": 11, "stamped": "kept"},
+                 {"reading_id": 2, "given": null, "written": null, "stamped": null}]
+                """)
+            .Stack("base")
+            .WriteTo("local");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), new Dacpac.TableModel("readings",
+            [("reading_id", "int"), ("given", "int"), ("written", "int"), ("stamped", "nvarchar")],
+            ["reading_id"],
+            Defaults: [("stamped", "('none')")]));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        return lake;
+    }
+
+    static List<string> Readings(TestLake lake) =>
+        lake.Query("SELECT reading_id, coalesce(given::VARCHAR, '<null>'), " +
+                   "coalesce(written::VARCHAR, '<null>'), coalesce(stamped, '<null>') " +
+                   "FROM lake.readings ORDER BY reading_id");
 }

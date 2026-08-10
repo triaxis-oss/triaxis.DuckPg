@@ -375,7 +375,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
         using var command = conn.CreateCommand();
         command.CommandText =
-            "SELECT table_name, column_name, data_type FROM information_schema.columns " +
+            "SELECT table_name, column_name, data_type, column_default FROM information_schema.columns " +
             "WHERE table_catalog = current_database() AND table_schema = ? ORDER BY table_name, ordinal_position";
         command.Parameters.Add(new DuckDBParameter(config.Schema));
 
@@ -384,8 +384,15 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         {
             var (table, column) = (reader.GetString(0), reader.GetString(1));
             if (!shapes.TryGetValue(table, out var columns)) shapes[table] = columns = [];
-            columns.Add(new Column(column, reader.GetString(2), Identity:
-                (identities.GetValueOrDefault(table) ?? []).Contains(column, StringComparer.OrdinalIgnoreCase)));
+            columns.Add(new Column(column, reader.GetString(2),
+                // The bake put the declared defaults on the tables, so DuckDB holds them and an
+                // insert leaving the column out is stamped whether anything here reads them or not.
+                // What reading them buys is the two questions only the catalog can answer: what an
+                // OUTPUT of such a column says, and what `ON DELETE SET DEFAULT` writes. Both halves
+                // are the expression, the other one filling a read layer's gaps and a base being a
+                // lake with no layers left to fill.
+                Default: reader.IsDBNull(3) ? null : new ColumnDefault(reader.GetString(3), reader.GetString(3)),
+                Identity: (identities.GetValueOrDefault(table) ?? []).Contains(column, StringComparer.OrdinalIgnoreCase)));
         }
         return shapes;
     }
@@ -1213,6 +1220,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             promoted.Add(table.Name);
             rows[table.Name] = Count(conn, table);
             Keyed(conn, table);
+            Stamps(conn, table);
             foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             return;
         }
@@ -1234,7 +1242,26 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         promoted.Add(table.Name);
         rows[table.Name] = Count(conn, table);
         Keyed(conn, table);
+        Stamps(conn, table);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
+    }
+
+    /// The declared defaults, put back onto the table the collapse produced. A materialized table is
+    /// the write branch as well as the read layers, and the two halves of a default are different
+    /// things: the merge wrote each one's *value* into the rows it collapsed, while what stamps a row
+    /// written from now on is the expression -- which CTAS carries no trace of. Without this the one
+    /// table that is its own write branch is the one that stamps nothing, so an insert leaving the
+    /// column out is a NULL here and the declared value on the same lake serving views, which is what
+    /// SQL Server would have written. Said again for a store that already holds the table, a default
+    /// being replaced rather than refused when it is already there.
+    ///
+    /// A baked database gets it by being materialized, so the copy a base is served from carries the
+    /// defaults in DuckDB's own catalog -- which is what `Shapes` reads back out of it.
+    static void Stamps(DuckDBConnection conn, Table table)
+    {
+        foreach (var column in table.Columns.Where(c => c.Default is not null))
+            Exec(conn, $"ALTER TABLE {table.QualifiedName} ALTER COLUMN {SqlText.Quote(column.Name)} " +
+                       $"SET DEFAULT {column.Default!.Expr}");
     }
 
     /// The declared key, held by DuckDB itself. A materialized table is the whole of what the lake
