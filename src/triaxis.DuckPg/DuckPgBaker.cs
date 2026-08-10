@@ -26,10 +26,12 @@ public enum BakeFormat
 /// bake owns and releases everything it was built from.
 public interface IDuckPgBaker
 {
-    /// What a baked database is created with when nothing says otherwise. A block is allocated
-    /// whole, so a lake of many small tables is mostly blocks -- 300 of them came to 159 MB at
-    /// DuckDB's own 256 KB and 18.7 MB at this. It cannot be changed once the file exists.
-    public const int DefaultBlockSize = 16384;
+    /// What a baked database is created with when nothing says otherwise, and the middle of the
+    /// 16 KB to 256 KB DuckDB allows, both ends of which cost something: a block is allocated whole,
+    /// so the largest makes a lake of many small tables mostly padding, and a compressed segment has
+    /// to fit its block, so the smallest stops a big table compressing at all. It cannot be changed
+    /// once the file exists.
+    public const int DefaultBlockSize = 65536;
 
     /// Builds the lake `config` describes and writes it to `target`. `format` unset is taken from
     /// the name -- `.duckdb` is a database and anything else a directory of parquet -- and named is
