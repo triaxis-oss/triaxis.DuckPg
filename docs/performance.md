@@ -176,10 +176,13 @@ says the store fills in — is in a `duckpg` schema in the same file.
 
 **The base is never written to.** The run copies it — to the `--store` if there is one and to a
 scratch file otherwise — and serves the copy, so a thousand runs share one file and each gets the
-state it was baked with. Copying is the whole cost, which is why the file is created with a small
-block size: a block is allocated whole, so a lake of many small tables is mostly blocks. Those 300
-tables came to 159 MB at DuckDB's own 256 KB and 18.7 MB at the 16 KB this uses, which is 9 ms to
-copy against 172. `--block-size` raises it where the tables are big enough to want the bigger one.
+state it was baked with. Copying is the whole cost, which is why the file is created with a block
+size smaller than DuckDB's own: a block is allocated whole, so a lake of many small tables is mostly
+blocks. Those 300 tables came to 159 MB at DuckDB's 256 KB and 18.7 MB at 16 KB, which is 9 ms to
+copy against 172. That 16 KB is DuckDB's smallest and has a cost of its own — a compressed segment
+has to fit its block, so a big table stops compressing — which is why the file is created at 64 KB,
+the middle of the 16-to-256 DuckDB allows. `--block-size` moves it either way for a lake that is all
+of one shape.
 
 **Writes persist exactly as they do without a bake.** The base stays attached read-only and is what
 the delta at shutdown is measured against — the same thing the `base` schema holds for a lake cut

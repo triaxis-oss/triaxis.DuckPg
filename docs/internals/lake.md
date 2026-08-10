@@ -212,6 +212,12 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   18.7 MB at 16 KB -- 9 ms to copy against 172, paid by every run. It is fixed when the file is
   created, so `AddDuckPgBake` registers the connection *before* `AddDuckPgLake` does, `TryAdd` leaving
   the first standing.
+- **64 KB is the middle of the range, and both ends of it cost something.** DuckDB takes 16 KB to
+  256 KB and refuses either side. At the top those 300 tables are mostly padding; at the bottom a
+  compressed segment no longer fits its block, and DuckDB's analyze pass takes the scheme that fits
+  or none -- so a table big enough to want compression gets none, which is slower *and* bigger: 5M
+  rows of five columns came to 138.9 MB and 3.0 s at 16 KB against 76.4 MB and 2.3 s at 64. A lake
+  that is all of one shape says `--block-size` instead.
 - **A factory, though, and never the connection itself.** The container closes what it built and
   leaves an instance handed to it alone, so registering one wrote the file and then held it open for
   the life of the process. What that costs is not the handle: the driver keeps a database per
