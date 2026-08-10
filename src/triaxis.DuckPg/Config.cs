@@ -10,6 +10,14 @@ public sealed class Config
     /// Listen address for the TDS front door, which SqlClient speaks. Off unless it is set.
     public string? Tds { get; set; }
 
+    /// What a TDS packet carries, in bytes. A client asks for a size in LOGIN7 and the server's
+    /// answer -- ENVCHANGE 4, in the login response -- is what both then use, so this raises a client
+    /// that asked for less as much as it holds down one that asked for more. Bigger is fewer packet
+    /// headers, fewer writes to the socket, and less of a packet given up by the row that ended it
+    /// early to stay out of the seam; the default is the largest TDS allows, since a lake answers
+    /// with rows far more often than it answers with one value. 512 to 32767.
+    public int TdsPacketSize { get; set; } = 32767;
+
     /// Schema the generated views live in. Whatever it is called, it goes in front of every
     /// session's search path, so an unqualified name finds it without the caller knowing the name.
     public string Schema { get; set; } = "lake";
@@ -186,6 +194,10 @@ public sealed class Config
         if (Listen is not { Length: > 0 } && Tds is not { Length: > 0 })
             throw new DuckPgConfigurationException(
                 "no front door to open: set `listen` for the PostgreSQL protocol, `tds` for SQL Server's, or both");
+
+        if (TdsPacketSize is < 512 or > 32767)
+            throw new DuckPgConfigurationException(
+                $"`tdsPacketSize: {TdsPacketSize}` is not a packet TDS can carry -- it is 512 to 32767 bytes");
 
         ValidateShape();
     }

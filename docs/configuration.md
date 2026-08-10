@@ -17,6 +17,7 @@ defaults.
 |---|---|---|
 | `listen` | `--pgwire`, `-l` | PostgreSQL listen address. Default `127.0.0.1:55432`; port 0 binds a free one. |
 | `tds` | `--tds` | TDS listen address, e.g. `127.0.0.1:1433`. Off unless set. |
+| `tdsPacketSize` | `--tds-packet-size` | Bytes a TDS packet carries, 512 to 32767. Default 32767: the server's answer settles it, whatever the client asked for. |
 | `schema` | `--schema` | Schema the published views live in, and the front of every session's search path. Default `lake`. |
 | `layers` | positional | Layer directories, lowest first. |
 | `base` | `--base` | A baked database served instead of layers, copied on the way up and never written to. |

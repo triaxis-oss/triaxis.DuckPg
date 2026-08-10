@@ -42,6 +42,12 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   connection string. TDS otherwise encrypts the login packet even in a plaintext session.
 - **A cancel arrives on the same connection as the query**, unlike PostgreSQL's second connection.
   It is only noticed between row packets; see `TdsSession.Canceled`.
+- **The packet size a client asks for in LOGIN7 is a request, not a setting.** TDS lets the server
+  answer with its own, in ENVCHANGE 4, and both then use that -- SqlClient resizes its buffers on the
+  token before it reads anything else. So `Config.TdsPacketSize` is what the door chunks to, and the
+  default is 32767 rather than the 8000 SqlClient asks for: a packet costs a header and a write to
+  the socket, and one that a row ends early to stay out of the seam gives up whatever was left of it,
+  so the bigger the packet the less of both a result set pays.
 - **Nothing may be cut across the seam between two packets.** SqlClient reassembles a read that
   ended mid-packet by replaying the framing it had begun, and framing split across the seam loses
   it its place -- it then reads response bytes as a length, and the failure surfaces much later,

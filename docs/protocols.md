@@ -70,6 +70,11 @@ the login packet even when the session itself is plaintext, and that needs a cer
 no business owning. Bind it to localhost. Both doors share one lake, one catalog and one write layer:
 a row inserted over TDS is in the same file a `psql` session reads a moment later.
 
+**The packet size is the server's to decide.** A client asks for one — SqlClient's `Packet Size`
+defaults to 8000 — and the login response answers with what the door will actually use, which is
+`tdsPacketSize`, 32767 by default. Lowering it is for a client that cannot be talked out of a small
+buffer; nothing else wants smaller packets.
+
 | What SqlClient does | What answers it |
 |---|---|
 | Login, `SELECT`, typed `SqlDataReader` reads, `NULL`s | COLMETADATA / ROW / DONE |

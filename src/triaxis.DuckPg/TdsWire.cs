@@ -159,12 +159,12 @@ sealed class TdsWire(Stream stream, ILogger logger)
 {
     readonly byte[] header = new byte[8];
 
-    /// What the client asked for in LOGIN7, within reason. Responses are chunked to it.
+    /// What the handshake settled on. Until it has, TDS's own default, which is what a client sends
+    /// its login in and reads the answer to that login out of.
     public int PacketSize { get; set; } = 4096;
 
-    /// What one packet carries, and so where a value has to break off and start a new chunk. TDS's
-    /// smallest legal packet is 512, and a client that negotiated one has a buffer that size.
-    public int Payload => Math.Max(PacketSize, 512) - 8;
+    /// What one packet carries, and so where a value has to break off and start a new chunk.
+    public int Payload => PacketSize - 8;
 
     /// A client that cancels sends an Attention on the same connection, so a query in flight has
     /// to be able to notice one arriving without blocking on the socket.
