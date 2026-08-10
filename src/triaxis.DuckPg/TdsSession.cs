@@ -156,8 +156,11 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         var reader = new TdsReader(payload);
         reader.Skip(4);
         tdsVersion = reader.I32();
-        var packetSize = reader.I32();
-        if (packetSize is >= 512 and <= 32767) wire.PacketSize = packetSize;
+        // What a client sends here is a request, and TDS lets the server answer with a size of its
+        // own that both then use -- so how a response is chunked is the lake's to decide rather than
+        // SqlClient's 8000-byte default's.
+        var requested = reader.I32();
+        wire.PacketSize = gateway.Config.TdsPacketSize;
 
         // The fixed part is 36 bytes; after it come offset/length pairs into the same buffer.
         string Field(int index)
@@ -181,7 +184,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
         var msg = new TdsMsg();
         EnvChange(msg, 1, login["database"], "");
-        EnvChange(msg, 4, wire.PacketSize.ToString(), "4096");
+        EnvChange(msg, 4, wire.PacketSize.ToString(), requested.ToString());
         // Without a collation SqlClient has nothing to encode a string parameter with, and fails
         // inside its own RPC writer before anything reaches the wire.
         Collation(msg);

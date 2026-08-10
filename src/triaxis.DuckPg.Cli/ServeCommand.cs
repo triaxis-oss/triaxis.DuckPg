@@ -15,6 +15,9 @@ public class ServeCommand : LakeCommand
     [Option("--tds", Description = "Listen address for the TDS front door, which SqlClient speaks.")]
     public string? Tds { get; set; }
 
+    [Option("--tds-packet-size", Description = "Bytes a TDS packet carries, 512 to 32767. The server's answer to what the client asked for. Default 32767.")]
+    public int? TdsPacketSize { get; set; }
+
     [Option("--write-format", Description = "Format a table is persisted in when the write layer has no file for it yet.")]
     public LayerFormat? WriteFormat { get; set; }
 
@@ -84,6 +87,7 @@ public class ServeCommand : LakeCommand
         // Arguments win over the file, and are relative to the working directory rather than to it.
         if (PgWire is not null) config.Listen = PgWire;
         if (Tds is not null) config.Tds = Tds;
+        if (TdsPacketSize is { } packet) config.TdsPacketSize = packet;
         if (WriteFormat is { } format) config.WriteFormat = format;
         if (Writable) config.Writable = true;
         if (Base is not null) config.Base = Path.GetFullPath(Base);

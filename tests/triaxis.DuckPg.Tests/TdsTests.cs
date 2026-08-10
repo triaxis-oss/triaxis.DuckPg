@@ -120,11 +120,12 @@ public class TdsTests : IDisposable
     public void LongResultsSurviveASplitRead(string sql, int expected, int packet)
     {
         if (sql == "WIDE") sql = WideRows(expected);
+        lake.Config.TdsPacketSize = packet;
 
         using var delivery = new SplitDelivery(lake.TdsPort, piece: 13).Start();
         using var connection = new SqlConnection(
             $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
-            $"Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false;Packet Size={packet}");
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
         connection.Open();
 
         using var command = new SqlCommand(sql, connection) { CommandTimeout = 30 };
@@ -146,10 +147,12 @@ public class TdsTests : IDisposable
     [Fact]
     public void PacketsEndWhereRowsDo()
     {
+        lake.Config.TdsPacketSize = 8000;
+
         using var delivery = new SplitDelivery(lake.TdsPort, piece: 4096).Start();
         using var connection = new SqlConnection(
             $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
-            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false;Packet Size=8000");
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
         connection.Open();
 
         using (var command = new SqlCommand(WideRows(400), connection))
@@ -162,6 +165,46 @@ public class TdsTests : IDisposable
         Assert.True(rows.Count == 400, $"walked {rows.Count} rows");
         Assert.True(boundaries.Count > 20, $"only {boundaries.Count} packets");
         Assert.DoesNotContain(rows, row => boundaries.Any(at => row.Start < at && at < row.End));
+    }
+
+    /// What a client asks for is a request; the door answers with its own size and both use that.
+    /// Checked on the bytes rather than on what SqlClient reports, and on one value long enough to
+    /// fill packets whole -- rows end a packet early, so a result set of them never reaches the size.
+    [Theory]
+    [InlineData(512)]
+    [InlineData(8192)]
+    [InlineData(32767)]
+    public void PacketsAreTheSizeTheDoorAnswersWith(int configured)
+    {
+        lake.Config.TdsPacketSize = configured;
+
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false;Packet Size=4096");
+        connection.Open();
+
+        using (var command = new SqlCommand("SELECT repeat('x', 200000) AS s", connection))
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) Assert.Equal(200000, reader.GetString(0).Length);
+
+        Thread.Sleep(200);
+        Assert.Equal(configured, Longest(delivery.Captured));
+        Assert.Equal(configured, connection.PacketSize);
+    }
+
+    /// The longest packet the server sent, which is the size the login settled on: a response bigger
+    /// than one packet fills at least one.
+    static int Longest(byte[] captured)
+    {
+        var longest = 0;
+        for (var at = 0; at + 8 <= captured.Length;)
+        {
+            var length = BinaryPrimitives.ReadUInt16BigEndian(captured.AsSpan(at + 2));
+            longest = Math.Max(longest, length);
+            at += length;
+        }
+        return longest;
     }
 
     /// Reassembles the longest response in a capture, and reports where its packets ended and where
