@@ -92,8 +92,11 @@ public static class DuckPgServiceCollectionExtensions
         // Before the lake's own connection rather than after: `TryAdd` leaves the first standing,
         // and a database's block size is fixed when the file is created -- there is no setting it
         // on a database that already exists.
+        // A factory and not the connection itself: the container disposes what it built and leaves
+        // an instance handed to it alone, so a bake registering one would write the file and then
+        // hold it open for as long as the process lived.
         if (blockSize > 0 && config.Store is { Length: > 0 } target)
-            services.AddSingleton(new DuckDBConnection($"Data Source={target};default_block_size={blockSize}"));
+            services.AddSingleton(_ => new DuckDBConnection($"Data Source={target};default_block_size={blockSize}"));
 
         services.AddDuckPgLake(config);
         services.TryAddSingleton<Bake>();

@@ -269,6 +269,28 @@ public class BakeTests
         Assert.Empty(Rows(duck, $"SELECT * FROM {Bake.Identified}"));
     }
 
+    /// A bake is done with the file when it returns, which takes the container closing the
+    /// connection it wrote through -- and it only closes what it built, so a connection handed to it
+    /// ready-made is one nothing ever closes. Left open, the file stays locked for the life of the
+    /// process, and the driver holds a database per connection string: the next bake over the same
+    /// target deletes the file, is handed that same still-open database back, and writes into the
+    /// inode nobody can reach any more.
+    [Fact]
+    public void ADatabaseBakeIsDoneWithTheFileItWrote()
+    {
+        using var lake = new TestLake()
+            .Yaml("base", "orders", "- order_id: 1")
+            .Stack("base");
+
+        lake.Baked("baked.duckdb");
+        File.WriteAllText(lake.At("base", "orders.yaml"), "- order_id: 2\n");
+        lake.Baked("baked.duckdb");
+
+        using var duck = new DuckDBConnection($"Data Source={lake.At("baked.duckdb")}");
+        duck.Open();
+        Assert.Equal(["2"], Rows(duck, "SELECT order_id FROM lake.orders"));
+    }
+
     /// The name is a default and not the mechanism: a caller that says which one it wants gets it,
     /// whatever the file is called.
     [Fact]
