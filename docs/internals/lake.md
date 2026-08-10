@@ -212,6 +212,12 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   18.7 MB at 16 KB -- 9 ms to copy against 172, paid by every run. It is fixed when the file is
   created, so `AddDuckPgBake` registers the connection *before* `AddDuckPgLake` does, `TryAdd` leaving
   the first standing.
+- **A factory, though, and never the connection itself.** The container closes what it built and
+  leaves an instance handed to it alone, so registering one wrote the file and then held it open for
+  the life of the process. What that costs is not the handle: the driver keeps a database per
+  connection string, so the next bake over the same target deleted the file, was handed that same
+  still-open database back, and wrote into an inode nothing could reach -- and on macOS the file it
+  had just written could not be read at all while the process that wrote it was still holding it.
 - **Attaching the base doubles the catalog, and DuckDB says nothing about it.** The base holds the
   same schema name and the same table names as the copy being served, and `information_schema` and
   the `duckdb_*` functions span every attached database -- so every table was found twice and every
