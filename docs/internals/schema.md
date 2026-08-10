@@ -15,6 +15,17 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   Only a default the merge depends on -- on a key column, or under a filter or a virtual column --
   is written into the copy. `Catalog.Signature` keys on a default's declared expression and not on
   what it evaluated to, or every stamped table would rebuild on every restart.
+- **A materialized table is both of those at once, so `Catalog.Stamps` puts the expression back on
+  it.** The merge wrote each default's *value* into the rows it collapsed, and CTAS carries no trace
+  of the declaration -- so without an `ALTER TABLE … ALTER COLUMN … SET DEFAULT` after it, the one
+  table that is its own write branch is the one that stamps nothing: an insert leaving the column
+  out is a NULL here and the declared value on the same lake serving views, which is the value SQL
+  Server would have written. Said again for a `--store` that already holds the table, a default
+  being replaced rather than refused when it is there already. A baked database gets it by being
+  materialized, so the copy a base serves carries the defaults in DuckDB's own catalog and a plain
+  insert into it is stamped by DuckDB; `Shapes` reads `column_default` back out for the two
+  questions only the catalog can answer -- what an OUTPUT of such a column says, and what
+  `ON DELETE SET DEFAULT` writes.
 - **An id a file does not carry can be per row, but only if it is derived.** `Catalog.Derived` is
   what `--derive-ids` turns on, and it replaces `ColumnDefault.Value` in the two places a read layer's
   gap is filled -- `Catalog.Value` for a layer branch and `Catalog.Over` for a `--cache` copy, both
