@@ -47,6 +47,15 @@ rely on:
 - Text **and binary** result formats, binary parameters including PG's base-10000 `numeric`.
 - Cancellation over the second connection → `duckdb_interrupt`.
 - psql introspection: `\dv`, `\d`.
+- The catalog a GUI client reads: a view definition by name (`pg_get_viewdef('"lake"."orders"'::regclass)`),
+  `pg_statio_user_tables`, `quote_ident`. A relation's size on disk is answered with NULL — what a
+  lake publishes is a view over files.
+- The function list: `pg_get_function_identity_arguments`, and a `pg_proc` carrying the
+  `proiswindow` DuckDB's lacks — nothing is one, since DuckDB reports a window function as an
+  aggregate.
+- `pg_constraint` publishes the keys and references the **lake** declares, since those are rules over
+  the merged view and not constraints DuckDB holds. A declared unique is not among them: a layered
+  lake does not keep one.
 
 Type mapping covers the scalar types; `LIST`, `STRUCT` and `MAP` are surfaced as text holding their
 JSON rendering, which is what a PG client can actually consume. Npgsql is the client held to a

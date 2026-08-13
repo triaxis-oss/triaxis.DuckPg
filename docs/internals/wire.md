@@ -25,6 +25,27 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
 - With the syscalls gone, allocation is what is left: a row is formatted straight into a `Msg` that
   the loop reuses (`Utf8`, `Format`, `BeginField`), never into a `byte[]` or a `string` per value.
   Anything on the row path that returns a fresh array puts the ceiling back.
+- **A GUI client reads the catalog through casts and arities psql never uses.** `regclass` is a real
+  type in `Shims.Macros` rather than another textual replacement, because `Shims.Apply` only touches
+  SQL that names `pg_catalog.` and a client casting `'"lake"."orders"'::regclass` need not. DuckDB's
+  own `pg_get_viewdef` takes an oid and nothing else, and arity is checked before the argument's type
+  is looked at, so the two-argument pretty form is refused whatever the name resolves to -- which is
+  why it is shadowed by one that takes both, and answers to a name as well as to an oid. A size
+  (`pg_total_relation_size` and its kin) is NULL rather than 0: 0 is what an empty table reports, and
+  a view over files is not one.
+- **`pg_constraint` is the lake's, not DuckDB's.** Its shape is wrong -- `confkey` is an integer
+  where PostgreSQL has a list, so a client unnesting it is refused before the row count matters --
+  and so are its contents: a layered table is a view, which carries no constraint at all, while the
+  keys and references the lake enforces are rules over the merged view that only the catalog knows
+  ([schema](schema.md)). So `Catalog.Constraints` writes what is declared into `duckpg_constraints`
+  after the relations exist -- attribute numbers are DuckDB's to hand out -- and the shim view joins
+  it back into PostgreSQL's shape. Uniques are left out: publishing one would promise a rule a
+  layered lake does not keep.
+- **A macro body sees the caller's aliases.** `pg_get_function_identity_arguments` reads `pg_proc`
+  with an alias of its own for that reason: a client selecting `FROM pg_proc p` and a body that also
+  said `p` compares the row to itself, and every function comes back with the same argument list --
+  an answer, and the wrong one, which is worse than the error it replaced. DuckDB gives several
+  functions one oid, so where its catalog cannot tell two apart neither can this.
 - `Describe('S')` must answer, or `cmd.Prepare()` fails. DuckDB cannot bind a statement with open
   parameters, so typed `NULL`s are substituted and the query run `LIMIT 0`.
 

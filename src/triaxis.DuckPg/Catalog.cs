@@ -126,6 +126,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (config.Base is { Length: > 0 }) Adopted(conn);
         else { Declared(); Macros(conn); Declared(conn); }
 
+        // Once every relation a constraint names is published, since the columns are answered for
+        // by attribute number and nothing has one until it exists.
+        Constraints(conn);
+
         Empty();
 
         // DuckDB writes table data uncompressed and compresses it at a checkpoint, which no WAL
@@ -855,6 +859,58 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         foreach (var name in pending.Keys)
             logger.LogWarning("view {View} skipped: {Reason}", name, refused.GetValueOrDefault(name, "unknown"));
     }
+
+    // ---- declared constraints --------------------------------------------------------------------
+
+    /// What this lake keeps, written where the `pg_constraint` shim reads it. A declared key and a
+    /// declared reference are rules over the merged view rather than constraints on a table, so
+    /// DuckDB's own catalog has nothing to say about either: a layered table is a view, and a view
+    /// holds no constraints. One row per column of each, since the key a client is answered with is
+    /// a list and the shim puts it back together.
+    ///
+    /// Keys and references only. A declared unique is a rule this lake does not keep unless DuckDB
+    /// is keeping it -- publishing one would promise what a layered lake does not do.
+    void Constraints(DuckDBConnection conn)
+    {
+        Exec(conn, $"DELETE FROM {Shims.Constraints}");
+
+        var values = new List<string>();
+        var ordinal = 0;
+
+        void Add(string name, string type, Table table, string[] columns,
+                 string? parent, string[]? parentColumns, string? onDelete)
+        {
+            ordinal++;
+            for (var i = 0; i < columns.Length; i++)
+                values.Add($"({SqlText.Literal(name)}, {SqlText.Literal(type)}, " +
+                           $"{SqlText.Literal(table.Schema)}, {SqlText.Literal(table.Name)}, " +
+                           $"{SqlText.Literal(columns[i])}, {i}, {Text(parent)}, " +
+                           $"{Text(parentColumns?[i])}, {Text(onDelete is null ? null : "a")}, " +
+                           $"{Text(onDelete is null ? null : Performs(onDelete))}, {ordinal})");
+        }
+
+        foreach (var table in Tables.Values.Where(table => table.Key.Length > 0))
+            Add($"PK_{table.Name}", "p", table, table.Key, null, null, null);
+
+        foreach (var reference in References)
+            Add(reference.Name, "f", Tables[reference.Table], reference.Columns,
+                Tables[reference.Parent].Name, reference.ParentColumns, reference.OnDelete);
+
+        if (values.Count > 0)
+            Exec(conn, $"INSERT INTO {Shims.Constraints} VALUES {string.Join(", ", values)}");
+    }
+
+    static string Text(string? value) => value is null ? "NULL" : SqlText.Literal(value);
+
+    /// What PostgreSQL calls the action, as the resolved one this lake actually performs. Nothing at
+    /// all happens on an update, which is `a`.
+    static string Performs(string onDelete) => onDelete switch
+    {
+        Cascade => "c",
+        SetNull => "n",
+        SetDefault => "d",
+        _ => "a",
+    };
 
     // ---- declared defaults -----------------------------------------------------------------------
 

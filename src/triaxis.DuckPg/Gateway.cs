@@ -1057,8 +1057,28 @@ static class Shims
         ("pg_catalog.", ""),
     ];
 
+    /// The table the `pg_constraint` shim reads. Filled by the catalog, because what a lake enforces
+    /// is what it was declared with rather than anything DuckDB holds.
+    public const string Constraints = "duckpg_constraints";
+
     /// Installed once on the shared catalog. `duckpg_pg_class` fills the gaps in DuckDB's pg_class
     /// that psql's \d relies on -- this is the part of a PG frontend that never really finishes.
+    ///
+    /// A GUI client asks the catalog more than psql does. `regclass` is a type rather than another
+    /// entry in `Replacements` because `Apply` only reaches SQL that names `pg_catalog.`, and a
+    /// client casting `'"lake"."orders"'::regclass` need not; `pg_get_viewdef` is shadowed because
+    /// DuckDB's own takes an oid and nothing else, and arity is checked before the cast is even
+    /// looked at -- so asking for the pretty form is refused before the argument means anything.
+    /// Ours answers to what a regclass literal actually holds, which is a name.
+    ///
+    /// A size is NULL rather than 0: what a lake publishes is a view over files, and 0 would read
+    /// as a table with nothing in it.
+    ///
+    /// `pg_constraint` is replaced rather than filled in. DuckDB's has the wrong shape -- `confkey`
+    /// is an integer where PostgreSQL has a list, so a client unnesting it is refused -- and the
+    /// wrong contents: a layered table is a view, which holds no constraints at all, while the keys
+    /// and references the lake does enforce are rules over the merged view that only the catalog
+    /// knows. So the rows come from `duckpg_constraints`, and the shape is put back here.
     public const string Macros = """
         CREATE OR REPLACE MACRO duckpg_set_config(name, value, is_local) AS value;
         CREATE OR REPLACE MACRO duckpg_true(oid) AS true;
@@ -1066,6 +1086,32 @@ static class Shims
         CREATE OR REPLACE MACRO duckpg_encoding(oid) AS 'UTF8';
         CREATE OR REPLACE MACRO duckpg_empty(a, b) AS '', (a, b, c) AS '';
         CREATE OR REPLACE MACRO pg_advisory_unlock_all() AS true;
+        CREATE OR REPLACE MACRO pg_total_relation_size(rel) AS NULL::BIGINT;
+        CREATE OR REPLACE MACRO pg_table_size(rel) AS NULL::BIGINT;
+        CREATE OR REPLACE MACRO pg_indexes_size(rel) AS NULL::BIGINT;
+        -- Only what has to be quoted, as PostgreSQL does it: a client that shows the answer shows
+        -- the quotes too.
+        CREATE OR REPLACE MACRO quote_ident(name) AS
+            CASE WHEN regexp_full_match(name, '[a-z_][a-z0-9_$]*') THEN name
+                 ELSE '"' || replace(name, '"', '""') || '"' END;
+        CREATE TYPE IF NOT EXISTS regclass AS VARCHAR;
+        CREATE OR REPLACE MACRO duckpg_viewdef(rel) AS (
+            SELECT sql FROM duckdb_views()
+            WHERE rel::VARCHAR = view_oid::VARCHAR
+               OR lower(replace(rel::VARCHAR, '"', ''))
+                  IN (lower(view_name), lower(schema_name || '.' || view_name))
+            LIMIT 1);
+        CREATE OR REPLACE MACRO pg_get_viewdef(rel) AS duckpg_viewdef(rel),
+                                             (rel, pretty) AS duckpg_viewdef(rel);
+        CREATE OR REPLACE VIEW pg_statio_user_tables AS
+            SELECT c.oid AS relid, n.nspname AS schemaname, c.relname,
+                   0::BIGINT AS heap_blks_read, 0::BIGINT AS heap_blks_hit,
+                   0::BIGINT AS idx_blks_read, 0::BIGINT AS idx_blks_hit,
+                   0::BIGINT AS toast_blks_read, 0::BIGINT AS toast_blks_hit,
+                   0::BIGINT AS tidx_blks_read, 0::BIGINT AS tidx_blks_hit
+            FROM pg_catalog.pg_class AS c
+            JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema');
         CREATE OR REPLACE VIEW duckpg_pg_class AS
             SELECT *, false AS relforcerowsecurity FROM pg_catalog.pg_class;
         CREATE OR REPLACE VIEW pg_namespace AS
@@ -1088,6 +1134,40 @@ static class Shims
                 (1083, 'time', 'D', 8),     (1114, 'timestamp', 'D', 8), (1184, 'timestamptz', 'D', 8),
                 (1186, 'interval', 'T', 16),(1700, 'numeric', 'N', -1),  (2950, 'uuid', 'U', 16)
             ) t(oid, typname, typcategory, typlen);
+        -- The alias is its own, because the caller's is in scope inside a macro body: a client that
+        -- calls this with `pg_proc p` and an alias of `p` here compares the row to itself, which
+        -- matches every function there is. Several of them share an oid, so where the catalog cannot
+        -- tell them apart this answers for the first of them rather than for the one meant.
+        CREATE OR REPLACE MACRO pg_get_function_identity_arguments(func) AS (
+            SELECT coalesce(list_aggregate(duckpg_proc.proargtypes, 'string_agg', ', '), '')
+            FROM pg_catalog.pg_proc AS duckpg_proc WHERE duckpg_proc.oid = func ORDER BY 1 LIMIT 1);
+        -- DuckDB reports a window function as an aggregate and never says `w`, so nothing here is
+        -- one; `pg_proc` is otherwise its own.
+        CREATE OR REPLACE VIEW pg_proc AS
+            SELECT *, false AS proiswindow FROM pg_catalog.pg_proc;
+        CREATE TABLE IF NOT EXISTS duckpg_constraints (
+            conname VARCHAR, contype VARCHAR, nspname VARCHAR, relname VARCHAR, colname VARCHAR,
+            ord INTEGER, parentname VARCHAR, parentcol VARCHAR,
+            confupdtype VARCHAR, confdeltype VARCHAR, conord BIGINT);
+        CREATE OR REPLACE VIEW pg_constraint AS
+            SELECT (c.oid * 1000000 + d.conord)::BIGINT AS oid, d.conname,
+                   n.oid::BIGINT AS connamespace, d.contype,
+                   false AS condeferrable, false AS condeferred, true AS convalidated,
+                   c.oid::BIGINT AS conrelid, 0 AS contypid, 0 AS conindid, 0 AS conparentid,
+                   coalesce(p.oid, 0)::BIGINT AS confrelid,
+                   d.confupdtype, d.confdeltype, 's' AS confmatchtype,
+                   true AS conislocal, 0 AS coninhcount, false AS connoinherit,
+                   list(ca.attnum::BIGINT ORDER BY d.ord) AS conkey,
+                   CASE WHEN d.contype = 'f' THEN list(pa.attnum::BIGINT ORDER BY d.ord) END AS confkey,
+                   NULL::INTEGER AS conpfeqop, NULL::INTEGER AS conppeqop, NULL::INTEGER AS conffeqop,
+                   NULL::INTEGER AS conexclop, NULL::VARCHAR AS conbin
+            FROM duckpg_constraints AS d
+            JOIN pg_catalog.pg_namespace AS n ON n.nspname = d.nspname
+            JOIN pg_catalog.pg_class AS c ON c.relnamespace = n.oid AND c.relname = d.relname
+            JOIN pg_catalog.pg_attribute AS ca ON ca.attrelid = c.oid AND ca.attname = d.colname
+            LEFT JOIN pg_catalog.pg_class AS p ON p.relnamespace = n.oid AND p.relname = d.parentname
+            LEFT JOIN pg_catalog.pg_attribute AS pa ON pa.attrelid = p.oid AND pa.attname = d.parentcol
+            GROUP BY d.conname, d.contype, d.confupdtype, d.confdeltype, d.conord, n.oid, c.oid, p.oid;
         CREATE OR REPLACE VIEW pg_range AS
             SELECT oid AS rngtypid, oid AS rngsubtype, oid AS rngmultitypid, oid AS rngcollation,
                    oid AS rngsubopc, oid AS rngcanonical, oid AS rngsubdiff
