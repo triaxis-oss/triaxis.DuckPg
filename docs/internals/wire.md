@@ -94,6 +94,15 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   framing itself rather than the client's tolerance of it -- SqlClient survives some violations and
   not others, which is how the first version of this fix passed while leaving wide rows broken, and
   how the framing half went unnoticed while the chunks behaved.
+- **A packet reaches the socket as one write.** Header and body written separately are two TCP
+  segments under TCP_NODELAY, the first a naked 8-byte header the client gets as a read of its own --
+  and on macOS loopback, where a 16K MTU already splits every 32K packet, a production capture showed
+  1,701 of them. SqlClient reassembles partial reads by replaying framing, so a stream arriving as
+  header-sized crumbs runs that replay on every packet and intermittently loses its place -- a
+  desync that reads as another column's bytes and reproduces roughly one run in three there, and
+  never on Linux. The TDS side writes through a `BufferedStream` the way the PostgreSQL side always
+  has, and `TdsTests.PacketsLeaveTheSocketCoalesced` counts the writes rather than trusting the
+  segmentation.
 - **The legacy LOB parameter types are still in use.** LLBLGen on the old `System.Data.SqlClient`
   types a string parameter as `NTEXT`, so `TdsTypes.ReadValue` has to know `TEXT`/`NTEXT`/`IMAGE`:
   four bytes of declared maximum instead of two, a collation on the text ones, and a four-byte

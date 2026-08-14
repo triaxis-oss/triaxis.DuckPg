@@ -216,6 +216,14 @@ struct TdsReader(byte[] body)
 /// carrying the end-of-message bit.
 sealed class TdsWire(Stream stream, ILogger logger)
 {
+    /// Written separately, a packet's header and body are two writes, and under TCP_NODELAY two
+    /// segments -- the first a naked 8-byte header, handed to the client as a read of its own.
+    /// SqlClient replays partial reads, and a stream arriving as header-sized crumbs runs that
+    /// replay on every packet; measured on macOS loopback, it sometimes loses. So responses go out
+    /// through a buffer and reach the socket whole. Only the write side: a BufferedStream cannot
+    /// serve both over a socket.
+    readonly Stream output = new BufferedStream(stream, 64 * 1024);
+
     readonly byte[] header = new byte[8];
 
     /// What the handshake settled on. Until it has, TDS's own default, which is what a client sends
@@ -275,7 +283,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
                 Packet(type, body[sent..end], end: false);
                 sent = end;
             }
-            stream.Flush();
+            output.Flush();
         }
 
         if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length}", type, sent);
@@ -299,7 +307,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
             }
 
             Packet(type, body[sent..], end: true);
-            stream.Flush();
+            output.Flush();
         }
 
         if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length} end", type, body.Length);
@@ -315,8 +323,8 @@ sealed class TdsWire(Stream stream, ILogger logger)
         header[6] = 1;
         header[7] = 0;
 
-        stream.Write(header);
-        stream.Write(body);
+        output.Write(header);
+        output.Write(body);
     }
 
     bool TryReadFully(Span<byte> target)
