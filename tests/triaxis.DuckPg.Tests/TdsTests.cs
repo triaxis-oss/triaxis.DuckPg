@@ -167,6 +167,158 @@ public class TdsTests : IDisposable
         Assert.DoesNotContain(rows, row => boundaries.Any(at => row.Start < at && at < row.End));
     }
 
+    /// The seam rule inside a row too big for any packet: such a row has to be cut, and every cut
+    /// falls where a value's chunks say one may -- so no total length, chunk header or terminator
+    /// sits across a packet boundary, and no chunk's bytes run through one. Two string columns whose
+    /// lengths creep at different rates, so over the rows the framing lands on every offset a seam
+    /// can fall on; small packets, so every row is one of these.
+    [Fact]
+    public void PlpFramingStaysOutOfTheSeam()
+    {
+        lake.Config.TdsPacketSize = 512;
+
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
+        connection.Open();
+
+        var sql = "SELECT repeat('x', 400 + r % 300) AS a, repeat('y', 250 + (r * 7) % 350) AS b " +
+                  "FROM range(400) t(r)";
+        using (var command = new SqlCommand(sql, connection) { CommandTimeout = 30 })
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) { reader.GetString(0); reader.GetString(1); }
+
+        Thread.Sleep(200);
+        var (boundaries, body) = Reassemble(delivery.Captured);
+        var seams = boundaries.ToHashSet();
+
+        void Whole(int start, int length, string what)
+        {
+            for (var b = start + 1; b < start + length; b++)
+                Assert.False(seams.Contains(b), $"{what} at {start} sits across the packet seam at {b}");
+        }
+
+        var columns = BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(1));
+        var i = 3;
+        for (var c = 0; c < columns; c++)
+        {
+            i += 4 + 2 + 1 + 2 + 5;
+            i += 1 + body[i] * 2;
+        }
+
+        var rows = 0;
+        while (i < body.Length && body[i] == 0xD1)
+        {
+            i++;
+            for (var c = 0; c < columns; c++)
+            {
+                Whole(i, 8, "a total length");
+                i += 8;
+                while (true)
+                {
+                    Whole(i, 4, "a chunk length");
+                    var chunk = BinaryPrimitives.ReadInt32LittleEndian(body.AsSpan(i));
+                    i += 4;
+                    if (chunk == 0) break;
+                    Whole(i, chunk, "a chunk");
+                    i += chunk;
+                }
+            }
+            rows++;
+        }
+        Assert.Equal(400, rows);
+    }
+
+    /// The client-side shape of the same failure, as it was met in the field: a reader that lost
+    /// its place hands one column's bytes back as another's. The key is asked for first and again
+    /// last, so a slip anywhere between the sentinels shows as them disagreeing -- and the split
+    /// read is forced, since that is what makes the client replay its framing at all.
+    [Fact]
+    public void WideRowsKeepTheirColumns()
+    {
+        lake.Config.TdsPacketSize = 512;
+
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 13).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
+        connection.Open();
+
+        var sql = "SELECT r AS first_key, repeat('x', 400 + r % 300) AS a, " +
+                  "repeat('y', 250 + (r * 7) % 350) AS b, r AS last_key FROM range(400) t(r)";
+        using var command = new SqlCommand(sql, connection) { CommandTimeout = 30 };
+        using var reader = command.ExecuteReader();
+
+        var rows = 0;
+        while (reader.Read())
+        {
+            var r = reader.GetInt64(0);
+            Assert.Equal((int)(400 + r % 300), reader.GetString(1).Length);
+            Assert.Equal((int)(250 + r * 7 % 350), reader.GetString(2).Length);
+            Assert.Equal(r, reader.GetInt64(3));
+            rows++;
+        }
+        Assert.Equal(400, rows);
+    }
+
+    /// The writer's half of the same rule, without a server: wherever in a packet a value starts
+    /// and however long it is, none of its framing and none of its chunks sit across a boundary,
+    /// and the chunks still reassemble to the value. The offsets close to the seam are the ones
+    /// that used to go wrong.
+    [Theory]
+    [InlineData(512)]
+    [InlineData(4096)]
+    [InlineData(32767)]
+    public void PlpFramingFitsWhereverTheValueStarts(int packet)
+    {
+        var payload = packet - 8;
+
+        foreach (var start in (int[])[0, 1, 37, payload - 9, payload - 5, payload - 2])
+            foreach (var length in (int[])[0, 1, 200, payload - 12, payload - 4, payload, 3 * payload + 7])
+            {
+                var value = new byte[length];
+                Random.Shared.NextBytes(value);
+
+                var msg = new TdsMsg();
+                msg.Raw(new byte[start]);
+                TdsTypes.WritePlp(msg, value, payload);
+
+                var seams = new HashSet<int>();
+                for (var at = msg.NextBoundary(0, payload); at <= msg.Length; at = msg.NextBoundary(at, payload))
+                    seams.Add(at);
+
+                void Whole(int from, int bytes, string what)
+                {
+                    for (var b = from + 1; b < from + bytes; b++)
+                        Assert.False(seams.Contains(b),
+                            $"{what} at {from} sits across the seam at {b} (payload {payload}, " +
+                            $"start {start}, length {length})");
+                }
+
+                var body = msg.Body.ToArray();
+                var i = start;
+                Whole(i, 8, "the total length");
+                Assert.Equal(length, BinaryPrimitives.ReadInt64LittleEndian(body.AsSpan(i)));
+                i += 8;
+
+                var read = new List<byte>();
+                while (true)
+                {
+                    Whole(i, 4, "a chunk length");
+                    var chunk = BinaryPrimitives.ReadInt32LittleEndian(body.AsSpan(i));
+                    i += 4;
+                    if (chunk == 0) break;
+                    Whole(i, chunk, "a chunk");
+                    read.AddRange(body[i..(i + chunk)]);
+                    i += chunk;
+                }
+
+                Assert.Equal(msg.Length, i);
+                Assert.Equal(value, read.ToArray());
+            }
+    }
+
     /// What a client asks for is a request; the door answers with its own size and both use that.
     /// Checked on the bytes rather than on what SqlClient reports, and on one value long enough to
     /// fill packets whole -- rows end a packet early, so a result set of them never reaches the size.
@@ -207,10 +359,9 @@ public class TdsTests : IDisposable
         return longest;
     }
 
-    /// Reassembles the longest response in a capture, and reports where its packets ended and where
-    /// its rows did. Every column of `WideRows` is a MAX string, so a row is the row token and one
-    /// PLP value per column: eight bytes of total length, chunks, and an empty chunk to end it.
-    static (List<int> Boundaries, List<(int Start, int End)> Rows) Frame(byte[] captured)
+    /// Reassembles the longest response in a capture: its body with the packet headers taken out,
+    /// and where in that body each packet ended.
+    static (List<int> Boundaries, byte[] Body) Reassemble(byte[] captured)
     {
         List<int> boundaries = [], longest = [];
         List<byte> message = [], result = [];
@@ -229,7 +380,15 @@ public class TdsTests : IDisposable
             at += length;
         }
 
-        var body = result.ToArray();
+        return (longest, result.ToArray());
+    }
+
+    /// Where the longest response's packets ended and where its rows did. Every column of
+    /// `WideRows` is a MAX string, so a row is the row token and one PLP value per column: eight
+    /// bytes of total length, chunks, and an empty chunk to end it.
+    static (List<int> Boundaries, List<(int Start, int End)> Rows) Frame(byte[] captured)
+    {
+        var (longest, body) = Reassemble(captured);
         var rows = new List<(int, int)>();
         var columns = BinaryPrimitives.ReadUInt16LittleEndian(body.AsSpan(1));
         var i = 3; // past the COLMETADATA token and its column count

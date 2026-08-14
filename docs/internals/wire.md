@@ -79,13 +79,21 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   - A MAX value's chunks stop at the packet boundary rather than running through it
     (`TdsTypes.WritePlp`), measured from the row's own start, which is why the row is built at
     offset zero: for a row too big for any packet, that is where the cuts really fall.
+  - The lengths around the chunks obey the same rule as the chunks: a total length, chunk header or
+    terminator that would sit across the seam ends the packet early instead (`TdsMsg.Fit`), and the
+    wire cuts where the message says to (`TdsMsg.NextBoundary`). Sizing the data to the seam is not
+    enough on its own -- a value starting a few bytes short of one puts its framing across it, which
+    is how a stringy row wider than a packet could still lose a replaying client its place, a few
+    offsets in every payload's worth. SQL Server ends the packet and starts the chunk in the next;
+    so does this.
 
   Flushing after the row that overflows instead cuts inside it, which is a different bug that looks
   the same. This is invisible on a fast loopback and constant over a real network, because TCP
   decides how often a read ends mid-packet. `TdsTests.LongResultsSurviveASplitRead` forces the split
-  so it is deterministic, and `PacketsEndWhereRowsDo` checks the framing itself rather than the
-  client's tolerance of it -- SqlClient survives some violations and not others, which is how the
-  first version of this fix passed while leaving wide rows broken.
+  so it is deterministic, and `PacketsEndWhereRowsDo` and `PlpFramingStaysOutOfTheSeam` check the
+  framing itself rather than the client's tolerance of it -- SqlClient survives some violations and
+  not others, which is how the first version of this fix passed while leaving wide rows broken, and
+  how the framing half went unnoticed while the chunks behaved.
 - **The legacy LOB parameter types are still in use.** LLBLGen on the old `System.Data.SqlClient`
   types a string parameter as `NTEXT`, so `TdsTypes.ReadValue` has to know `TEXT`/`NTEXT`/`IMAGE`:
   four bytes of declared maximum instead of two, a collation on the text ones, and a four-byte
