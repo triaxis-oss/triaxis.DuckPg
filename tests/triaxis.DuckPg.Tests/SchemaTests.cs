@@ -12,6 +12,22 @@ public class SchemaTests
         ["order_id"],
         [("status", "('new')"), ("created", "(getdate())")]);
 
+    /// Two dacpacs among the layers used to demote the schema to a warning and serve the inferred
+    /// shape instead -- every table's columns, types and keys silently different from the declared
+    /// ones. A lake that cannot tell which schema it was given refuses to guess.
+    [Fact]
+    public void TwoDacpacsAmongTheLayersRefuseToStart()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("base", "one.dacpac"), Orders);
+        Dacpac.Write(lake.At("base", "two.dacpac"), Orders);
+
+        var error = Assert.Throws<DuckPgConfigurationException>(() => lake.Start());
+        Assert.Contains("--dacpac", error.Message);
+    }
+
     [Fact]
     public void TheDeclaredShapeIsWhatTheViewPublishes()
     {
@@ -218,18 +234,21 @@ public class SchemaTests
             lake.Columns("lake.orders"));
     }
 
+    /// Naming one is still what settles it: the ambiguity is about which schema was meant, not
+    /// about whether the named one can be used.
     [Fact]
-    public void SeveralDacpacsMeanNoneIsAssumed()
+    public void ANamedDacpacSettlesTheAmbiguity()
     {
         using var lake = new TestLake()
             .Json("base", "orders", """[{"order_id": 1, "amount": 5}]""")
             .Stack("base");
         Dacpac.Write(lake.At("base", "one.dacpac"), Orders);
         Dacpac.Write(lake.At("base", "two.dacpac"), Orders);
+        lake.Config.Dacpac = lake.At("base", "one.dacpac");
         lake.Start();
 
-        // The layer's own inference, not the schema: no `created` column.
-        Assert.Equal(["order_id:bigint", "amount:bigint"], lake.Columns("lake.orders"));
+        Assert.Equal(["order_id:integer", "amount:numeric", "created:timestamp without time zone"],
+            lake.Columns("lake.orders"));
     }
 
     [Fact]

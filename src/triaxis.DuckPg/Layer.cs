@@ -136,9 +136,12 @@ static class Layer
                 logger.LogInformation("schema from {Dacpac}", found[0]);
                 return found[0];
             default:
-                logger.LogWarning("several dacpacs found ({Dacpacs}); name one with --dacpac to use it",
-                    string.Join(", ", found));
-                return null;
+                // Refused rather than demoted to a warning: serving on regardless means the
+                // inferred shape -- every table's columns, types and keys quietly different from
+                // the declared ones -- on the say-so of a stray build artifact.
+                throw new DuckPgConfigurationException(
+                    $"several dacpacs found ({string.Join(", ", found)}): name the schema with " +
+                    "--dacpac or `dacpac:`, or remove the others");
         }
     }
 
