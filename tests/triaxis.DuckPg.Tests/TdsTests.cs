@@ -417,6 +417,19 @@ public class TdsTests : IDisposable
         return (longest, rows);
     }
 
+    /// The declaration is split at top-level commas only: cutting at a type's own -- decimal(18,2)
+    /// -- invents a parameter in the middle, and a caller that sends its values unnamed (the JDBC
+    /// driver, jTDS, FreeTDS; SqlClient names them) gets every value after it bound to the wrong
+    /// name.
+    [Fact]
+    public void ParameterDeclarationsSurviveTypeArguments()
+    {
+        Assert.Equal(["p0", "p1", "p2", "p3"],
+            TdsSession.DeclaredNames("@p0 int,@p1 decimal(18,2),@p2 nvarchar(50),@p3 numeric(10, 2) OUTPUT"));
+        Assert.Equal(["min"], TdsSession.DeclaredNames("@min decimal(18,2)"));
+        Assert.Equal([], TdsSession.DeclaredNames(""));
+    }
+
     [Fact]
     public void ConnectsAndAnswers()
     {

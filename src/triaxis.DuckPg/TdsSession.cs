@@ -793,17 +793,21 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     static string Declaration(List<Argument> arguments, int index) => Text(arguments, index);
 
+    /// The names a parameter declaration lists, in order. Split only at top-level commas: a type's
+    /// own -- `decimal(18,2)` -- is inside parentheses, and cutting there invents a parameter that
+    /// shifts every name after it onto the wrong value for a caller that sends them unnamed.
+    internal static List<string> DeclaredNames(string declaration) =>
+        [.. SqlText.SplitList(declaration, ',')
+            .Select(part => part.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "")
+            .Select(name => name.TrimStart('@'))
+            .Where(name => name.Length > 0)];
+
     /// sp_executesql declares its parameters in a string; the values follow in the same order, so
     /// the declaration is only needed for the names a statement will refer to.
     static Dictionary<string, Parameter> Bind(string declaration, IEnumerable<Argument> values)
     {
         var bound = new Dictionary<string, Parameter>(StringComparer.OrdinalIgnoreCase);
-        var declared = declaration
-            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(part => part.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "")
-            .Select(name => name.TrimStart('@'))
-            .Where(name => name.Length > 0)
-            .ToList();
+        var declared = DeclaredNames(declaration);
 
         var index = 0;
         foreach (var argument in values)
