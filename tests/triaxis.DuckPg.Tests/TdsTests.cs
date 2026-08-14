@@ -460,6 +460,32 @@ public class TdsTests : IDisposable
         Assert.Equal(1, parens.ExecuteScalar());
     }
 
+    /// A batch that fails after a result already streamed: the buffered tail of a row wider than a
+    /// packet still has to go out before the error, or the client is left mid-value reading the
+    /// ERROR token's bytes as the rest of the row.
+    [Fact]
+    public void AFailingStatementAfterAStreamedResultStillArrivesAsAnError()
+    {
+        lake.Config.TdsPacketSize = 512;
+
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "SELECT repeat('x', 40001) AS s FROM range(3); SELECT * FROM no_such_table", connection)
+        {
+            CommandTimeout = 15,
+        };
+        using var reader = command.ExecuteReader();
+
+        var rows = 0;
+        while (reader.Read())
+        {
+            Assert.Equal(40001, reader.GetString(0).Length);
+            rows++;
+        }
+        Assert.Equal(3, rows);
+        Assert.Throws<SqlException>(() => reader.NextResult());
+    }
+
     [Fact]
     public void ConnectsAndAnswers()
     {
