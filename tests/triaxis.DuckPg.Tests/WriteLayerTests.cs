@@ -54,6 +54,29 @@ public class WriteLayerTests
         Assert.Equal(["2"], lake.Query("SELECT order_id FROM lake.orders"));
     }
 
+    /// A key declared in another order than the table's columns, of one type throughout, so a
+    /// tombstone landing in the wrong columns is values swapped rather than a cast error: the wrong
+    /// row buried, and the deleted one back on the next start.
+    [Fact]
+    public void DeletingWithAReorderedKeyBuriesTheRightRow()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1::BIGINT, 2::BIGINT, 'first'), (2::BIGINT, 1::BIGINT, 'second'))
+                t(customer_id, line_no, note)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+        lake.Config.DefaultKey = ["line_no", "customer_id"];
+        lake.Start();
+
+        Assert.Equal(1, lake.Execute("DELETE FROM lake.orders WHERE customer_id = 1"));
+        Assert.Equal(["2|1|second"], lake.Query("SELECT customer_id, line_no, note FROM lake.orders"));
+
+        lake.Restart();
+        Assert.Equal(["2|1|second"], lake.Query("SELECT customer_id, line_no, note FROM lake.orders"));
+    }
+
     [Fact]
     public void ADeletedRowCanBeWrittenAgain()
     {

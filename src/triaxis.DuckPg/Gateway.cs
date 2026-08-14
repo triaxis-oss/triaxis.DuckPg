@@ -857,8 +857,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     }
 
     /// A tombstone hides the row in every layer below; the same key deleted twice is one tombstone.
+    /// The columns are named because the orders differ: the key set carries them in the key's own
+    /// order, and the tombstone table holds them in the table's -- positionally, a key of one type
+    /// throughout would land swapped, burying another row.
     static string Tombstone(Table table, string keys = "duckpg_keys") =>
-        $"INSERT OR IGNORE INTO {table.TombstoneName} SELECT * FROM {keys}";
+        $"INSERT OR IGNORE INTO {table.TombstoneName} ({KeyList(table)}) SELECT * FROM {keys}";
 
     /// The write layer's own copy of a row is deleted outright -- nothing below it to hide.
     static string Evict(Table table, string keys = "duckpg_keys") =>
