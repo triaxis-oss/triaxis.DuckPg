@@ -430,6 +430,22 @@ public class TdsTests : IDisposable
         Assert.Equal([], TdsSession.DeclaredNames(""));
     }
 
+    /// The ERROR token counts its message in a U16 of characters, so a message past what it can
+    /// say has to be cut, not wrapped: wrapped, the count lies and the client reads the rest of the
+    /// message's own bytes as tokens. The statement here puts a 70k-character name into the refusal.
+    [Fact]
+    public void AHugeErrorMessageStillArrivesAsAnError()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand($"EXEC [{new string('x', 70000)}]", connection)
+        {
+            CommandTimeout = 15,
+        };
+        var error = Assert.Throws<SqlException>(() => command.ExecuteScalar());
+        Assert.StartsWith("stored procedure", error.Message);
+        Assert.Equal(2048, error.Message.Length);
+    }
+
     [Fact]
     public void ConnectsAndAnswers()
     {

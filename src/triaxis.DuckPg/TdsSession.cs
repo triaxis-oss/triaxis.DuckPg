@@ -918,11 +918,17 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             },
         };
 
+        // Cut where SQL Server cuts its own messages. The token counts the text in a U16 of
+        // characters, so one past that would wrap the count and the client would read the rest of
+        // the message's own bytes as tokens -- the same length rule `Named` enforces on a column.
+        var message = e.Message.ReplaceLineEndings(" ");
+        if (message.Length > 2048) message = message[..2048];
+
         var body = new TdsMsg()
             .I32(number)
             .U8(1)                                  // state
             .U8(16)                                 // class: an error the client raises
-            .UsVarchar(e.Message.ReplaceLineEndings(" "))
+            .UsVarchar(message)
             .BVarchar("duckpg")
             .BVarchar("")
             .I32(e is TSqlException tsql ? tsql.Position : 0);
