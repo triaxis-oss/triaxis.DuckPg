@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace triaxis.DuckPg.Tests;
 
@@ -484,6 +485,41 @@ public class TdsTests : IDisposable
         }
         Assert.Equal(3, rows);
         Assert.Throws<SqlException>(() => reader.NextResult());
+    }
+
+    /// Every write to the socket is a segment of its own under TCP_NODELAY, so a header written
+    /// separately from its body reaches the client as a naked 8-byte read -- and a client that
+    /// replays partial reads gets that path exercised by every single packet. One message's packets
+    /// leave in one write.
+    [Fact]
+    public void PacketsLeaveTheSocketCoalesced()
+    {
+        var writes = new List<int>();
+        var wire = new TdsWire(new WriteRecorder(writes), NullLogger.Instance) { PacketSize = 512 };
+
+        var msg = new TdsMsg();
+        msg.Raw(new byte[2000]);
+        wire.Send(TdsMessage.Result, msg);
+
+        Assert.DoesNotContain(8, writes);
+        Assert.Equal(2000 + 4 * 8, Assert.Single(writes));
+    }
+
+    /// Records what one Write hands the socket; everything else is not a socket's business here.
+    sealed class WriteRecorder(List<int> writes) : Stream
+    {
+        public override void Write(byte[] buffer, int offset, int count) => writes.Add(count);
+        public override void Write(ReadOnlySpan<byte> buffer) => writes.Add(buffer.Length);
+        public override void Flush() { }
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => 0;
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 
     [Fact]
