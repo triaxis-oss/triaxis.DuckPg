@@ -1,5 +1,4 @@
 using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.Hosting;
 
 namespace triaxis.DuckPg.Cli;
 
@@ -27,26 +26,6 @@ public abstract class LakeCommand : LoggingCommand
     public bool InstallDuckDb { get; set; }
 
     [Inject] private readonly IConfiguration _configuration = null!;
-
-    /// A configuration file is read when one is named, and never otherwise. Arguments alone are
-    /// enough to serve a directory, and a tool that helped itself to a `duckpg.yaml` from whatever
-    /// directory it happened to start in would be reading a lake nobody pointed it at -- and would
-    /// hand a bake the file describing the lake being served rather than the one being written out.
-    /// Named, the file has to exist: a typo is an error rather than a silent fall back to defaults.
-    ///
-    /// It is named on the command line, so the source can only be added once the arguments are
-    /// parsed.
-    protected static void AddConfigFile(IToolBuilder builder)
-    {
-        builder.ConfigureConfiguration((context, configuration) =>
-        {
-            // Optional here and required in `Configured`, which is the only difference between a
-            // sentence naming the file and a FileNotFoundException out of the configuration
-            // provider, thrown while the host is still being built and caught by nothing.
-            if (context.GetInvocationContext().ParseResult.GetValue<string?>("--config") is { Length: > 0 } path)
-                configuration.AddYamlFile(Path.GetFullPath(path), optional: true, reloadOnChange: false);
-        });
-    }
 
     /// The file, if there was one, with the arguments over the top of it. Paths in the file are
     /// relative to the file and paths in an argument to the working directory, which is the one

@@ -26,7 +26,6 @@ public class BakeCommand : LakeCommand
 
     public static void Configure(IToolBuilder builder)
     {
-        AddConfigFile(builder);
         builder.ConfigureServices(services => services.AddDuckPgBaker());
     }
 

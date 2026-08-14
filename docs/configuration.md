@@ -1,15 +1,37 @@
 # Configuration
 
-A YAML file named with `--config`, bound through `IConfiguration` — so environment variables and the
-tool's usual override files layer over it for free. Every key here has a command line flag or is
-positional, and the flag wins where both are given; argument paths are relative to the working
-directory, file paths to the file.
+A YAML file named with `--config`, bound through `IConfiguration` — so the environment and this
+machine's own files layer under it. Every key here has a command line flag or is positional, and the
+flag wins where both are given; argument paths are relative to the working directory, file paths to
+the file.
 
-**Nothing is read unless it is named.** There is no default file: a tool that helped itself to a
+**Nothing in the working directory is read unless it is named.** There is no default file: a tool
+that helped itself to a
 `duckpg.yaml` from whatever directory it was started in would be serving a lake nobody pointed it at,
 and would hand `bake` the file describing the lake being *served* rather than the one being written
 out. A file that is named has to exist, so a typo is an error rather than a silent fall back to
 defaults.
+
+## Where a value comes from
+
+Most specific last, which is what wins:
+
+| Source | What it is for |
+|---|---|
+| `duckpg/config.yaml` under the machine's configuration folder | How this machine runs duckpg, for everyone on it. |
+| `duckpg/config.yaml` under the user's | The same, for one account. |
+| `DUCKPG_`-prefixed environment variables | One value, for one run, without a file to edit. |
+| The file named with `--config` | The lake being served, named deliberately — which is why it is above the ambient ones. |
+| Arguments | The last word, always. |
+
+An environment variable is the key with `DUCKPG_` in front and `__` for every `:`, so
+`DUCKPG_schema=staging`, `DUCKPG_layers__0=/srv/common` and `DUCKPG_tables__orders__key=order_id`.
+`layers` takes the scalar form too, one directory being the common case.
+
+Only the file named with `--config` has to exist, and none of the others is ever written by the
+tool. The `config.yaml` probes sit under `%ProgramData%` and `%AppData%` on Windows, and under
+`/usr/share` and `~/.config` (with `~/.local/share` read as the user's too) elsewhere. Those four
+are the whole list: nothing beside the executable is read, and nothing in the working directory.
 
 ## Keys
 
