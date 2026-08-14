@@ -25,6 +25,12 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// version it does not know is a version it will not talk to.
     public const string ServerVersion = "16.0.1000";
 
+    /// The largest packet the platform should carry, clipped below what TDS allows where it has to
+    /// be: macOS's loopback MTU is 16K, so a bigger packet always arrives split, and a client
+    /// replaying every one of those partial reads is a client exercising its least-proven path per
+    /// packet. 16000 keeps a whole packet inside one segment with room for the TCP headers.
+    internal static readonly int MaxPacketSize = OperatingSystem.IsMacOS() ? 16000 : 32767;
+
     int tdsVersion = 0x74000004;
     long rowCount;
     int transactions;
@@ -157,7 +163,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         // own that both then use -- so how a response is chunked is the lake's to decide rather than
         // SqlClient's 8000-byte default's.
         var requested = reader.I32();
-        wire.PacketSize = gateway.Config.TdsPacketSize;
+        wire.PacketSize = Math.Min(gateway.Config.TdsPacketSize, MaxPacketSize);
 
         // The fixed part is 36 bytes; after it come offset/length pairs into the same buffer.
         string Field(int index)

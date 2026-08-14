@@ -68,7 +68,11 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   token before it reads anything else. So `Config.TdsPacketSize` is what the door chunks to, and the
   default is 32767 rather than the 8000 SqlClient asks for: a packet costs a header and a write to
   the socket, and one that a row ends early to stay out of the seam gives up whatever was left of it,
-  so the bigger the packet the less of both a result set pays.
+  so the bigger the packet the less of both a result set pays. Except on macOS, where the answer is
+  clipped to 16000 (`TdsSession.MaxPacketSize`): the loopback MTU there is 16K, so a 32K packet
+  always arrives in two reads, and coalescing the writes alone did not stop SqlClient's partial-read
+  replay from intermittently losing its place in the field -- a packet that rides one segment never
+  enters that path at all.
 - **Nothing may be cut across the seam between two packets.** SqlClient reassembles a read that
   ended mid-packet by replaying the framing it had begun, and framing split across the seam loses
   it its place -- it then reads response bytes as a length, and the failure surfaces much later,
