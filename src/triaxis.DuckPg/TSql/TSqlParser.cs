@@ -87,6 +87,10 @@ sealed class TSqlParser
     {
         if (Peek.Is("explain")) return Explain();
         if (Peek.Is("select") || Peek.Is("with") || Peek.Is("values")) return SelectOrInto();
+        // A statement may open with a parenthesised query -- `(a UNION b) INTERSECT c` is how one
+        // is grouped against the precedence.
+        if (Peek.Is(TokenKind.Operator, "(") && (Ahead(1).Is("select") || Ahead(1).Is("with") || Ahead(1).Is("values")))
+            return new SelectStatement(Query());
         if (Peek.Is("insert")) return Insert();
         if (Peek.Is("drop")) return Drop();
         if (Peek.Is("update")) return Update();
@@ -667,18 +671,33 @@ sealed class TSqlParser
         return new Query(with, body, orderBy, offset, fetch);
     }
 
+    /// UNION and EXCEPT, left to right. INTERSECT binds tighter in T-SQL as in ANSI, so it is a
+    /// level of its own below this one -- one flat loop read `a UNION b INTERSECT c` as
+    /// `(a UNION b) INTERSECT c`, which is the wrong rows with nothing said.
     QueryBody QueryBody()
     {
-        var left = QueryTerm();
+        var left = Intersected();
 
         while (true)
         {
-            string? op = Peek.Is("union") ? "UNION" : Peek.Is("except") ? "EXCEPT" : Peek.Is("intersect") ? "INTERSECT" : null;
+            string? op = Peek.Is("union") ? "UNION" : Peek.Is("except") ? "EXCEPT" : null;
             if (op is null) return left;
             pos++;
             var all = Accept("all");
-            left = new SetOperationBody(op, all, left, QueryTerm());
+            left = new SetOperationBody(op, all, left, Intersected());
         }
+    }
+
+    QueryBody Intersected()
+    {
+        var left = QueryTerm();
+
+        while (Accept("intersect"))
+        {
+            var all = Accept("all");
+            left = new SetOperationBody("INTERSECT", all, left, QueryTerm());
+        }
+        return left;
     }
 
     QueryBody QueryTerm()

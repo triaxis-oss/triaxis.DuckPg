@@ -374,10 +374,14 @@ sealed class TSqlWriter(TSqlContext context)
                 scopes.RemoveAt(scopes.Count - 1);
                 return;
 
+            // The tree is the grouping, so an operand the words alone would regroup keeps its
+            // parentheses: a left operand binding looser than its parent, and a right one binding
+            // no tighter -- EXCEPT is not associative, and a right-nested operand only exists
+            // because the statement wrote the parentheses.
             case SetOperationBody set:
-                Body(set.Left);
+                Operand(set.Left, parens: set.Left is SetOperationBody l && Rank(l) < Rank(set));
                 Put($" {set.Operator}{(set.All ? " ALL" : "")} ");
-                Body(set.Right);
+                Operand(set.Right, parens: set.Right is SetOperationBody r && Rank(r) <= Rank(set));
                 return;
 
             case ValuesBody values:
@@ -385,6 +389,15 @@ sealed class TSqlWriter(TSqlContext context)
                 Join(values.Rows, row => { Put("("); Join(row, Expression); Put(")"); });
                 return;
         }
+    }
+
+    static int Rank(SetOperationBody set) => set.Operator == "INTERSECT" ? 2 : 1;
+
+    void Operand(QueryBody body, bool parens)
+    {
+        if (parens) Put("(");
+        Body(body);
+        if (parens) Put(")");
     }
 
     /// What a FROM clause puts in scope, by the name a column reference would use for it.
