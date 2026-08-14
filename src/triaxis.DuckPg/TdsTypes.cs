@@ -264,26 +264,29 @@ static class TdsTypes
         msg.U8(length + 5).Raw(b[..length]).Raw(Days(utc)).Raw(minutes);
     }
 
-    /// A MAX value is sent as its total length, then chunks, then an empty chunk to end it. Each
-    /// chunk stops at the packet boundary rather than running through it: SqlClient reassembles a
-    /// read that ended mid-packet by replaying the value's framing, and a chunk spanning the
-    /// boundary loses it its place there -- it then reads response bytes as the next length, which
-    /// surfaces much later and looks like anything but this. SQL Server itself never emits one,
-    /// because it fills a packet and starts a chunk in the next.
+    /// A MAX value is sent as its total length, then chunks, then an empty chunk to end it. Nothing
+    /// of it sits across a packet boundary: SqlClient reassembles a read that ended mid-packet by
+    /// replaying the value's framing, and framing split across the seam loses it its place there --
+    /// it then reads response bytes as the next length, which surfaces much later and looks like
+    /// anything but this. So each chunk's bytes stop at the boundary rather than running through
+    /// it, and a length that would sit across one ends the packet early instead, which is what SQL
+    /// Server does -- it fills a packet and starts a chunk in the next.
     public static void WritePlp(TdsMsg msg, byte[] value, int payload)
     {
-        msg.I64(value.Length);
+        msg.Fit(8, payload).I64(value.Length);
 
         var at = 0;
         while (at < value.Length)
         {
-            // The chunk header goes in first, so the room left is measured from after it.
-            var take = Math.Min(value.Length - at, payload - (msg.Length + 4) % payload);
+            // The chunk header goes in first, so the room left is measured from after it -- and a
+            // header the seam would leave no data behind starts the next packet instead.
+            msg.Fit(4 + 1, payload);
+            var take = Math.Min(value.Length - at, payload - msg.Offset(payload) - 4);
             msg.I32(take).Raw(value.AsSpan(at, take));
             at += take;
         }
 
-        msg.I32(0);
+        msg.Fit(4, payload).I32(0);
     }
 
     static byte[] Days(DateTime value)

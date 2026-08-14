@@ -550,15 +550,19 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 fields[i].Write(row, columns[i], reader, i, wire.Payload);
 
             // A row cut across the seam between two packets loses a client replaying a split read
-            // its place, so one that does not fit ends the packet here and starts the next.
-            if (msg.Length > 0 && msg.Length + row.Length > wire.Payload && Flush(msg.Length)) break;
+            // its place, so one that does not fit ends the packet here and starts the next. One
+            // that cut a packet of its own while it was built assumed it would start one, so it is
+            // put where that is true.
+            if (msg.Length > 0 && (msg.Length + row.Length > wire.Payload || row.HasCuts)
+                && Flush(msg.Length)) break;
 
-            msg.Raw(row.Body);
+            msg.Append(row);
             rows++;
 
-            // A row too big for any packet has to be cut, and is cut on the packet boundaries its
-            // own values were chunked to -- which are whole payloads from where the row started.
-            if (msg.Length >= wire.Payload && Flush(msg.Length / wire.Payload * wire.Payload)) break;
+            // A row too big for any packet has to be cut, and is cut on the boundaries its own
+            // values were chunked to -- whole payloads from where the row started, and sooner where
+            // a value's framing ended a packet early to stay out of the seam.
+            if (msg.Length >= wire.Payload && Flush(msg.Complete(wire.Payload))) break;
         }
 
         logger.LogDebug("{Rows} rows in {Elapsed:0.0} ms", rows, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
