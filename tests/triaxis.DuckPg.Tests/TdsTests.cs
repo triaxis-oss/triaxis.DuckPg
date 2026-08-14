@@ -446,6 +446,20 @@ public class TdsTests : IDisposable
         Assert.Equal(2048, error.Message.Length);
     }
 
+    /// Set operations grouped the way T-SQL groups them: INTERSECT before UNION and EXCEPT, and
+    /// written parentheses kept. Flattened left to right, both of these answer the empty set.
+    [Fact]
+    public void SetOperationsKeepTheirGrouping()
+    {
+        using var connection = Open();
+
+        using var precedence = new SqlCommand("SELECT 1 AS v UNION SELECT 2 INTERSECT SELECT 3", connection);
+        Assert.Equal(1, precedence.ExecuteScalar());
+
+        using var parens = new SqlCommand("SELECT 1 AS v EXCEPT (SELECT 1 EXCEPT SELECT 1)", connection);
+        Assert.Equal(1, parens.ExecuteScalar());
+    }
+
     [Fact]
     public void ConnectsAndAnswers()
     {

@@ -206,6 +206,12 @@ public class TSqlTests
         """WITH "c" AS (SELECT 1 AS "x") SELECT * FROM "c" """)]
     [InlineData("SELECT a FROM t UNION ALL SELECT b FROM u",
         """SELECT "a" FROM "lake"."t" UNION ALL SELECT "b" FROM "lake"."u" """)]
+    // Written parentheses survive where the words alone would regroup: EXCEPT is not associative,
+    // and INTERSECT binds tighter than the operators around it in both dialects.
+    [InlineData("SELECT 1 UNION (SELECT 2 EXCEPT SELECT 3)", "SELECT 1 UNION (SELECT 2 EXCEPT SELECT 3)")]
+    [InlineData("(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3", "(SELECT 1 UNION SELECT 2) INTERSECT SELECT 3")]
+    [InlineData("SELECT 1 UNION SELECT 2 INTERSECT SELECT 3", "SELECT 1 UNION SELECT 2 INTERSECT SELECT 3")]
+    [InlineData("SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3", "SELECT 1 EXCEPT SELECT 2 EXCEPT SELECT 3")]
     [InlineData("SELECT * FROM (SELECT 1 AS x) AS d", """SELECT * FROM (SELECT 1 AS "x") AS "d" """)]
     [InlineData("SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id)",
         """SELECT * FROM "lake"."t" WHERE EXISTS (SELECT 1 FROM "lake"."u" WHERE "u"."id" = "t"."id")""")]
