@@ -329,6 +329,8 @@ public class TdsTests : IDisposable
     [InlineData(32767)]
     public void PacketsAreTheSizeTheDoorAnswersWith(int configured)
     {
+        // The door also clips to what the platform should carry, which on macOS is under 32767.
+        var settled = Math.Min(configured, TdsSession.MaxPacketSize);
         lake.Config.TdsPacketSize = configured;
 
         using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
@@ -342,8 +344,8 @@ public class TdsTests : IDisposable
             while (reader.Read()) Assert.Equal(200000, reader.GetString(0).Length);
 
         Thread.Sleep(200);
-        Assert.Equal(configured, Longest(delivery.Captured));
-        Assert.Equal(configured, connection.PacketSize);
+        Assert.Equal(settled, Longest(delivery.Captured));
+        Assert.Equal(settled, connection.PacketSize);
     }
 
     /// The longest packet the server sent, which is the size the login settled on: a response bigger

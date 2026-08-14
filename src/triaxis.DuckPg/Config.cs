@@ -15,7 +15,9 @@ public sealed class Config
     /// that asked for less as much as it holds down one that asked for more. Bigger is fewer packet
     /// headers, fewer writes to the socket, and less of a packet given up by the row that ended it
     /// early to stay out of the seam; the default is the largest TDS allows, since a lake answers
-    /// with rows far more often than it answers with one value. 512 to 32767.
+    /// with rows far more often than it answers with one value. 512 to 32767. On macOS the door
+    /// clips the answer to 16000 whatever is configured: the loopback MTU there is 16K, and a
+    /// packet that always arrives split is what trips a fragile reassembly path in SqlClient.
     public int TdsPacketSize { get; set; } = 32767;
 
     /// Schema the generated views live in. Whatever it is called, it goes in front of every
