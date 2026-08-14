@@ -7,8 +7,9 @@ carries are published as typed `NULL`s, layer columns are cast to the declared t
 whatever inference guessed, and the declared primary key means `--key` is unnecessary. A declared
 table no layer carries is published as well — empty, with its declared shape — and is writable like
 any other, so the catalog is the schema rather than a reflection of which files turned up. A single
-`.dacpac` sitting in a layer directory is used on its own; several means none is assumed, and the
-tool says so.
+`.dacpac` sitting in a layer directory is used on its own; several is refused at startup — serving
+on with no schema would silently change every table's shape — and naming one with `--dacpac` (or
+`dacpac:`) settles it.
 
 **Defaults.** A `SqlDefaultConstraint` fills in the column where a row has no value for it, whether it
 left the column out or spelled out a null. The expression is T-SQL and goes through the same
