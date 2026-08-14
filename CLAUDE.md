@@ -17,7 +17,8 @@ publish a temp-directory convention as API.
 
 | File | What it owns |
 |---|---|
-| `LakeCommand.cs` | What both commands take: the layers, the config file (read only when named), argument-over-file precedence, and the answer for a missing DuckDB. |
+| `Startup.cs` | Where the whole tool's configuration comes from: the machine's file, the user's, the environment, and the file `--config` names over all three. |
+| `LakeCommand.cs` | What both commands take: the layers, the bound configuration with the arguments over it, and the answer for a missing DuckDB. |
 | `ServeCommand.cs` | The `duckpg` command itself: the doors and everything only a running lake has. |
 | `BakeCommand.cs` | `duckpg bake`: the same lake, written out instead of served. |
 | `DuckPgServiceCollectionExtensions.cs` | `AddDuckPg` and `AddDuckPgFactory`: what a lake is made of, as registrations. |

@@ -67,8 +67,6 @@ public class ServeCommand : LakeCommand
 
     public static void Configure(IToolBuilder builder)
     {
-        AddConfigFile(builder);
-
         // The factory rather than a lake: what to serve is only known once the arguments have won
         // over the file, which is after the host has been built.
         builder.ConfigureServices(services => services.AddDuckPgFactory());
