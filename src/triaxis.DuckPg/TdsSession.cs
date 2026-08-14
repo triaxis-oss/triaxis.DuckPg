@@ -73,13 +73,10 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             }
             catch (Exception e) when (e is not (IOException or SocketException))
             {
-                // A statement the client was told about is one the log should carry: a client that
-                // reports a failure and a server that says nothing leave nowhere to look.
-                logger.LogWarning("{Error}", e.Message.ReplaceLineEndings(" "));
-                var msg = new TdsMsg();
-                Error(msg, e);
-                Done(msg, TdsToken.Done, Status.Error, 0);
-                wire.Send(TdsMessage.Result, msg);
+                // Only for a failure with no response in flight -- the handshake, a protocol
+                // error. A batch or call answers into its own message (`Failed`), which may
+                // already be partly on the wire.
+                Failed(new TdsMsg(), e);
             }
         }
     }
@@ -241,7 +238,29 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         var sql = reader.Ucs2((payload.Length - reader.Position) / 2);
 
         var msg = new TdsMsg();
-        Run(msg, sql, NoParameters, TdsToken.Done);
+        try
+        {
+            Run(msg, sql, NoParameters, TdsToken.Done);
+        }
+        catch (Exception e) when (e is not (IOException or SocketException))
+        {
+            Failed(msg, e);
+            return;
+        }
+        wire.Send(TdsMessage.Result, msg);
+    }
+
+    /// Ends a response with the failure, in the message it was being built in: part of it may be on
+    /// the wire already -- packets that did not end the message, up to the tail of a row wider than
+    /// a packet still buffered here -- and an error sent in its place would cut that row mid-value,
+    /// leaving the client reading the ERROR token's bytes as the rest of it.
+    void Failed(TdsMsg msg, Exception e)
+    {
+        // A statement the client was told about is one the log should carry: a client that reports
+        // a failure and a server that says nothing leave nowhere to look.
+        logger.LogWarning("{Error}", e.Message.ReplaceLineEndings(" "));
+        Error(msg, e);
+        Done(msg, TdsToken.Done, Status.Error, 0);
         wire.Send(TdsMessage.Result, msg);
     }
 
@@ -628,29 +647,37 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         SkipHeaders(ref reader);
         var msg = new TdsMsg();
 
-        while (!reader.AtEnd)
+        try
         {
-            var nameLength = reader.U16();
-            var procedure = nameLength == 0xFFFF ? reader.U16() : (ushort)0;
-            var name = nameLength == 0xFFFF ? "" : reader.Ucs2(nameLength);
-            reader.Skip(2); // option flags
-
-            var arguments = new List<Argument>();
             while (!reader.AtEnd)
             {
-                // A byte where a parameter name should start is the separator before the next call.
-                if (payload[reader.Position] is 0x80 or 0xFF) break;
-                var parameter = reader.BVarchar();
-                var status = reader.U8();
-                var (column, value) = TdsTypes.ReadParameter(ref reader);
+                var nameLength = reader.U16();
+                var procedure = nameLength == 0xFFFF ? reader.U16() : (ushort)0;
+                var name = nameLength == 0xFFFF ? "" : reader.Ucs2(nameLength);
+                reader.Skip(2); // option flags
 
-                // BY_REF_VALUE: the caller wants this one back, whatever the batch makes of it.
-                arguments.Add(new Argument(parameter.TrimStart('@'), value, column, (status & 0x01) != 0));
+                var arguments = new List<Argument>();
+                while (!reader.AtEnd)
+                {
+                    // A byte where a parameter name should start is the separator before the next call.
+                    if (payload[reader.Position] is 0x80 or 0xFF) break;
+                    var parameter = reader.BVarchar();
+                    var status = reader.U8();
+                    var (column, value) = TdsTypes.ReadParameter(ref reader);
+
+                    // BY_REF_VALUE: the caller wants this one back, whatever the batch makes of it.
+                    arguments.Add(new Argument(parameter.TrimStart('@'), value, column, (status & 0x01) != 0));
+                }
+
+                Call(msg, procedure, name, arguments);
+
+                if (!reader.AtEnd) reader.Skip(1);
             }
-
-            Call(msg, procedure, name, arguments);
-
-            if (!reader.AtEnd) reader.Skip(1);
+        }
+        catch (Exception e) when (e is not (IOException or SocketException))
+        {
+            Failed(msg, e);
+            return;
         }
 
         wire.Send(TdsMessage.Result, msg);
