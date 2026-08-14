@@ -194,6 +194,28 @@ public class KeyedWriteTests : IDisposable
         return lake.Start();
     }
 
+    /// A keyed file comes back with its key hoisted in front of the body, and the write layer sits
+    /// on top of the stack -- so letting it order the shape would move the key column to the front
+    /// whenever the file happens to exist, and back when it does not. The read layers own the
+    /// order; the write layer's own columns only append.
+    [Fact]
+    public void AKeyedWriteFileDoesNotReorderTheTable()
+    {
+        lake.Json("base", "things", """[{"foo": 1, "id": "a", "bar": 2}]""")
+            .Text("local", "things.yaml", "b:\n  foo: 3\n  bar: 4\n")
+            .Stack("base")
+            .WriteTo("local", LayerFormat.Yaml);
+        lake.Config.DefaultKey = ["id"];
+        lake.Start();
+
+        var shape = "SELECT string_agg(column_name, '|' ORDER BY ordinal_position) " +
+                    "FROM information_schema.columns WHERE table_schema = 'lake' AND table_name = 'things'";
+        Assert.Equal(["foo|id|bar"], lake.Query(shape));
+
+        lake.Restart();
+        Assert.Equal(["foo|id|bar"], lake.Query(shape));
+    }
+
     [Theory]
     [InlineData("yaml", "b:\n  foo: 2\n")]
     [InlineData("json", "{\"b\": {\"foo\": 2}}")]

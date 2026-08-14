@@ -164,7 +164,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
             List<Column> columns = schema.Columns(name) is { } declared
                 ? [.. declared.Select(c => Defaulted(conn, name, c))]
-                : Published(describedWrite is null ? layers : [.. layers, describedWrite]);
+                : Published(layers, describedWrite);
             var writable = settings.Writable ?? write.Enabled;
             var partitions = layers.SelectMany(l => l.Source.Partitions)
                                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -1051,16 +1051,22 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     // ---- the published shape ---------------------------------------------------------------------
 
-    /// Columns in the order the topmost layer holding them puts them, so the shape follows the
-    /// most recent layer rather than an accident of which file was read first.
-    static List<Column> Published(List<TableLayer> layers)
+    /// Columns in the order the topmost read layer holding them puts them, so the shape follows the
+    /// most recent layer rather than an accident of which file was read first. The write layer only
+    /// appends what nothing below carries: its shape was derived from this one, so letting it lead
+    /// would be circular -- and not even faithfully, since a keyed file comes back with its key
+    /// hoisted in front of the body, which would move the column on every start where the file
+    /// happens to exist. Its columns still count for the type, where a parquet write branch knows
+    /// what a YAML layer below it guessed.
+    static List<Column> Published(List<TableLayer> layers, TableLayer? write)
     {
         var order = new List<string>();
-        foreach (var layer in layers.OrderByDescending(l => l.Source.Seq))
+        foreach (var layer in layers.OrderByDescending(l => l.Source.Seq).Concat(write is null ? [] : [write]))
             foreach (var column in layer.Columns)
                 if (!order.Any(n => Same(n, column.Name))) order.Add(column.Name);
 
-        return [.. order.Select(name => new Column(name, TypeOf(layers, name)))];
+        List<TableLayer> all = write is null ? layers : [.. layers, write];
+        return [.. order.Select(name => new Column(name, TypeOf(all, name)))];
     }
 
     /// A parquet file carries a real schema; YAML and JSON types are inferred from the values, and
