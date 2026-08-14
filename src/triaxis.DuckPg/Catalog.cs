@@ -1486,8 +1486,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             Exec(conn, $"INSERT INTO {stacked.WriteName} ({columns}) SELECT {columns} FROM duckpg_delta");
 
 
+            // Named: the delta carries the key in its own order, the tombstone table in the table's.
             if (table.Key.Length > 0)
-                Exec(conn, $"INSERT INTO {stacked.TombstoneName} SELECT * FROM duckpg_gone");
+                Exec(conn, $"INSERT INTO {stacked.TombstoneName} ({keys}) SELECT * FROM duckpg_gone");
 
             write.Persist(conn, stacked);
         }

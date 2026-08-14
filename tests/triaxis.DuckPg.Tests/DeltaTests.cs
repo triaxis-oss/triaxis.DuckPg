@@ -196,4 +196,24 @@ public class KeylessDeltaTests
         lake.Restart();
         Assert.Equal(["one", "two"], lake.Query("SELECT text FROM lake.notes ORDER BY text"));
     }
+    /// The shutdown subtraction's tombstones, under a key declared in another order than the
+    /// table's columns -- the row-by-row write path has the same test beside the write layer.
+    [Fact]
+    public void AMaterializedDeleteWithAReorderedKeySurvives()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", """
+                SELECT * FROM (VALUES (1::BIGINT, 2::BIGINT, 'first'), (2::BIGINT, 1::BIGINT, 'second'))
+                t(customer_id, line_no, note)
+                """)
+            .Stack("base")
+            .WriteTo("local");
+        lake.Config.DefaultKey = ["line_no", "customer_id"];
+        lake.Materialized();
+        lake.Start();
+
+        lake.Execute("DELETE FROM lake.orders WHERE customer_id = 1");
+        lake.Restart();
+        Assert.Equal(["2|1|second"], lake.Query("SELECT customer_id, line_no, note FROM lake.orders"));
+    }
 }
