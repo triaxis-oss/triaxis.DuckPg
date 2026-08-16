@@ -70,7 +70,8 @@ same way; see [the schema, from a dacpac](schema.md).
 | `MERGE t USING (VALUES …) i (…) ON 1=0 WHEN NOT MATCHED THEN INSERT …` — EF Core's batch insert | one multi-row `INSERT` |
 | `DELETE FROM [s] FROM [t] AS [s] WHERE …` — EF Core's `ExecuteDelete` | a delete against the table the alias binds |
 | `UPDATE [o] SET … FROM [t] AS [o] WHERE …` — its `ExecuteUpdate` | the same, on the other write |
-| either of those joined to another table | the other tables become the write's own `FROM`, their conditions its `WHERE` |
+| either of those joined to another table by an inner join | the other tables become the write's own `FROM`, their conditions its `WHERE` |
+| either of those joined by an outer join something reads | the tree is carried whole and the write is keyed on the rows it selected |
 | `DELETE FROM [db].[dbo].[t] FROM ((… JOIN [db].[dbo].[t] ON …) LEFT JOIN …)` — LLBLGen | the target is found by name inside the tree; the joins nothing reads are dropped |
 | `OUTPUT INSERTED.[id], i._Position` | the rows are written down first, then answered from |
 | `UPDATE … OUTPUT 1 WHERE …`, `DELETE … OUTPUT 1` | one row per row the statement touched |
@@ -78,21 +79,32 @@ same way; see [the schema, from a dacpac](schema.md).
 | `IDENT_CURRENT('t')` | the last key generated for that table, by any connection |
 | `SELECT @id = SCOPE_IDENTITY()` | nothing goes back as rows; the value fills the OUTPUT parameter |
 
-Only an inner join folds into the write's own clauses: an outer one keeps the rows matching nothing,
-and those are rows the write would still touch, which a condition cannot say once the join is gone.
+Any join shape picks the rows a write touches, outer joins included. A join tree around a write only
+*selects* — it says which rows of the target are affected and nothing more — so a write is keyed on
+what its tree selected. Only an inner join folds into the write's own `FROM` and `WHERE`, since that
+shape is an inner join itself; anything else is carried whole and the rows are collected through it.
+A target row the tree matches more than once is affected once, not once per match, and a target row
+whose outer join matched nothing is still selected — which is what a predicate like
+`WHERE [child].[col] IS NULL` means to say.
 
-An outer join *nothing else reads* is dropped first, and then that rule decides what is left. An ORM
-writes out the entity's whole relation graph whether the statement reads it or not, and such a join
-cannot change which rows are written: every row of the preserved side comes through it, matched or
-not, so taking it away leaves the same rows behind. Only a single named table is dropped, never a
-join tree, never a FULL join, and never the write's own target — `[a] LEFT JOIN [target]` matched
-exactly the rows the statement meant, and dropping `a` would widen it to every row of the target. An
-unqualified column or a subquery in the predicate counts as reading everything, so nothing is
-dropped on their account.
+An outer join *nothing else reads* is dropped before either path, which keeps the everyday two-table
+write the two-table write it always was. An ORM writes out the entity's whole relation graph whether
+the statement reads it or not, and such a join cannot change which rows are written: every row of the
+preserved side comes through it, matched or not, so taking it away leaves the same rows behind. Only
+a single named table is dropped, never a join tree, never a FULL join, and never the write's own
+target — `[a] LEFT JOIN [target]` matched exactly the rows the statement meant, and dropping `a`
+would widen it to every row of the target. An unqualified column or a subquery in the predicate
+counts as reading everything, so nothing is dropped on their account.
 
 The write's target is resolved to an alias the FROM clause bound, or — when the statement spells the
-table out and puts it inside the join tree, which is what LLBLGen does — to the one unaliased source
-of that name. A name matching two sources is ambiguous and left alone, as SQL Server leaves it.
+table out and puts it inside the join tree, which is what LLBLGen does — to the one source of that
+name. A name matching two sources is ambiguous and the statement is refused, as SQL Server refuses
+it: nothing in it says which of the two the rows come from.
+
+One gap: an `UPDATE` carrying such a tree needs the lake's declared key, because its assignments read
+the tree and so cannot be moved aside the way a `DELETE`'s rows can. Against a table the lake
+publishes that is always there; against a session's own `#temp` table it is not, and the statement is
+refused by name. A `DELETE` has no such limit — a temporary table's own `rowid` stands in for a key.
 
 `OUTPUT INSERTED.[key], i._Position` is answered by materializing the rows, writing from there and
 reading back off the same copy, so each key comes back beside the position of the row that got it. A

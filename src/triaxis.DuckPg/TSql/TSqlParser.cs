@@ -253,10 +253,10 @@ sealed class TSqlParser
         var from = Accept("from") ? TableSource() : null;
         var where = Accept("where") ? Expression() : null;
 
-        if (from is null || Bound(from, target) is not { } source)
+        if (from is null || Bound(from, target, at) is not { } source)
             return new UpdateStatement(target, null, assignments, from, where, output, top);
 
-        var (rest, filtered) = Selecting(from, source, where, at,
+        var (rest, filtered) = Selecting(from, source, where,
             [.. assignments.Select(a => a.Value), .. output.Select(o => o.Value)]);
         return new UpdateStatement(source.Name, source.Alias, assignments, rest, filtered, output, top);
     }
@@ -272,19 +272,23 @@ sealed class TSqlParser
     }
 
     /// A write whose FROM clause joins its target to something else: the join is what picks the rows,
-    /// so the other tables become the write's own FROM and the conditions holding them together join
-    /// the WHERE. Only an inner join says that -- an outer one keeps rows matching nothing, and those
-    /// are rows the write would still touch, which a condition cannot say afterwards. What is left
-    /// after the joins that decide nothing have been dropped, that is.
-    (TableSource? From, Expr? Where) Selecting(TableSource from, NamedTableSource target, Expr? where, int at,
+    /// so the rest of it becomes the write's own clauses. An inner tree folds -- the other tables
+    /// become the write's FROM and the conditions holding them together join the WHERE. An outer one
+    /// cannot fold: it keeps rows matching nothing, which is not something a condition says
+    /// afterwards -- so the tree is handed on whole instead, turned to lead with the target and with
+    /// the target still inside it. A join tree only *selects* the rows a write touches, and what the
+    /// tree selects is something any join shape can say. Joins that decide nothing go before either.
+    (TableSource? From, Expr? Where) Selecting(TableSource from, NamedTableSource target, Expr? where,
                                                List<Expr>? read = null)
     {
         from = Pruned(from, target, [.. read ?? [], .. where is null ? (Expr[])[] : [where]]);
 
         if (ReferenceEquals(from, target)) return (null, where);
-        if (!Inner(from))
-            throw new TSqlException("an outer join cannot pick the rows a write touches: it keeps the ones " +
-                                    "matching nothing, which is not something a condition says afterwards", at);
+
+        // Turning the tree may dissolve its outer joins entirely -- a target on a nullable side
+        // comes through the same rows an inner join keeps -- so folding is decided after the turn.
+        if (!Inner(from)) from = Rotated(from, target)!;
+        if (!Inner(from)) return (from, where);
 
         List<TableSource> sources = [];
         List<Expr> conditions = [];
@@ -302,6 +306,45 @@ sealed class TSqlParser
     /// ordinary predicates.
     static bool Inner(TableSource source) => source is not JoinSource join ||
         (join.Kind is JoinKind.Inner or JoinKind.Cross && Inner(join.Left) && Inner(join.Right));
+
+    /// The tree turned so the target leads it, with every join on the target's path preserving only
+    /// the target's side. Neither turn changes which target rows come through with what beside them:
+    /// LEFT and RIGHT name sides, so mirroring a join renames it -- and a row an outer join kept for
+    /// matching nothing on the *other* side holds no target row at all, only the null fill where its
+    /// columns would be, so preserving that side never put a target row through. Null where the
+    /// subtree does not hold the target.
+    static TableSource? Rotated(TableSource from, NamedTableSource target)
+    {
+        if (ReferenceEquals(from, target)) return from;
+        if (from is not JoinSource join) return null;
+
+        if (Rotated(join.Left, target) is { } left)
+            return join with
+            {
+                Kind = join.Kind switch
+                {
+                    JoinKind.Right => JoinKind.Inner,
+                    JoinKind.Full => JoinKind.Left,
+                    _ => join.Kind,
+                },
+                Left = left,
+            };
+
+        if (Rotated(join.Right, target) is { } right)
+            return join with
+            {
+                Kind = join.Kind switch
+                {
+                    JoinKind.Left => JoinKind.Inner,
+                    JoinKind.Right or JoinKind.Full => JoinKind.Left,
+                    _ => join.Kind,
+                },
+                Left = right,
+                Right = join.Left,
+            };
+
+        return null;
+    }
 
     /// The tables a join tree stands on, and the conditions holding them together.
     static void Flatten(TableSource source, List<TableSource> sources, List<Expr> conditions)
@@ -462,10 +505,10 @@ sealed class TSqlParser
         var output = Output();
         var where = Accept("where") ? Expression() : null;
 
-        if (from is null || Bound(from, target) is not { } source)
+        if (from is null || Bound(from, target, at) is not { } source)
             return new DeleteStatement(target, null, from, where, output, top);
 
-        var (rest, filtered) = Selecting(from, source, where, at, [.. output.Select(o => o.Value)]);
+        var (rest, filtered) = Selecting(from, source, where, [.. output.Select(o => o.Value)]);
         return new DeleteStatement(source.Name, source.Alias, rest, filtered, output, top);
     }
 
@@ -475,21 +518,39 @@ sealed class TSqlParser
     ///
     /// An alias the clause bound, which is what EF Core writes; or the table spelled out, which is
     /// what LLBLGen writes -- it names every table in full and puts the target itself inside the
-    /// join tree. A name matching more than one source is ambiguous, and left alone rather than
-    /// guessed at: SQL Server refuses it too.
-    static NamedTableSource? Bound(TableSource from, TableName target)
+    /// join tree. The table's own name still finds a source the clause aliased: SQL Server binds
+    /// `DELETE FROM t FROM t AS a …` through the alias too, as one reference and not a self-join.
+    ///
+    /// Nothing matching is the plain `UPDATE t SET … FROM s`, where the FROM clause is something the
+    /// target reads rather than something it sits in. More than one matching is refused outright --
+    /// see `One`.
+    static NamedTableSource? Bound(TableSource from, TableName target, int at)
     {
         List<TableSource> sources = [];
         Flatten(from, sources, []);
         var named = sources.OfType<NamedTableSource>().ToList();
 
         if (target.Parts is [var alias] &&
-            named.Where(source => source.Alias is { } bound && Same(bound, alias)).ToList() is [var only])
-            return only;
+            named.Where(source => source.Alias is { } bound && Same(bound, alias)).ToList() is { Count: > 0 } aliased)
+            return One(aliased, alias.Text, at);
 
-        return named.Where(source => source.Alias is null && Same(source.Name.Table, target.Table)).ToList()
-            is [var single] ? single : null;
+        return named.Where(source => Same(source.Name.Table, target.Table)).ToList() is { Count: > 0 } matched
+            ? One(matched, target.Table.Text, at)
+            : null;
     }
+
+    /// The one source a write's target names. Two is not a write against either of them: the clause
+    /// binds the name twice and nothing in the statement says which occurrence the rows come from.
+    /// SQL Server refuses it -- "The table 't' is ambiguous" -- and refusing is the only safe answer
+    /// here too, because the alternative is not a smaller write but a larger one: with no source to
+    /// resolve to, the target would be scanned *beside* the tree rather than through it, and that
+    /// cross join pairs every row of the table with anything the tree kept. A three-row table
+    /// filtered to one then loses all three, with nothing to say it had gone wrong.
+    static NamedTableSource One(List<NamedTableSource> matched, string name, int at) =>
+        matched is [var single] ? single
+        : throw new TSqlException($"the table {name} is ambiguous: the write's FROM clause binds it more " +
+                                  "than once, and which of them the rows come from is not something the " +
+                                  "statement says", at);
 
     static bool Same(Name a, Name b) => string.Equals(a.Text, b.Text, StringComparison.OrdinalIgnoreCase);
 
@@ -554,7 +615,7 @@ sealed class TSqlParser
     {
         ColumnRef column => column.Parts.Count < 2 || Same(column.Parts[^2], source.Alias ?? source.Name.Table),
         StarRef star => star.Qualifier.Count == 0 || Same(star.Qualifier[^1], source.Alias ?? source.Name.Table),
-        ExistsExpr or SubqueryExpr => true,
+        ExistsExpr or SubqueryExpr or InExpr { Subquery: not null } => true,
         _ => false,
     });
 

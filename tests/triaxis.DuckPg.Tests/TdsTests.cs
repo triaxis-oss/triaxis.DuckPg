@@ -1043,6 +1043,40 @@ public class TdsTests : IDisposable
             new SqlCommand("DELETE TOP (1) FROM [#scratch]", connection).ExecuteNonQuery()).Message);
     }
 
+    /// The tree-carrying shape against a table the lake does not publish: there is no declared key
+    /// to collect the rows by, but the table is DuckDB's own, so its rowid stands where the key
+    /// would -- which is the same subselect the shape means everywhere else.
+    [Fact]
+    public void ATemporaryTablePickedThroughAJoinTreeIsKeyedOnItsRowid()
+    {
+        using var connection = Open();
+        new SqlCommand("SELECT order_id INTO #scratch FROM orders", connection).ExecuteNonQuery();
+
+        // Only order 3 is over 25, so the other two scratch rows match nothing -- and those are
+        // exactly the rows an `IS NULL` predicate over the outer side means to take.
+        Assert.Equal(2, new SqlCommand(
+            "DELETE FROM [#scratch] FROM [#scratch] LEFT JOIN [orders] AS [o] " +
+            "ON [o].[order_id] = [#scratch].[order_id] AND [o].[amount] > 25 " +
+            "WHERE [o].[order_id] IS NULL", connection).ExecuteNonQuery());
+
+        Assert.Equal(["3"], Rows(connection, "SELECT order_id FROM #scratch ORDER BY order_id"));
+    }
+
+    /// The same shape on an UPDATE has nowhere to go: the assignments read the tree, so it cannot
+    /// move into a subselect the way a DELETE's rowids can. Said plainly rather than handed on for
+    /// DuckDB to refuse in its own words.
+    [Fact]
+    public void ATemporaryTablePickedThroughAJoinTreeCannotBeUpdated()
+    {
+        using var connection = Open();
+        new SqlCommand("SELECT order_id INTO #scratch FROM orders", connection).ExecuteNonQuery();
+
+        Assert.Contains("needs the lake's keys", Assert.Throws<SqlException>(() => new SqlCommand(
+            "UPDATE [#scratch] SET [order_id] = 9 FROM [#scratch] LEFT JOIN [orders] AS [o] " +
+            "ON [o].[order_id] = [#scratch].[order_id] WHERE [o].[order_id] IS NULL",
+            connection).ExecuteNonQuery()).Message);
+    }
+
     static List<string> Rows(SqlConnection connection, string sql)
     {
         var rows = new List<string>();
@@ -1254,7 +1288,8 @@ public class TdsTests : IDisposable
 
     /// Three tables an entity's relation graph joins, one entry pointing at a batch that is not
     /// there. That row is the point of the fixture: it is in the result of a LEFT JOIN and not of an
-    /// INNER one, so a rewrite that confused the two would quietly leave it alone.
+    /// INNER one, so a rewrite that confused the two would quietly leave it alone. The tags point at
+    /// one entry twice, which is the other thing a join can do to a write's rows.
     static TestLake Related([CallerMemberName] string name = "")
     {
         var lake = new TestLake(name)
@@ -1265,6 +1300,7 @@ public class TdsTests : IDisposable
                  {"pKey": 101, "category_pKey": 2, "batch_pKey": 999,  "revision_pKey": 7},
                  {"pKey": 102, "category_pKey": 1, "batch_pKey": 10,   "revision_pKey": 8}]
                 """)
+            .Json("base", "tags", """[{"pKey": 1, "entry_pKey": 100}, {"pKey": 2, "entry_pKey": 100}]""")
             .Stack("base")
             .WriteTo("local")
             .WithTds();
@@ -1383,6 +1419,129 @@ public class TdsTests : IDisposable
                  ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
         WHERE ([lake].[dbo].[entries].[revision_pKey] = @p1{extra})
         """;
+
+    /// The same tree with the LEFT JOIN read by the predicate, which is how a scheduler's cleanup
+    /// keeps rows pointing at nothing deletable: the join cannot fold into a condition, so the
+    /// write travels with it whole -- and the row whose batch is not there is exactly the one that
+    /// goes. An INNER-shaped rewrite would quietly leave it alone.
+    [Fact]
+    public void AReadOuterJoinStillPicksTheRowsMatchingNothing()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand(
+            Tree("DELETE", " AND [lake].[dbo].[batches].[pKey] IS NULL"), connection);
+        command.Parameters.AddWithValue("@p1", 7);
+
+        Assert.Equal(1, command.ExecuteNonQuery());
+
+        lake.Restart();
+        Assert.Equal(["100|7", "102|8"], lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// The shape LLBLGen SelfServicing's `DeleteMulti(filter, relations)` renders for an entity with
+    /// a required and an optional relation: an INNER JOIN and a LEFT JOIN, every table spelled out,
+    /// and a predicate reading the optional side *or* accepting the rows that matched nothing. Both
+    /// halves of that `OR` have to select, which is the whole reason the tree cannot fold away.
+    [Fact]
+    public void TheJoinedDeleteAnLlblgenSchedulerWrites()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            DELETE FROM [lake].[dbo].[entries]
+            FROM [lake].[dbo].[entries]
+                 INNER JOIN [lake].[dbo].[categories]
+                   ON [lake].[dbo].[entries].[category_pKey] = [lake].[dbo].[categories].[pKey]
+                 LEFT JOIN [lake].[dbo].[batches]
+                   ON [lake].[dbo].[entries].[batch_pKey] = [lake].[dbo].[batches].[pKey]
+            WHERE [lake].[dbo].[entries].[revision_pKey] = @p1
+              AND ([lake].[dbo].[batches].[label] IN (@p2) OR [lake].[dbo].[batches].[pKey] IS NULL)
+            """, connection);
+        command.Parameters.AddWithValue("@p1", 7);
+        command.Parameters.AddWithValue("@p2", "one");
+
+        // Entry 100 through the batch it has, entry 101 through the batch it has not.
+        Assert.Equal(2, command.ExecuteNonQuery());
+
+        lake.Restart();
+        Assert.Equal(["102"], lake.Query("SELECT pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// A target row the join matches twice is one row of the target: it goes once and counts once.
+    /// Only entry 100 has tags, and it has two of them; the LEFT JOIN is read so the tree cannot
+    /// fold away.
+    [Fact]
+    public void ARowTheJoinMatchesTwiceGoesOnce()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            DELETE FROM [lake].[dbo].[entries]
+            FROM [lake].[dbo].[entries]
+                 INNER JOIN [lake].[dbo].[tags]
+                   ON [lake].[dbo].[tags].[entry_pKey]=[lake].[dbo].[entries].[pKey]
+                 LEFT JOIN [lake].[dbo].[batches]
+                   ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey]
+            WHERE [lake].[dbo].[batches].[pKey] IS NOT NULL
+            """, connection);
+
+        Assert.Equal(1, command.ExecuteNonQuery());
+        Assert.Equal(["101", "102"], lake.Query("SELECT pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// The same row matched twice under an UPDATE: two identical writes are one write, affecting
+    /// the row once -- not a key collision, which is what two rows that *differ* under one key
+    /// would be.
+    [Fact]
+    public void ARowTheJoinMatchesTwiceIsUpdatedOnce()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            UPDATE [lake].[dbo].[entries] SET [revision_pKey] = @p0
+            FROM [lake].[dbo].[entries]
+                 INNER JOIN [lake].[dbo].[tags]
+                   ON [lake].[dbo].[tags].[entry_pKey]=[lake].[dbo].[entries].[pKey]
+                 LEFT JOIN [lake].[dbo].[batches]
+                   ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey]
+            WHERE [lake].[dbo].[batches].[pKey] IS NOT NULL
+            """, connection);
+        command.Parameters.AddWithValue("@p0", 9);
+
+        Assert.Equal(1, command.ExecuteNonQuery());
+        Assert.Equal(["100|9", "101|7", "102|8"],
+            lake.Query("SELECT pKey, revision_pKey FROM lake.entries ORDER BY pKey"));
+    }
+
+    /// An update reading the outer side of its join writes the null fill where nothing matched --
+    /// which is the point of asking for a LEFT JOIN rather than an INNER one.
+    [Fact]
+    public void AnUpdateReadsTheOuterSideNullFillAndAll()
+    {
+        using var lake = Related();
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        using var command = new SqlCommand("""
+            UPDATE [e] SET [batch_pKey] = [b].[pKey]
+            FROM [entries] AS [e] LEFT JOIN [batches] AS [b] ON [b].[pKey] = [e].[batch_pKey]
+            WHERE [e].[revision_pKey] = @p1
+            """, connection);
+        command.Parameters.AddWithValue("@p1", 7);
+
+        Assert.Equal(2, command.ExecuteNonQuery());
+        Assert.Equal(["100|10", "101|", "102|10"],
+            lake.Query("SELECT pKey, batch_pKey FROM lake.entries ORDER BY pKey"));
+    }
 
     [Fact]
     public void AFailedStatementLeavesTheConnectionUsable()
