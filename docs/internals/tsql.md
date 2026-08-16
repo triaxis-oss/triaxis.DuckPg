@@ -6,7 +6,10 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
 
 - **The dialect is translated on the tree, never on the text.** `TSql/` parses T-SQL into an AST and
   renders DuckDB SQL from it. A regex "fix" for a dialect difference belongs in the renderer as a
-  case, not in a string replacement — this is why `'a' + b` concatenates and `1 + 2` adds.
+  case, not in a string replacement — this is why `'a' + b` concatenates and `1 + 2` adds. The one
+  standing exception is not a dialect fix at all: SqlClient 7's bulk-copy probe is a procedural
+  batch no statement subset should learn, so `TdsSession.Probe` answers it by fingerprint before
+  the parser ever sees it — [wire](wire.md#bulk-load) holds that argument.
 - **A statement the parser does not cover is refused**, with the position. Passing unknown text
   through to DuckDB moves the failure somewhere harder to read.
 - **A join's right operand is a join tree, not a table.** `a LEFT JOIN b JOIN c ON … ON …` nests, and
@@ -69,9 +72,11 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   against the other connections of a shared database; a lake serves the application that owns its
   files, so the exclusion is already there and `TSqlWriter` renders the statement as nothing --
   which `Gateway.Translate` already answers as `Plan.Empty`. Making it a real lock would promise
-  more than a lake can keep, since the files under it may be served by another process. `EXEC` of
-  anything else is refused by name: the parser covers the call so an ORM reaching for a procedure
-  is told which one is missing, not that `EXEC` is unparseable.
+  more than a lake can keep, since the files under it may be served by another process.
+  `sp_tablecollations_100` is the other procedure answered -- SqlBulkCopy asks it before every
+  load, and [wire](wire.md#bulk-load) says what the answer has to look like. `EXEC` of anything
+  else is refused by name: the parser covers the call so an ORM reaching for a procedure is told
+  which one is missing, not that `EXEC` is unparseable.
 - **`SCOPE_IDENTITY()` is per connection and `IDENT_CURRENT` is per table, which is why they are kept
   in two different places.** `TdsSession.identity` is the session's and `Gateway.identities` is the
   process's; `@@IDENTITY` is `SCOPE_IDENTITY()` without the scope, and without triggers there is no

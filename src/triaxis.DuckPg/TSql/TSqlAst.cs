@@ -32,6 +32,11 @@ sealed record DropTableStatement(TableName Target, bool IfExists) : Statement;
 sealed record InsertStatement(TableName Target, List<Name> Columns, InsertSource Source,
                               List<OutputItem> Output) : Statement;
 
+/// `INSERT BULK t (col type, …) WITH (…)` -- not a statement an application writes: SqlBulkCopy
+/// sends it to declare where the bulk load stream that follows lands. Only the names and their
+/// order are kept, since the stream re-declares the types in its own metadata.
+sealed record InsertBulkStatement(TableName Target, List<Name> Columns) : Statement;
+
 /// One item of an OUTPUT clause: a column of the rows being written, or a constant -- EF Core sends
 /// `OUTPUT 1` to count the rows a statement touched. Whether a column was qualified by `INSERTED` or
 /// by the source's own alias is settled while parsing; either way it names one of those rows.

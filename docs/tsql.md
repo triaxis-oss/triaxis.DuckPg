@@ -135,7 +135,8 @@ on the lake without the application knowing what it is talking to.
 | `@@VERSION`, `@@ROWCOUNT`, `@@TRANCOUNT`, `@@SPID` | the session's own values |
 | `SET NOCOUNT ON`, isolation levels | no-ops |
 | `SAVE TRANSACTION x` | nothing; `ROLLBACK TRANSACTION x` is refused rather than faked |
-| `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted; every other `EXEC` is refused by name |
+| `EXEC sp_getapplock @Resource = …`, `sp_releaseapplock` | granted |
+| `EXEC sp_tablecollations_100 N'[t]'` — SqlBulkCopy's question | the destination's columns, every collation the one the login advertised; every other `EXEC` is refused by name |
 
 A savepoint is refused rather than approximated. `SAVE TRANSACTION` renders to nothing, since marking
 a point costs nothing, but DuckDB has no savepoint to return to — so `ROLLBACK TRANSACTION x` fails

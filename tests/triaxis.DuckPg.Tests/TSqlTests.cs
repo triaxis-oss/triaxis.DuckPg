@@ -665,4 +665,42 @@ public class TSqlTests
         """SELECT "LPA_L1"."OrderID" FROM (SELECT ROW_NUMBER() OVER (ORDER BY "lake"."Orders"."OrderID") AS "__rn", "lake"."Orders"."OrderID" FROM "lake"."Orders") AS "LPA_L1" WHERE "LPA_L1"."__rn" > $p1 LIMIT $p2""")]
     public void RendersWhatAnOrmSends(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql, "p1", "p2"));
+
+    /// SqlBulkCopy's probe comes as one batch with no semicolons, so a SET option has to stop at
+    /// the statement that follows it instead of swallowing it as more of the option.
+    [Fact]
+    public void ParsesWhatSqlBulkCopySendsFirst()
+    {
+        var statements = TSqlParser.Parse(
+            "select @@trancount; SET FMTONLY ON select * from [dbo].[orders] SET FMTONLY OFF " +
+            "exec ..sp_tablecollations_100 N'[dbo].[orders]'");
+
+        Assert.Equal(5, statements.Count);
+        Assert.Equal("FMTONLY ON", ((SetOptionStatement)statements[1]).Option);
+        Assert.IsType<SelectStatement>(statements[2]);
+        Assert.Equal("FMTONLY OFF", ((SetOptionStatement)statements[3]).Option);
+        var probe = Assert.IsType<ExecuteStatement>(statements[4]);
+        Assert.Equal("sp_tablecollations_100", probe.Procedure.Table.Text);
+    }
+
+    /// The INSERT BULK that declares a load: types, collations and hints are read past, the names
+    /// and their order are what the bulk stream is landed by.
+    [Fact]
+    public void ParsesInsertBulk()
+    {
+        var statements = TSqlParser.Parse(
+            "insert bulk [dbo].[orders] ([order_id] Int, [amount] Decimal(10,2), " +
+            "[note] NVarChar(max) COLLATE SQL_Latin1_General_CP1_CI_AS) with (TABLOCK, ROWS_PER_BATCH = 3)");
+
+        var bulk = Assert.IsType<InsertBulkStatement>(Assert.Single(statements));
+        Assert.Equal(["order_id", "amount", "note"], bulk.Columns.Select(c => c.Text));
+    }
+
+    /// The destination comes out of a string literal, so the quoting decides where the parts end
+    /// -- a dot inside the brackets is part of the name, not a separator.
+    [Fact]
+    public void CollationsAnswerSurvivesADottedTableName()
+    {
+        Assert.Contains("lower('order.lines')", Translate("EXEC ..sp_tablecollations_100 N'[dbo].[order.lines]'"));
+    }
 }

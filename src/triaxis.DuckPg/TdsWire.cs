@@ -8,8 +8,8 @@ namespace triaxis.DuckPg;
 /// TDS message types, as they appear in the packet header.
 static class TdsMessage
 {
-    public const byte Batch = 1, Rpc = 3, Result = 4, Attention = 6, TransactionManager = 14,
-                      Login7 = 16, PreLogin = 18;
+    public const byte Batch = 1, Rpc = 3, Result = 4, Attention = 6, BulkLoad = 7,
+                      TransactionManager = 14, Login7 = 16, PreLogin = 18;
 }
 
 /// The tokens a response stream is made of.
@@ -154,12 +154,16 @@ sealed class TdsMsg
     }
 }
 
-/// Cursor over a received message body.
-struct TdsReader(byte[] body)
+/// Cursor over a received message body. The buffer may run past the message -- it is a
+/// MemoryStream's own, spare capacity included -- so the end is the length given, never the
+/// array's.
+struct TdsReader(byte[] body, int length)
 {
+    public TdsReader(byte[] body) : this(body, body.Length) { }
+
     int pos = 0;
 
-    public readonly bool AtEnd => pos >= body.Length;
+    public readonly bool AtEnd => pos >= length;
 
     public readonly int Position => pos;
 
@@ -209,7 +213,7 @@ struct TdsReader(byte[] body)
 
     public string UsVarchar() => Ucs2(U16());
 
-    public readonly byte[] Rest() => body[pos..];
+    public readonly byte[] Rest() => body[pos..length];
 }
 
 /// TDS packet framing: a message is a run of packets, each with an 8-byte header, the last one
@@ -240,7 +244,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
     /// `Reset` is how a pooled connection says it is a new session: SqlClient marks the first
     /// message it sends on a connection it took back out of the pool, rather than calling
     /// `sp_reset_connection` the way an older client does.
-    public (byte Type, byte[] Payload, bool Reset)? ReadMessage()
+    public (byte Type, byte[] Payload, int Length, bool Reset)? ReadMessage()
     {
         var payload = new MemoryStream();
         byte type;
@@ -263,7 +267,9 @@ sealed class TdsWire(Stream stream, ILogger logger)
         }
 
         logger.LogTrace("<< {Type} {Length}", type, payload.Length);
-        return (type, payload.ToArray(), reset);
+        // The stream's own buffer with its length beside it, not `ToArray`: a bulk load message
+        // can be most of a client's data, and copying it whole once more doubles the peak.
+        return (type, payload.GetBuffer(), (int)payload.Length, reset);
     }
 
     /// Sends the first <paramref name="count"/> bytes as packets that do not end the message; the

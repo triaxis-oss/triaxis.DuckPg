@@ -173,6 +173,26 @@ sealed class TSqlWriter(TSqlContext context)
             case ExecuteStatement execute when Granted.Contains(execute.Procedure.Table.Text):
                 return;
 
+            // What SqlBulkCopy asks before a bulk load: each destination column's collation, one
+            // row per column in SELECT * order -- the client reads the rowset by column ordinal
+            // and refuses an empty one. Every column duckpg puts on the wire is Unicode under the
+            // one collation the login advertised, so the collations themselves are null; the row
+            // count is what has to be true.
+            case ExecuteStatement execute
+                when execute.Procedure.Table.Text.Equals("sp_tablecollations_100", StringComparison.OrdinalIgnoreCase):
+            {
+                if (execute.Arguments is not [{ Value: Literal { Kind: LiteralKind.String } literal }])
+                    throw new TSqlException("sp_tablecollations_100 takes the name of a table, written as a string", 0);
+
+                var table = LastPart(literal.Text);
+                Put("SELECT ordinal_position::INT AS colid, column_name AS name, NULL::BLOB AS tds_collation, " +
+                    "NULL::VARCHAR AS collation_name FROM information_schema.columns WHERE table_schema = ")
+                    .Put(SqlText.Literal(context.Schema))
+                    .Put(" AND lower(table_name) = lower(").Put(SqlText.Literal(table))
+                    .Put(") ORDER BY ordinal_position");
+                return;
+            }
+
             case ExecuteStatement execute:
                 throw new TSqlException($"stored procedure {execute.Procedure.Table.Text} is not supported", 0);
 
@@ -823,9 +843,33 @@ sealed class TSqlWriter(TSqlContext context)
     /// one a key was generated in.
     static string Named(Expr argument) => argument switch
     {
-        Literal { Kind: LiteralKind.String, Text: var text } => text.Split('.')[^1].Trim('[', ']', '"'),
+        Literal { Kind: LiteralKind.String, Text: var text } => LastPart(text),
         _ => throw new TSqlException("IDENT_CURRENT takes the name of a table, written as a string", 0),
     };
+
+    /// The table's own name out of a multipart name written as text -- `[dbo].[order.lines]` names
+    /// `order.lines`, so only a dot outside the quoting splits, and a doubled closer inside it is
+    /// the character itself.
+    static string LastPart(string text)
+    {
+        var part = new StringBuilder();
+        var close = '\0';
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (close != '\0')
+            {
+                if (c == close && i + 1 < text.Length && text[i + 1] == close) { part.Append(c); i++; }
+                else if (c == close) close = '\0';
+                else part.Append(c);
+            }
+            else if (c == '[') close = ']';
+            else if (c == '"') close = '"';
+            else if (c == '.') part.Clear();
+            else part.Append(c);
+        }
+        return part.ToString();
+    }
 
     string Variable(VariableRef variable)
     {
