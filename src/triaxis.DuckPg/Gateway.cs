@@ -530,7 +530,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var update = SqlText.FindKeyword(sql, "UPDATE");
         var reference = SqlText.ReadTableRef(sql, update + 6);
         if (Writable(reference.Schema, reference.Name) is not { } table)
-            return Plan.Count("UPDATE", Unlimited(sql, "UPDATE"));
+            return Plan.Count("UPDATE", Unlimited(Grounded(sql, reference), "UPDATE"));
         RequireKey(table, "UPDATE");
 
         // What the statement was asked to hand back is answered from the rows it wrote, so it comes
@@ -583,12 +583,19 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var tombstones = moves && !table.Materialized;
 
         // With a FROM clause the target's own columns are no longer the only ones in scope, so
-        // everything the statement did not assign has to say which table it came from.
+        // everything the statement did not assign has to say which table it came from. A clause
+        // opening with the target itself carries the whole join tree the rows are picked through,
+        // target included, so the tree stands alone as the scan.
         var target = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
-        var scan = from < 0
-            ? target
-            : $"{target}, {sql[(from + 4)..(where < 0 ? sql.Length : where)]}";
-        var qualifier = from < 0 ? "" : SqlText.Quote(alias ?? table.Name) + ".";
+        var scan = target;
+        var qualifier = "";
+
+        if (from >= 0)
+        {
+            var clause = sql[(from + 4)..(where < 0 ? sql.Length : where)];
+            scan = Embedded(clause, reference, alias) ? clause : $"{target}, {clause}";
+            qualifier = SqlText.Quote(alias ?? table.Name) + ".";
+        }
 
         var projection = string.Join(", ", table.Columns.Select(c =>
             assignments.TryGetValue(c.Name, out var assigned)
@@ -610,17 +617,18 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var checking = rows is null ? predicate : $"({predicate}) AND {Within(table, keyed, owner)}";
 
         // A key that moves may land on one the lake already publishes, and a join around the target
-        // may produce the same row twice -- both write two rows under one key, which the write
-        // branch's own PRIMARY KEY catches and a materialized table does not. Where each row lands
-        // and what it is taking away are read together, so the scan behind them is paid for once.
-        // An update that neither moves a key nor joins cannot make a duplicate, since what it reads
-        // is the merged view and the merged view is already keyed.
+        // may hand the same row to the projection twice -- but two identical rows are one write, so
+        // a joined statement collapses what it writes first and only rows that *differ* under one
+        // key are a collision, which the write branch's own PRIMARY KEY catches and a materialized
+        // table does not. The check reads the whole row for the same reason; an update without a
+        // join reads the merged view, already keyed, so its key columns alone answer more cheaply.
+        var was = string.Join(", ", table.Key.Select(k =>
+            $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}"));
         var duplicates = moves || from >= 0
             ? Duplicates(table,
-                         $"SELECT {Moved(table, assignments, qualifier)}, " +
-                         string.Join(", ", table.Key.Select(k =>
-                             $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}")) +
-                         $" FROM {scan} WHERE {checking}",
+                         from >= 0
+                             ? $"SELECT DISTINCT {projection}, {was} FROM {scan} WHERE {checking}"
+                             : $"SELECT {Moved(table, assignments, qualifier)}, {was} FROM {scan} WHERE {checking}",
                          replacing: true)
             : KeyRule.None;
 
@@ -628,7 +636,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // anything is tombstoned -- afterwards the view no longer returns them.
         string[] steps = [
             Keys(keyed),
-            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS SELECT {projection} FROM {scan} WHERE {touched}",
+            $"CREATE OR REPLACE TEMP TABLE duckpg_updated AS " +
+            $"SELECT {(from < 0 ? "" : "DISTINCT ")}{projection} FROM {scan} WHERE {touched}",
             .. tombstones ? (string[])[Tombstone(table)] : [],
             Evict(table),
             $"INSERT INTO {table.WriteName} ({columns}) SELECT {columns} FROM duckpg_updated"];
@@ -656,7 +665,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         var reference = SqlText.ReadTableRef(sql, from + 4);
         if (Writable(reference.Schema, reference.Name) is not { } table)
-            return Plan.Count("DELETE", Unlimited(sql, "DELETE"));
+            return Plan.Count("DELETE", Detached(Unlimited(sql, "DELETE"), reference));
         RequireKey(table, "DELETE");
 
         var (answered, rest) = Answers(sql);
@@ -673,10 +682,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var qualifier = "";
 
         // With another table in scope the key columns have to say which side they came from -- both
-        // may carry a column of that name, and the delete is against one of them.
+        // may carry a column of that name, and the delete is against one of them. A clause opening
+        // with the target itself carries the whole join tree the rows are picked through, target
+        // included, so the tree stands alone as the scan.
         if (joined >= 0)
         {
-            scan += ", " + sql[(joined + 5)..(where < 0 ? sql.Length : where)];
+            var clause = sql[(joined + 5)..(where < 0 ? sql.Length : where)];
+            scan = Embedded(clause, reference, alias) ? clause : $"{scan}, {clause}";
             qualifier = SqlText.Quote(alias ?? table.Name) + ".";
         }
 
@@ -854,6 +866,73 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         return word.Name.Equals("AS", StringComparison.OrdinalIgnoreCase)
             ? SqlText.ReadTableRef(sql, word.End).Name
             : word.Name;
+    }
+
+    static readonly HashSet<string> JoinWords =
+        new(StringComparer.OrdinalIgnoreCase) { "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "JOIN" };
+
+    /// Whether a joined write's clause opens with the write's own target under the write's own
+    /// alias -- duckpg's spelling, made by `TSqlParser.Selecting`, for a join tree that picks the
+    /// rows itself with the target inside it: the tree only selects, so its target occurrence is
+    /// the scan and nothing is put beside it. Nobody else writes this: SQL Server refuses the
+    /// doubled name outright, and reading it as a self-join is what has to be avoided here, since
+    /// DuckDB does exactly that rather than refusing -- see `Detached`.
+    static bool Embedded(string clause, (string? Schema, string Name, int Start, int End) target, string? alias)
+    {
+        var first = SqlText.ReadTableRef(clause, 0);
+        if (!string.Equals(first.Schema, target.Schema, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(first.Name, target.Name, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var word = SqlText.ReadTableRef(clause, first.End);
+        var bound = word.Name.Equals("AS", StringComparison.OrdinalIgnoreCase)
+            ? SqlText.ReadTableRef(clause, word.End).Name
+            : word.Name.Length == 0 || JoinWords.Contains(word.Name) ? null : word.Name;
+
+        return string.Equals(bound, alias, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// The tree-carrying spelling against a table the lake does not publish -- a session's `#temp`
+    /// joined through a graph of its own. There is no declared key to collect the rows by, but the
+    /// table is DuckDB's own, so its rowid takes the key's place: the tree moves into a subquery
+    /// picking rowids.
+    ///
+    /// Handed on as written it is not refused -- DuckDB reads the target's second occurrence as a
+    /// *separate* binding and deletes every row pairing with any the tree kept, which on a three-row
+    /// scratch table filtered to two deletes all three. Nothing says it went wrong, which is why
+    /// this path exists rather than a refusal: keeping the one binding one is the whole of it.
+    static string Detached(string sql, (string? Schema, string Name, int Start, int End) reference)
+    {
+        var alias = DeleteAlias(sql, reference.End);
+        var joined = SqlText.FindKeyword(sql, "USING", reference.End);
+        if (joined < 0) return sql;
+
+        var (answered, rest) = Answers(sql);
+        var where = SqlText.FindKeyword(rest, "WHERE", joined + 5);
+        var clause = rest[(joined + 5)..(where < 0 ? rest.Length : where)].Trim();
+        if (!Embedded(clause, reference, alias)) return sql;
+
+        return rest[..joined] +
+               $"WHERE rowid IN (SELECT {SqlText.Quote(alias ?? reference.Name)}.rowid FROM {clause} " +
+               $"WHERE {(where < 0 ? "TRUE" : rest[(where + 5)..].Trim())})" +
+               (answered is null ? "" : $" RETURNING {answered}");
+    }
+
+    /// The same spelling on an UPDATE has nowhere to go without a key: the assignments read the
+    /// tree, so it cannot move aside into a subquery the way a DELETE's rowids can. Refused here,
+    /// while the statement can still be named for what it is -- handed on, it would be read as a
+    /// self-join and write the wrong rows without saying so, which is what `Detached` measures.
+    static string Grounded(string sql, (string? Schema, string Name, int Start, int End) reference)
+    {
+        var set = SqlText.FindKeyword(sql, "SET", reference.End);
+        var from = set < 0 ? -1 : SqlText.FindKeyword(sql, "FROM", set + 3);
+        if (from < 0) return sql;
+
+        var where = SqlText.FindKeyword(sql, "WHERE", from + 4);
+        var clause = sql[(from + 4)..(where < 0 ? sql.Length : where)];
+        if (!Embedded(clause, reference, ReadAlias(sql, reference.End))) return sql;
+
+        throw new PgError("0A000", "an UPDATE picked through a join tree carrying its own target " +
+                                   $"needs the lake's keys, and {reference.Name} is not a table the lake publishes");
     }
 
     /// A tombstone hides the row in every layer below; the same key deleted twice is one tombstone.

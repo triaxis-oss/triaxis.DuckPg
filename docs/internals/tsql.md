@@ -96,11 +96,19 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   `DELETE FROM [s] FROM [t] AS [s]`; LLBLGen spells every table out in full and puts the target
   *inside* its own join tree -- `DELETE FROM [db].[dbo].[t] FROM ((… INNER JOIN [db].[dbo].[t] ON …)
   LEFT JOIN …)`. So `TSqlParser.Bound` resolves either way: an alias the clause bound, or, failing
-  that, the one unaliased source carrying that table's name. *One* -- a name matching two sources is
-  ambiguous and left alone, which is what SQL Server does with it, and a target that resolves to
-  nothing is the plain `UPDATE t SET … FROM s` where the FROM clause is something the target reads
-  rather than something it sits in. The old guard was `target.Parts is not [var named]`, so a
-  three-part target never even reached the alias lookup.
+  that, the one source carrying that table's name -- aliased or not, since SQL Server binds
+  `DELETE FROM t FROM t AS a …` through the alias as one reference rather than as a self-join. A
+  target that resolves to nothing is the plain `UPDATE t SET … FROM s`, where the FROM clause is
+  something the target reads rather than something it sits in. The old guard was
+  `target.Parts is not [var named]`, so a three-part target never even reached the alias lookup.
+- **A target the clause binds twice is refused, and refusing is the *safe* answer rather than the
+  cautious one.** `Bound` returning null does not mean "leave the statement alone" -- it means the
+  write has no source to resolve to, so the gateway scans the target *beside* the tree instead of
+  through it, and that cross join pairs every row of the table with anything the tree kept. Measured
+  on a three-row table filtered to one: all three deleted, with nothing to say it had gone wrong.
+  So `One` throws where two sources match, which is also what SQL Server does with it (Msg 8154,
+  "The table 't' is ambiguous"). This predates the outer-join work and was found by reviewing it;
+  the comment that used to sit on that line claimed SQL Server parity while doing the opposite.
 - **A join around that target folds into the write's own clauses.** `TSqlParser.Selecting` makes the
   other tables the write's `FROM` and their `ON` conditions part of its `WHERE`, which is the shape
   `Gateway.RewriteUpdate` already ran for a `MERGE`. Only an inner join folds: an outer one keeps the
@@ -109,21 +117,51 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   it collects, since both tables may carry a column of that name. A join hint -- `INNER LOOP JOIN`,
   `HASH`, `MERGE`, `REMOTE` -- is read and dropped: it steers an optimiser this does not have, and
   says nothing about which rows come back.
-- **An outer join that decides nothing is dropped, and that is not the same as allowing one.**
-  An ORM renders the entity's whole relation graph whether the statement reads it or not, so the
-  refusal above fires on joins that could not change a single row: every row of the preserved side
-  comes through a LEFT JOIN, matched or not, so removing one nothing else names leaves exactly the
-  rows behind that were there. `TSqlParser.Pruned` takes those away until none is left and `Inner`
-  then decides the rest, which is why the refusal still stands for the join somebody reads.
-  Conservative on every axis, because each axis is a way to delete the wrong rows: only a single
-  named table, never a join tree; never the target, since `[a] LEFT JOIN [target]` matched exactly
-  the rows the write meant and dropping `a` would widen it to all of them; never a FULL join, which
-  preserves both sides. And `Names` counts an unqualified column and a subquery as reading
-  everything -- one could be anyone's and the other may be correlated, and neither says anything
-  that can be read off the tree. What makes the difference visible is a row pointing at a parent that
-  is not there: it is in the result of the LEFT JOIN and not of an INNER one, so a rewrite that
-  confused the two would leave it behind and report a smaller count. That row is in
-  `TdsTests.Related` for exactly that reason.
+- **What cannot fold travels whole, because a join tree only *selects*.** Folding is `USING`'s shape
+  and `USING` is an inner join, so a tree that survives `Pruned` with an outer join in it used to be
+  refused outright. That was a step too far: the tree around a write picks which target rows it
+  touches and nothing else -- there are no columns of the other side in what a DELETE writes -- so
+  any join shape is expressible by keying the write on what the tree selected. `Selecting` hands the
+  tree back intact with the target still inside it, and the gateway reads that spelling through
+  `Embedded` and makes the tree the scan its keys come off. `DISTINCT` on those keys is what makes a
+  target row matched twice one row, which `USING` never promised. LLBLGen SelfServicing's
+  `DeleteMulti(filter, relations)` is why this matters: an INNER plus a LEFT relation is the ordinary
+  output of an entity with an optional parent, and the predicate reads the optional side (`… OR
+  [Visit_pKey] IS NULL`) precisely to catch the rows matching nothing.
+- **The tree has to lead with the target, and turning it renames sides rather than changing rows.**
+  `TSqlParser.Rotated` walks to the target and mirrors each join above it: LEFT and RIGHT name sides,
+  so a mirrored `LEFT` is a `RIGHT`, and a join whose *preserved* side is the one the target is not
+  on becomes inner -- a row kept for matching nothing there holds no target row at all, only the null
+  fill where its columns would be, so it never put one through. That is also why an outer join with
+  the target on its nullable side dissolves to an inner one, and why folding is decided after the
+  turn rather than before it.
+- **An `UPDATE`'s assignments read the tree, so it cannot move into a subselect the way a DELETE's
+  rowids can.** For a table the lake publishes that costs nothing -- the plan already builds
+  `duckpg_updated` out of a scan it chooses, so the tree is simply that scan, `DISTINCT` so a row
+  matched twice is written once and is not mistaken for a key collision. For a table it does not
+  publish there is no key and no plan, and `Gateway.Grounded` says so by name.
+- **DuckDB does not refuse the target bound twice -- it self-joins.** `Gateway.Detached` exists
+  because a `#temp` target in the tree-carrying spelling, handed on as written, reads the second
+  occurrence as a separate binding and deletes every row pairing with any the tree kept: three rows
+  filtered to two deleted all three, with nothing to say it had gone wrong. There is no declared key
+  to collect by, but the table is DuckDB's own, so `rowid` stands where the key would.
+- **An outer join that decides nothing is still dropped, and that is now an optimisation rather
+  than the difference between running and being refused.** An ORM renders the entity's whole
+  relation graph whether the statement reads it or not, and a join nothing reads could not change a
+  single row: every row of the preserved side comes through a LEFT JOIN, matched or not, so removing
+  one nothing else names leaves exactly the rows behind that were there. `TSqlParser.Pruned` takes
+  those away until none is left, and what survives folds or travels whole. Keeping it is what lets
+  the common ORM delete stay the two-table `USING` it always was instead of dragging a relation
+  graph through every key scan. Conservative on every axis, because each axis is a way to delete the
+  wrong rows: only a single named table, never a join tree; never the target, since
+  `[a] LEFT JOIN [target]` matched exactly the rows the write meant and dropping `a` would widen it
+  to all of them; never a FULL join, which preserves both sides. And `Names` counts an unqualified
+  column, a subquery and an `IN (SELECT …)` as reading everything -- one could be anyone's and the
+  others may be correlated, and none says anything that can be read off the tree. What makes the
+  difference visible is a row pointing at a parent that is not there: it is in the result of the
+  LEFT JOIN and not of an INNER one, so a rewrite that confused the two would leave it behind and
+  report a smaller count. That row is in `TdsTests.Related` for exactly that reason, beside a pair
+  of tags on one entry -- the other thing a join does to a write's rows.
 
 ## Rewriting a write
 

@@ -442,38 +442,83 @@ public class TSqlTests
                 """, "p1"));
     }
 
-    /// A join that decides nothing is dropped; one that decides something is still refused, and the
-    /// difference is whether anything outside the join reads the nullable side.
+    /// A join that decides nothing is dropped; one that decides something cannot fold into ordinary
+    /// clauses -- it keeps rows matching nothing -- so the write carries the whole tree instead,
+    /// target inside it, and the gateway keys the rows off what the tree selects.
     [Theory]
     // Nothing names the outer side, so every row of the target survives the join either way.
     [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
         """DELETE FROM "lake"."orders" AS "s" """)]
     [InlineData("UPDATE [s] SET [x] = 1 FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
         """UPDATE "lake"."orders" AS "s" SET "x" = 1""")]
-    // Read by the predicate, so the join is what picks the rows and cannot be taken away.
+    // Read by the predicate, so the join is what picks the rows and travels whole -- rows whose
+    // outer side matched nothing included, which is exactly what such a predicate means to catch.
     [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE t.x IS NULL",
-        null)]
-    // Read by what the update writes.
+        """DELETE FROM "lake"."orders" AS "s" USING "lake"."orders" AS "s" LEFT JOIN "lake"."staging" AS "t" """ +
+        """ON "t"."id" = "s"."id" WHERE "t"."x" IS NULL""")]
+    // Read by what the update writes: the assignment sees the outer side, null fill and all.
     [InlineData("UPDATE [s] SET [x] = [t].[x] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
-        null)]
+        """UPDATE "lake"."orders" AS "s" SET "x" = "t"."x" FROM "lake"."orders" AS "s" """ +
+        """LEFT JOIN "lake"."staging" AS "t" ON "t"."id" = "s"."id" """)]
     // An unqualified column could be anyone's, and a subquery may be correlated: neither is read
-    // here, so neither is guessed at.
+    // here, so neither is guessed at -- the join stays, and stays whole.
     [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE x = 1",
-        null)]
+        """DELETE FROM "lake"."orders" AS "s" USING "lake"."orders" AS "s" LEFT JOIN "lake"."staging" AS "t" """ +
+        """ON "t"."id" = "s"."id" WHERE "x" = 1""")]
     [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id " +
-        "WHERE EXISTS (SELECT 1 FROM other WHERE other.id = t.id)", null)]
-    // The target itself is never the one dropped: the rows it matched are the ones the write meant.
-    [InlineData("DELETE FROM [s] FROM [staging] AS [t] LEFT JOIN [orders] AS [s] ON t.id = s.id", null)]
-    public void DropsOnlyTheJoinsThatDecideNothing(string tsql, string? expected)
-    {
-        if (expected is null)
-        {
-            Assert.Contains("an outer join cannot pick",
-                Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
-            return;
-        }
+        "WHERE EXISTS (SELECT 1 FROM other WHERE other.id = t.id)",
+        """DELETE FROM "lake"."orders" AS "s" USING "lake"."orders" AS "s" LEFT JOIN "lake"."staging" AS "t" """ +
+        """ON "t"."id" = "s"."id" WHERE EXISTS (SELECT 1 FROM "lake"."other" WHERE "other"."id" = "t"."id")""")]
+    // A target on the nullable side reads as an inner join: a row kept for matching nothing is not
+    // a target row at all, only the null fill where its columns would be.
+    [InlineData("DELETE FROM [s] FROM [staging] AS [t] LEFT JOIN [orders] AS [s] ON t.id = s.id",
+        """DELETE FROM "lake"."orders" AS "s" USING "lake"."staging" AS "t" WHERE "t"."id" = "s"."id" """)]
+    public void DropsOnlyTheJoinsThatDecideNothing(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql));
-    }
+
+    /// The tree a write carries leads with its target, whatever order the client wrote it in --
+    /// mirroring a join renames its sides and nothing else -- and a join preserving the target's
+    /// side only where the target's own rows come through it keeps FULL and RIGHT out of the
+    /// spelling the gateway reads.
+    [Theory]
+    // The ORM tree with the LEFT JOIN read: the inner join turns to put the target first, and the
+    // outer one follows it whole.
+    [InlineData("""
+        DELETE FROM [lake].[dbo].[entries]
+        FROM (([lake].[dbo].[categories]
+               INNER JOIN [lake].[dbo].[entries]
+                 ON [lake].[dbo].[categories].[pKey]=[lake].[dbo].[entries].[category_pKey])
+              LEFT JOIN [lake].[dbo].[batches]
+                 ON [lake].[dbo].[batches].[pKey]=[lake].[dbo].[entries].[batch_pKey])
+        WHERE ([lake].[dbo].[batches].[pKey] IS NULL)
+        """,
+        """DELETE FROM "lake"."entries" USING "lake"."entries" INNER JOIN "lake"."categories" """ +
+        """ON "lake"."categories"."pKey" = "lake"."entries"."category_pKey" LEFT JOIN "lake"."batches" """ +
+        """ON "lake"."batches"."pKey" = "lake"."entries"."batch_pKey" WHERE ("lake"."batches"."pKey" IS NULL)""")]
+    // A RIGHT JOIN preserving the target is the same join with its sides renamed.
+    [InlineData("DELETE FROM [t] FROM [staging] AS [s] RIGHT JOIN [t] ON [s].[id] = [t].[id] WHERE [s].[id] IS NULL",
+        """DELETE FROM "lake"."t" USING "lake"."t" LEFT JOIN "lake"."staging" AS "s" """ +
+        """ON "s"."id" = "t"."id" WHERE "s"."id" IS NULL""")]
+    // The target named by its table's name while the FROM clause aliases it: SQL Server binds the
+    // two as one reference, and so does the write.
+    [InlineData("DELETE FROM [t] FROM [t] AS [a] LEFT JOIN [staging] AS [s] ON s.id = a.id WHERE s.x IS NULL",
+        """DELETE FROM "lake"."t" AS "a" USING "lake"."t" AS "a" LEFT JOIN "lake"."staging" AS "s" """ +
+        """ON "s"."id" = "a"."id" WHERE "s"."x" IS NULL""")]
+    public void TurnsTheJoinTreeToLeadWithItsTarget(string tsql, string expected) =>
+        Assert.Equal(expected.Trim(), Translate(tsql));
+
+    /// A target the FROM clause binds twice is a write against neither: nothing says which
+    /// occurrence its rows come from. Refused, as SQL Server refuses it -- and refusing is the safe
+    /// answer rather than the cautious one, since a target that resolves to nothing is scanned
+    /// beside the tree instead of through it, and that cross join is every row of the table.
+    [Theory]
+    [InlineData("DELETE FROM [t] FROM [t] AS [a] INNER JOIN [t] AS [b] ON [b].[id] = [a].[id] " +
+        "LEFT JOIN [staging] AS [s] ON [s].[id] = [a].[id] WHERE [s].[id] IS NULL")]
+    [InlineData("UPDATE [t] SET [x] = 1 FROM [t] AS [a] INNER JOIN [t] AS [b] ON [b].[id] = [a].[id]")]
+    // Two unaliased occurrences say no more than two aliased ones do.
+    [InlineData("DELETE FROM [t] FROM [t] INNER JOIN [t] ON 1 = 1")]
+    public void RefusesATargetTheFromClauseBindsTwice(string tsql) =>
+        Assert.Contains("is ambiguous", Assert.Throws<TSqlException>(() => Translate(tsql)).Message);
 
     /// The OUTPUT clause sits between SET and WHERE, so a statement carrying one does not end at its
     /// assignments. `OUTPUT 1` is how EF Core counts the rows a statement touched.
@@ -502,15 +547,6 @@ public class TSqlTests
         "a condition that cannot match")]
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED BY SOURCE THEN DELETE",
         "NOT MATCHED BY SOURCE")]
-    // One side of a join deleted and the other filtering it is a different statement, and one whose
-    // rows a lake decides differently.
-    // An outer join that something else reads keeps the rows matching nothing, and those are rows
-    // the write would still touch -- which a condition cannot say once the join is gone. One nothing
-    // reads is dropped instead; see DropsOnlyTheJoinsThatDecideNothing.
-    [InlineData("UPDATE [s] SET [x] = [t].[x] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id",
-        "an outer join cannot pick")]
-    [InlineData("DELETE FROM [s] FROM [orders] AS [s] LEFT JOIN [staging] AS [t] ON t.id = s.id WHERE [t].[x] = 1",
-        "an outer join cannot pick")]
     // What OUTPUT cannot mean over an insert: there is no row it replaced, and nowhere else to put
     // the answer than the answer.
     [InlineData("MERGE t USING (VALUES (1)) AS i (id) ON 1=0 WHEN NOT MATCHED THEN " +
