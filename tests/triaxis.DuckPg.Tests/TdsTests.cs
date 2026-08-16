@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Data;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -1462,4 +1463,167 @@ public class TdsTests : IDisposable
     // DuckDB counts in BIGINT, so the value arrives as a long rather than SQL Server's int.
     static int Count(SqlConnection connection) =>
         Convert.ToInt32(new SqlCommand("SELECT COUNT(*) FROM orders", connection).ExecuteScalar());
+
+    // ---- bulk copy -------------------------------------------------------------------------------
+
+    static DataTable OrderRows(params object?[][] rows)
+    {
+        var table = new DataTable();
+        table.Columns.Add("order_id", typeof(int));
+        table.Columns.Add("amount", typeof(decimal));
+        table.Columns.Add("ordered_on", typeof(DateTime));
+        table.Columns.Add("note", typeof(string));
+        foreach (var row in rows) table.Rows.Add(row);
+        return table;
+    }
+
+    /// SqlBulkCopy probes the destination's shape, declares the load with INSERT BULK, and streams
+    /// the rows as the tokens a server would send. They land in the write layer like any INSERT,
+    /// which is what surviving a restart proves.
+    [Fact]
+    public void BulkCopiesRowsThroughTheWriteLayer()
+    {
+        using (var connection = Open())
+        {
+            using var bulk = new SqlBulkCopy(connection) { DestinationTableName = "orders" };
+            bulk.WriteToServer(OrderRows(
+                [7020, 42.00m, new DateTime(2026, 8, 10), "bulk one"],
+                [7021, 43.50m, new DateTime(2026, 8, 11), null]));
+        }
+
+        lake.Restart();
+        Assert.Equal(["7020|42.00|2026-08-10|bulk one", "7021|43.50|2026-08-11|"],
+            lake.Query("SELECT order_id, amount, ordered_on, note FROM lake.orders " +
+                       "WHERE order_id >= 7020 ORDER BY order_id"));
+    }
+
+    /// More rows than one internal insert carries, so the stream spans several statements under
+    /// one transaction and the write layer is persisted once.
+    [Fact]
+    public void BulkCopiesManyRowsAsOneCommit()
+    {
+        using (var connection = Open())
+        {
+            var table = OrderRows();
+            for (var i = 0; i < 1500; i++) table.Rows.Add(8000 + i, 1.00m, new DateTime(2026, 8, 1), $"row {i}");
+
+            using var bulk = new SqlBulkCopy(connection) { DestinationTableName = "orders" };
+            bulk.WriteToServer(table);
+        }
+
+        lake.Restart();
+        Assert.Equal(["1500"], lake.Query("SELECT COUNT(*) FROM lake.orders WHERE order_id >= 8000"));
+    }
+
+    /// A client batch size repeats the INSERT BULK / stream pair, so the arming has to survive
+    /// being consumed and set again on the same connection.
+    [Fact]
+    public void BulkCopyBatchesRearmTheDoor()
+    {
+        using (var connection = Open())
+        {
+            using var bulk = new SqlBulkCopy(connection) { DestinationTableName = "orders", BatchSize = 1 };
+            bulk.WriteToServer(OrderRows(
+                [7030, 1.00m, new DateTime(2026, 8, 1), "a"],
+                [7031, 2.00m, new DateTime(2026, 8, 2), "b"],
+                [7032, 3.00m, new DateTime(2026, 8, 3), "c"]));
+        }
+
+        lake.Restart();
+        Assert.Equal(["7030", "7031", "7032"],
+            lake.Query("SELECT order_id FROM lake.orders WHERE order_id >= 7030 ORDER BY order_id"));
+    }
+
+    /// The stream goes through the same insert path a statement takes, so a key the lake already
+    /// holds refuses the load -- and the transaction wrapped around it takes the rows that had
+    /// already streamed down with it.
+    [Fact]
+    public void BulkCopyRefusesABrokenKey()
+    {
+        using (var connection = Open())
+        {
+            using var bulk = new SqlBulkCopy(connection) { DestinationTableName = "orders" };
+            Assert.Throws<SqlException>(() => bulk.WriteToServer(OrderRows(
+                [7040, 1.00m, new DateTime(2026, 8, 1), "new"],
+                [1, 2.00m, new DateTime(2026, 8, 2), "already there"])));
+        }
+
+        lake.Restart();
+        Assert.Equal(["3"], lake.Query("SELECT COUNT(*) FROM lake.orders"));
+    }
+
+    /// A probe that fails -- a misspelled destination -- fails between SET FMTONLY ON and OFF, and
+    /// the window has to die with the batch: a flag that survived it would leave every later query
+    /// on the pooled connection answering shape-only, with no error anywhere.
+    [Fact]
+    public void AFailedBulkCopyLeavesTheConnectionAnswering()
+    {
+        using var connection = Open();
+
+        using (var bulk = new SqlBulkCopy(connection) { DestinationTableName = "misspelled" })
+            Assert.ThrowsAny<Exception>(() => bulk.WriteToServer(OrderRows([7060, 1.00m, new DateTime(2026, 8, 1), "x"])));
+
+        Assert.Equal(3, Count(connection));
+    }
+
+    /// FMTONLY executes nothing, as SQL Server executes nothing: the query inside the window
+    /// answers its shape and no rows, and the write is skipped rather than run.
+    [Fact]
+    public void FmtOnlyDescribesWithoutExecuting()
+    {
+        using var connection = Open();
+
+        using (var command = new SqlCommand(
+            "SET FMTONLY ON; DELETE FROM [orders]; SELECT * FROM [orders]; SET FMTONLY OFF", connection))
+        using (var reader = command.ExecuteReader())
+        {
+            Assert.Equal(4, reader.FieldCount);
+            Assert.False(reader.Read());
+        }
+
+        Assert.Equal(3, Count(connection));
+    }
+
+    /// The probe rewrite must fire on SqlClient's handshake and on nothing else: an application's
+    /// own batch may open with the same trancount check and still mention OBJECT_ID.
+    [Fact]
+    public void TheProbeRewritesOnlyTheHandshake()
+    {
+        const string probe =
+            "SELECT @@TRANCOUNT;\nDECLARE @Object_ID INT = OBJECT_ID('[orders]');\n" +
+            "SET FMTONLY ON;\nEXEC(N'SELECT * FROM [orders]');\nSET FMTONLY OFF;\n" +
+            "EXEC ..sp_tablecollations_100 N'.[orders]';";
+
+        Assert.Equal(
+            "SELECT @@TRANCOUNT; SET FMTONLY ON; SELECT * FROM [orders]; SET FMTONLY OFF; " +
+            "EXEC ..sp_tablecollations_100 N'[orders]'",
+            TdsSession.Probe(probe));
+
+        // The next SqlClient reads a fourth result set of graph-column aliases, by position.
+        Assert.EndsWith("Aliased_Column_Name WHERE FALSE",
+            TdsSession.Probe(probe + "\nSELECT [Canonical_Column_Name], [Aliased_Column_Name] FROM #Column_Aliases"));
+
+        var lookalike = "SELECT @@TRANCOUNT; SELECT OBJECT_ID('orders')";
+        Assert.Same(lookalike, TdsSession.Probe(lookalike));
+    }
+
+    /// A bulk copy handed the client's transaction defers to it: the rows are the transaction's
+    /// until it commits, and go with it when it rolls back.
+    [Fact]
+    public void BulkCopyJoinsTheClientsTransaction()
+    {
+        using var connection = Open();
+
+        using (var transaction = connection.BeginTransaction())
+        {
+            using var bulk = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction)
+            {
+                DestinationTableName = "orders",
+            };
+            bulk.WriteToServer(OrderRows([7050, 1.00m, new DateTime(2026, 8, 1), "in flight"]));
+            transaction.Rollback();
+        }
+
+        Assert.Equal(3, Count(connection));
+    }
 }

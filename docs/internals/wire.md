@@ -134,3 +134,68 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   `CASE WHEN EXISTS (...)` passes 255 without trying. `TdsSession.Named` cuts at 128, which is where
   SQL Server cuts (`sysname`); `TdsMsg.BVarchar` cuts at 255 as well, since a length prefix that
   cannot say what it carries is a desynchronized stream whatever the field was.
+
+## Bulk load
+
+`SqlBulkCopy` is three exchanges, and each one demanded something of its own.
+
+- **The metadata probe is procedural since SqlClient 7**: DECLAREs, an `IF` over
+  `SERVERPROPERTY`, a walk of `sys.all_columns` through `sp_executesql` to leave graph columns out
+  of the column list, and an `EXEC` of the SELECT it built. None of that is a statement the parser
+  should learn -- it is one client's private handshake, not T-SQL an application writes -- so
+  `TdsSession.Probe` recognizes it by fingerprint and answers the plain question inside it: the
+  transaction count, the destination's shape, its collations. The destination is spliced out of
+  the `DECLARE @Object_ID INT = OBJECT_ID('…')` declaration, the one place the probe names it
+  whole -- and that declaration, with `sp_tablecollations` beside it, is the fingerprint: an
+  application's own batch may open with the same trancount check and still mention `OBJECT_ID`,
+  and a match on less than the probe's own body would swallow it. The answer must also carry as
+  many result sets as the client's probe expects back -- the client indexes them by position --
+  which is why a probe carrying `#Column_Aliases` (the next SqlClient's fourth rowset, its graph
+  aliases) is answered with an empty fourth rowset: a lake has no graph columns, so no aliases is
+  the true answer. This is the TDS side's one text-level rewrite, and it lives beside the
+  statement path for the same reason the PostgreSQL side's catalog shims do: the alternative is a
+  procedural batch interpreter.
+- **FMTONLY is scoped to the batch and executes nothing.** ON and OFF always travel together in
+  the one probe batch a client sends, and a session flag would outlive a batch that failed between
+  them -- leaving every later query on the pooled connection silently answering shape-only. Inside
+  the window a query answers with its shape and a write is skipped rather than run: SQL Server
+  executes no statement under FMTONLY, and a metadata probe must not mutate the lake.
+- **FMTONLY's shape comes from `DESCRIBE`, not from an empty result.** DuckDB.NET reports a
+  decimal's precision and scale off the data chunks, so a result with no rows says `DECIMAL(0,0)`
+  -- and SqlDecimal refuses precision zero on the client before a single row is sent.
+  `TdsSession.Shape` has DuckDB bind the statement and say each column's type in full, which also
+  costs no materialization. `TdsTypes.Describe` therefore reads `DESCRIBE`'s SQL spellings beside
+  the reader's own names. What `DESCRIBE` cannot say is which column is an identity, so the shape
+  never sets the identity flag -- which means SqlBulkCopy behaves as though `KeepIdentity` were
+  always on: source values land verbatim, the divergence twin of KEEP_NULLS below.
+- **The collations rowset is read by column ordinal, and an empty one is refused** -- the client
+  indexes row *i* for destination column *i* and only looks at `collation_name`. So
+  `sp_tablecollations_100` is answered from `information_schema.columns`, one row per column in
+  SELECT * order, every collation null: everything this door puts on the wire is Unicode under the
+  one collation the login advertised, and a null is what tells the client to send no COLLATE back.
+- **`INSERT BULK` is parsed and remembered, not run** (`InsertBulkStatement`): it declares where
+  the next bulk load message lands, and only the column names and their order are kept -- the
+  stream re-declares the types in its own COLMETADATA. A `BatchSize` on the client repeats the
+  whole pair, so the arming is consumed by each stream and set again by the next statement -- and
+  it is good for exactly the message after it: any batch or call in between cancels it, the way
+  SQL Server refuses a stray stream after intervening traffic.
+- **The stream is the server's own token vocabulary written backwards** -- COLMETADATA, ROWs, DONE
+  -- which is why `TdsTypes.ReadTypeInfo`/`ReadValue` are the RPC parameter reader split in two:
+  the types arrive once and the values per row. One asymmetry earned its own reader
+  (`ReadBulkValue`): a bulk decimal is always a sign and sixteen bytes of magnitude, while the
+  length prefix repeats the declared length -- SqlClient writes 9 and sends 17, and SQL Server
+  reads it that way too.
+- **The rows go through the insert plan, not around it.** Each slice of the stream becomes a
+  multi-row parameterized `INSERT` through the same translator and gateway a statement takes, so
+  declared keys, references, defaults and identities hold for a bulk load exactly as for an INSERT
+  -- an appender into the write layer would have bypassed every one of them. One statement serves
+  every full slice: the SQL depends only on the row count, so the translation and the plan are
+  paid once and only the values are bound per slice -- not the plan cache the performance note
+  bans, which is a held DuckDB plan baking in statistics; the SQL text carries none. The whole
+  stream runs in one transaction unless the client brought its own, so the write layer is
+  persisted once per stream rather than once per slice, and a mid-stream failure takes the rows
+  already landed with it -- and a rollback that itself cannot be delivered resets the session's
+  transaction bookkeeping rather than leaving writes deferred to a COMMIT nobody will send. Two
+  limits follow from the shape: `KEEP_NULLS` semantics are what always happens (a null in the
+  stream is a null in the row, never a default), and the message is buffered whole before it is
+  read -- a load big enough to mind that sets `BatchSize`, which bounds the message too.

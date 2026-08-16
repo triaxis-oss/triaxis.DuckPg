@@ -67,7 +67,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             var message = wire.ReadMessage();
             if (message is null) return;
-            var (type, payload, reset) = message.Value;
+            var (type, payload, length, reset) = message.Value;
 
             // A connection out of the pool is a session that never happened here: what the last one
             // prepared, made or left open goes before its first statement is read.
@@ -75,7 +75,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
             try
             {
-                Dispatch(type, payload);
+                Dispatch(type, payload, length);
             }
             catch (Exception e) when (e is not (IOException or SocketException))
             {
@@ -87,15 +87,16 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
     }
 
-    void Dispatch(byte type, byte[] payload)
+    void Dispatch(byte type, byte[] payload, int length)
     {
         switch (type)
         {
-            case TdsMessage.PreLogin: PreLogin(payload); return;
-            case TdsMessage.Login7: Login(payload); return;
-            case TdsMessage.Batch: Batch(payload); return;
-            case TdsMessage.Rpc: Rpc(payload); return;
-            case TdsMessage.TransactionManager: TransactionManager(payload); return;
+            case TdsMessage.PreLogin: PreLogin(payload, length); return;
+            case TdsMessage.Login7: Login(payload, length); return;
+            case TdsMessage.Batch: Batch(payload, length); return;
+            case TdsMessage.Rpc: Rpc(payload, length); return;
+            case TdsMessage.BulkLoad: BulkLoad(payload, length); return;
+            case TdsMessage.TransactionManager: TransactionManager(payload, length); return;
 
             case TdsMessage.Attention:
             {
@@ -121,10 +122,10 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// Encryption is refused outright, which is what `Encrypt=False` in the connection string
     /// agrees to. TDS otherwise encrypts the login packet even when the session is plaintext, and
     /// that handshake needs a certificate this tool has no business owning.
-    void PreLogin(byte[] payload)
+    void PreLogin(byte[] payload, int length)
     {
         var requested = new List<byte>();
-        var reader = new TdsReader(payload);
+        var reader = new TdsReader(payload, length);
         while (!reader.AtEnd)
         {
             var token = reader.U8();
@@ -154,9 +155,9 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         wire.Send(TdsMessage.PreLogin, msg);
     }
 
-    void Login(byte[] payload)
+    void Login(byte[] payload, int length)
     {
-        var reader = new TdsReader(payload);
+        var reader = new TdsReader(payload, length);
         reader.Skip(4);
         tdsVersion = reader.I32();
         // What a client sends here is a request, and TDS lets the server answer with a size of its
@@ -168,14 +169,14 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         // The fixed part is 36 bytes; after it come offset/length pairs into the same buffer.
         string Field(int index)
         {
-            var pair = new TdsReader(payload);
+            var pair = new TdsReader(payload, length);
             pair.Seek(36 + index * 4);
             var offset = pair.U16();
-            var length = pair.U16();
-            if (length == 0) return "";
-            var value = new TdsReader(payload);
+            var count = pair.U16();
+            if (count == 0) return "";
+            var value = new TdsReader(payload, length);
             value.Seek(offset);
-            return value.Ucs2(length);
+            return value.Ucs2(count);
         }
 
         login["host"] = Field(0);
@@ -237,16 +238,20 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     // ---- statements ------------------------------------------------------------------------------
 
-    void Batch(byte[] payload)
+    void Batch(byte[] payload, int length)
     {
-        var reader = new TdsReader(payload);
+        // An arming is good for exactly the message after it: a request in between is a client
+        // that moved on, and the stray stream it might still send has to be refused.
+        bulk = null;
+
+        var reader = new TdsReader(payload, length);
         SkipHeaders(ref reader);
-        var sql = reader.Ucs2((payload.Length - reader.Position) / 2);
+        var sql = reader.Ucs2((length - reader.Position) / 2);
 
         var msg = new TdsMsg();
         try
         {
-            Run(msg, sql, NoParameters, TdsToken.Done);
+            Run(msg, Probe(sql), NoParameters, TdsToken.Done);
         }
         catch (Exception e) when (e is not (IOException or SocketException))
         {
@@ -292,9 +297,35 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             return;
         }
 
+        // The FMTONLY window lives and dies with the batch on purpose: SET FMTONLY ON and OFF
+        // always travel together in the one probe batch a client sends, and a flag outliving a
+        // batch that failed between them would leave every later query on the connection
+        // answering shape-only, with no error anywhere.
+        var fmtonly = false;
+
         for (var i = 0; i < statements.Count; i++)
         {
             var last = i == statements.Count - 1;
+            var done = last ? doneToken : TdsToken.DoneInProc;
+            var status = last ? Status.Final : Status.More;
+
+            switch (statements[i])
+            {
+                // The window SqlBulkCopy probes a destination's shape through: a query inside it
+                // answers with its metadata and none of its rows.
+                case SetOptionStatement { Option: var option }
+                    when option.StartsWith("fmtonly", StringComparison.OrdinalIgnoreCase):
+                    fmtonly = option.EndsWith("on", StringComparison.OrdinalIgnoreCase);
+                    Done(msg, done, status, 0);
+                    continue;
+
+                // Not run but remembered: the statement declares where the bulk load stream in the
+                // next message lands, and the stream is what writes.
+                case InsertBulkStatement armed:
+                    bulk = armed;
+                    Done(msg, done, status, 0);
+                    continue;
+            }
 
             // Rendered one at a time rather than the batch at once: `@@ROWCOUNT`, `@@TRANCOUNT` and
             // `SCOPE_IDENTITY()` go into the statement as literals, so a statement has to be
@@ -302,7 +333,22 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             // SCOPE_IDENTITY()` is asking for.
             var translated = TSqlTranslator.Translate(statements[i], Context(parameters));
             var plan = gateway.Translate(translated.Sql);
-            Execute(msg, plan, parameters, last ? doneToken : TdsToken.DoneInProc, last, translated);
+
+            // FMTONLY executes nothing, exactly as SQL Server executes nothing: a query answers
+            // with its shape and a write is skipped rather than run or described. The shape has to
+            // come from DuckDB's own description of the statement rather than an empty result: a
+            // decimal's precision only travels in the data chunks, and a result with no rows
+            // carries none.
+            if (fmtonly)
+            {
+                if (plan.Kind == PlanKind.Rows && plan.Dirty is null)
+                    Shape(msg, plan.Steps[^1], parameters, done, status);
+                else
+                    Done(msg, done, status, 0);
+                continue;
+            }
+
+            Execute(msg, plan, parameters, done, last, translated);
         }
     }
 
@@ -647,9 +693,12 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         public const ushort ExecuteSql = 10, Prepare = 11, Execute = 12, PrepExec = 13, Unprepare = 15;
     }
 
-    void Rpc(byte[] payload)
+    void Rpc(byte[] payload, int length)
     {
-        var reader = new TdsReader(payload);
+        // The same rule as a batch: a call in between cancels what INSERT BULK armed.
+        bulk = null;
+
+        var reader = new TdsReader(payload, length);
         SkipHeaders(ref reader);
         var msg = new TdsMsg();
 
@@ -784,6 +833,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     {
         prepared.Clear();
         transactions = 0;
+        bulk = null;
 
         // What an abandoned transaction meant to do is not the next session's to finish, so all
         // three go together -- a promotion left here would be made by whatever that session commits.
@@ -868,11 +918,227 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         TdsTypes.WriteValue(msg, column, value, wire.Payload);
     }
 
+    // ---- bulk load -------------------------------------------------------------------------------
+
+    /// SqlBulkCopy's first question, asked since SqlClient 7 as a procedural batch: DECLAREs, a
+    /// walk of sys.all_columns building a column list that leaves graph columns out, and an EXEC
+    /// of the SELECT it built. None of that is a statement a lake takes, and nothing in a lake is
+    /// hidden from a SELECT * -- so the probe is answered as the plain question inside it: the
+    /// transaction count, the destination's shape, and its collations. The destination is spliced
+    /// out of the OBJECT_ID declaration, the one place the probe names it whole -- and only that
+    /// declaration, with the collations call beside it, is fingerprint enough: an application's
+    /// own batch may open with the same trancount check and still mention OBJECT_ID.
+    ///
+    /// The answer has to carry as many result sets as the probe the client sent expects back: a
+    /// newer client reads a fourth, the #Column_Aliases it keeps for graph tables, and refuses
+    /// its absence. A lake has no graph columns, so no aliases is the true answer.
+    internal static string Probe(string sql)
+    {
+        const string Declared = "DECLARE @Object_ID INT = OBJECT_ID('";
+
+        if (!sql.StartsWith("SELECT @@TRANCOUNT;", StringComparison.OrdinalIgnoreCase)
+            || !sql.Contains("sp_tablecollations", StringComparison.OrdinalIgnoreCase))
+            return sql;
+
+        var open = sql.IndexOf(Declared, StringComparison.OrdinalIgnoreCase);
+        if (open < 0) return sql;
+
+        // The literal ends at the first quote not doubled into the name.
+        var at = open + Declared.Length;
+        var end = at;
+        while (true)
+        {
+            end = sql.IndexOf('\'', end);
+            if (end < 0) return sql;
+            if (end + 1 < sql.Length && sql[end + 1] == '\'') { end += 2; continue; }
+            break;
+        }
+        var name = sql[at..end].Replace("''", "'");
+
+        var aliases = sql.Contains("#Column_Aliases", StringComparison.OrdinalIgnoreCase)
+            ? "; SELECT NULL::VARCHAR AS Canonical_Column_Name, NULL::VARCHAR AS Aliased_Column_Name WHERE FALSE"
+            : "";
+
+        return $"SELECT @@TRANCOUNT; SET FMTONLY ON; SELECT * FROM {name}; SET FMTONLY OFF; " +
+               $"EXEC ..sp_tablecollations_100 N{SqlText.Literal(name)}{aliases}";
+    }
+
+    /// The column metadata a query would answer with, and no rows: `DESCRIBE` makes DuckDB bind
+    /// the statement and say each column's type in full, which is what SqlBulkCopy shapes the
+    /// values it sends by.
+    void Shape(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken, int status)
+    {
+        var described = new List<(string Name, string Type)>();
+        using (var command = Command($"DESCRIBE {sql}", parameters))
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) described.Add((reader.GetString(0), reader.GetString(1)));
+
+        msg.U8(TdsToken.ColMetadata).U16(described.Count);
+        foreach (var (name, type) in described)
+        {
+            msg.I32(0).U16(0x0001); // no user type; nullable
+            TdsTypes.WriteTypeInfo(msg, TdsTypes.Describe(type));
+            msg.BVarchar(Named(name));
+        }
+
+        Done(msg, doneToken, status, 0);
+    }
+
+    /// What the last `INSERT BULK` declared, which is what arms the door for a bulk load message:
+    /// the stream that follows carries values and their wire types, but not where they go.
+    InsertBulkStatement? bulk;
+
+    void BulkLoad(byte[] payload, int length)
+    {
+        var armed = bulk ?? throw new ProtocolException("a bulk load needs an INSERT BULK statement first");
+        bulk = null;
+
+        var msg = new TdsMsg();
+        try
+        {
+            var total = Load(armed, payload, length);
+            Done(msg, TdsToken.Done, Status.Final | Status.Count, total);
+        }
+        catch (Exception e) when (e is not (IOException or SocketException))
+        {
+            Failed(msg, e);
+            return;
+        }
+        wire.Send(TdsMessage.Result, msg);
+    }
+
+    /// The stream is the tokens a server sends -- column metadata, then rows -- written by the
+    /// client. Each slice of it goes through the same insert path a statement takes, so the keys,
+    /// references and defaults the layers enforce hold for a bulk load exactly as they do for an
+    /// INSERT -- and one statement serves every full slice: the SQL depends only on the row count,
+    /// so the translation and the plan are paid once rather than per slice, and only the values
+    /// are bound fresh. The stream's shorter tail is the one slice translated again.
+    long Load(InsertBulkStatement armed, byte[] payload, int length)
+    {
+        var reader = new TdsReader(payload, length);
+        if (reader.U8() != TdsToken.ColMetadata)
+            throw new ProtocolException("a bulk load stream has to start with column metadata");
+
+        var count = reader.U16();
+        if (count != armed.Columns.Count)
+            throw new ProtocolException(
+                $"the bulk load carries {count} columns where INSERT BULK declared {armed.Columns.Count}");
+
+        var columns = new TdsColumn[count];
+        for (var i = 0; i < count; i++)
+        {
+            reader.Skip(6); // user type and flags
+            columns[i] = TdsTypes.ReadTypeInfo(ref reader);
+            // A legacy LOB in column metadata drags a table name behind it that nothing modern
+            // sends -- and nothing modern sends the type either, since the destination's own
+            // metadata never declares one.
+            if (columns[i].Token is TdsTypes.Text or TdsTypes.NText or TdsTypes.Image)
+                throw new ProtocolException("legacy LOB types are not supported in a bulk load");
+            reader.BVarchar(); // the column's name, already declared by INSERT BULK
+        }
+
+        // One transaction over the whole stream unless the client brought its own: persisting a
+        // write is the write layer written back, and committing per slice would pay that per slice.
+        var scratch = new TdsMsg();
+        var wrap = transactions == 0;
+        if (wrap) Run(scratch, "BEGIN TRANSACTION", NoParameters, TdsToken.Done);
+
+        var size = Math.Max(1, 2048 / count);
+        var names = new List<string>();
+        string Name(int i)
+        {
+            while (names.Count <= i) names.Add("b" + names.Count);
+            return names[i];
+        }
+
+        Dictionary<string, Parameter>? full = null;
+        Translated? translated = null;
+        Plan? plan = null;
+
+        long Insert(List<object?[]> rows)
+        {
+            var reuse = rows.Count == size && plan is not null;
+            var parameters = reuse ? full! : new Dictionary<string, Parameter>(StringComparer.OrdinalIgnoreCase);
+
+            var at = 0;
+            foreach (var row in rows)
+                foreach (var value in row)
+                    parameters[Name(at++)] = new Parameter(value, new TdsColumn(TdsTypes.NVarChar, TdsTypes.Max), false);
+
+            if (!reuse)
+            {
+                var values = new List<List<Expr>>(rows.Count);
+                at = 0;
+                foreach (var row in rows)
+                {
+                    var exprs = new List<Expr>(row.Length);
+                    foreach (var _ in row) exprs.Add(new VariableRef(Name(at++), false));
+                    values.Add(exprs);
+                }
+
+                var statement = new InsertStatement(armed.Target, armed.Columns, new InsertValues(values), []);
+                translated = TSqlTranslator.Translate(statement, Context(parameters));
+                plan = gateway.Translate(translated.Sql);
+                if (rows.Count == size) full = parameters;
+            }
+
+            Execute(scratch, plan!, parameters, TdsToken.DoneInProc, last: false, translated);
+            // A response nobody reads still costs what is written into it.
+            scratch.Clear();
+            return rowCount;
+        }
+
+        try
+        {
+            var total = 0L;
+            var batch = new List<object?[]>();
+
+            while (true)
+            {
+                var token = reader.U8();
+                if (token == TdsToken.Done) break;
+                if (token != TdsToken.Row)
+                    throw new ProtocolException($"unexpected token 0x{token:X2} in a bulk load");
+
+                var row = new object?[count];
+                for (var i = 0; i < count; i++) row[i] = TdsTypes.ReadBulkValue(ref reader, columns[i]);
+                batch.Add(row);
+
+                if (batch.Count >= size)
+                {
+                    total += Insert(batch);
+                    batch.Clear();
+                }
+            }
+
+            if (batch.Count > 0) total += Insert(batch);
+            if (wrap) Run(scratch, "COMMIT", NoParameters, TdsToken.Done);
+            return total;
+        }
+        catch
+        {
+            if (wrap)
+                try { Run(scratch, "ROLLBACK", NoParameters, TdsToken.Done); }
+                catch
+                {
+                    // A rollback that could not be delivered must not leave the session believing
+                    // a transaction is open: later writes would defer to a COMMIT nobody sends,
+                    // and the write turn would be held for a client that never asked for it.
+                    transactions = 0;
+                    pendingWrites.Clear();
+                    pendingPromotions.Clear();
+                    pendingTombstones.Clear();
+                    Release();
+                }
+            throw;
+        }
+    }
+
     // ---- transactions ----------------------------------------------------------------------------
 
-    void TransactionManager(byte[] payload)
+    void TransactionManager(byte[] payload, int length)
     {
-        var reader = new TdsReader(payload);
+        var reader = new TdsReader(payload, length);
         SkipHeaders(ref reader);
         var request = reader.U16();
 

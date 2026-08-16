@@ -166,6 +166,7 @@ sealed class TSqlParser
     Statement Insert()
     {
         Expect("insert");
+        if (Accept("bulk")) return InsertBulk();
         Accept("into");
         var target = TableName();
 
@@ -196,6 +197,43 @@ sealed class TSqlParser
         }
 
         return new InsertStatement(target, columns, new InsertQuery(Query()), output);
+    }
+
+    /// Each column carries its type, an optional collation and an optional nullability, and the
+    /// statement may close with a `WITH (…)` of load hints -- all of it read past rather than kept,
+    /// since the bulk stream declares the types again and the hints ask for what a lake already
+    /// does or refuses elsewhere.
+    Statement InsertBulk()
+    {
+        var target = TableName();
+        var columns = new List<Name>();
+
+        ExpectOperator("(");
+        do
+        {
+            columns.Add(Identifier());
+            Identifier(); // the column's type
+            if (Peek.Is(TokenKind.Operator, "(")) SkipParenthesised();
+            if (Accept("collate")) Identifier();
+            if (Accept("not")) Expect("null"); else Accept("null");
+        } while (AcceptOperator(","));
+        ExpectOperator(")");
+
+        if (Accept("with")) SkipParenthesised();
+        return new InsertBulkStatement(target, columns);
+    }
+
+    void SkipParenthesised()
+    {
+        ExpectOperator("(");
+        var depth = 1;
+        while (depth > 0)
+        {
+            if (Peek.Kind == TokenKind.End) throw Unexpected("unterminated parenthesis");
+            if (Peek.Is(TokenKind.Operator, "(")) depth++;
+            else if (Peek.Is(TokenKind.Operator, ")")) depth--;
+            pos++;
+        }
     }
 
     /// `UPDATE [o] SET … FROM [t] AS [o] WHERE …` names its target the same way a DELETE can, and
@@ -546,6 +584,15 @@ sealed class TSqlParser
         _ => [],
     };
 
+    /// What may open the statement after a `SET` option in a batch written without semicolons --
+    /// SqlBulkCopy sends `SET FMTONLY ON select * from …` as one string. The option's own name is
+    /// never one of these, so only the words after it stop here.
+    static readonly HashSet<string> StatementStarters = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "select", "insert", "update", "delete", "merge", "set", "exec", "execute",
+        "begin", "commit", "rollback", "save", "drop", "with", "values", "explain",
+    };
+
     /// `SET` here is only the session-option form; `SET @x = …` needs variables, which a lake has
     /// no place to keep.
     Statement SetOption()
@@ -557,7 +604,10 @@ sealed class TSqlParser
         var words = new List<string>();
         while (Peek.Kind is TokenKind.Word or TokenKind.Number or TokenKind.String
                && !Peek.Is(TokenKind.Operator, ";"))
+        {
+            if (words.Count > 0 && Peek.Kind == TokenKind.Word && StatementStarters.Contains(Peek.Text)) break;
             words.Add(Take().Text);
+        }
 
         if (words.Count == 0) throw Unexpected("expected an option name");
         return new SetOptionStatement(string.Join(' ', words));
@@ -575,6 +625,9 @@ sealed class TSqlParser
         if (Peek.Is(TokenKind.Operator, "("))
             throw new TSqlException("EXEC of a string is not supported", Peek.Position);
 
+        // `exec ..sp_tablecollations_100` is how SqlBulkCopy spells "in this database": the empty
+        // parts name nothing.
+        while (AcceptOperator(".")) { }
         var procedure = TableName();
         var arguments = new List<ExecuteArgument>();
 
@@ -930,14 +983,7 @@ sealed class TSqlParser
     {
         if (!Peek.Is("with") || !Ahead(1).Is(TokenKind.Operator, "(")) return;
         pos++;
-        var depth = 0;
-        do
-        {
-            if (Peek.Is(TokenKind.Operator, "(")) depth++;
-            else if (Peek.Is(TokenKind.Operator, ")")) depth--;
-            else if (Peek.Kind == TokenKind.End) throw Unexpected("unterminated table hint");
-            pos++;
-        } while (depth > 0);
+        SkipParenthesised();
     }
 
     TableName TableName()

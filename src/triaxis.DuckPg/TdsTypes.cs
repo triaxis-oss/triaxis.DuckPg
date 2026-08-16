@@ -16,7 +16,9 @@ static class TdsTypes
                       DateTimeOffset = 0x2B, DecimalN = 0x6A, NumericN = 0x6C, FloatN = 0x6D,
                       MoneyN = 0x6E, DateTimeN = 0x6F, BitN = 0x68, VarBinary = 0xA5, VarChar = 0xA7,
                       Char = 0xAF, Binary = 0xAD, NVarChar = 0xE7, NChar = 0xEF,
-                      Text = 0x23, NText = 0x63, Image = 0x22;
+                      Text = 0x23, NText = 0x63, Image = 0x22,
+                      // and what an untyped null parameter arrives as:
+                      NullType = 0x1F;
 
     /// A variable-length type declared with this length is a MAX type, whose values are sent in
     /// chunks rather than with one leading length.
@@ -29,8 +31,9 @@ static class TdsTypes
     /// one makes SqlClient treat the column as having no encoding at all.
     public static readonly byte[] Collation = [0x09, 0x04, 0x00, 0x00, 0x00];
 
-    /// The names are the reader's own -- `UnsignedBigInt`, `TimestampMs` -- not the SQL spellings,
-    /// and a name that matches nothing here goes out as text.
+    /// The names are the reader's own -- `UnsignedBigInt`, `TimestampMs` -- or `DESCRIBE`'s SQL
+    /// spellings of the same types, which is what the FMTONLY path asks with. A name that matches
+    /// nothing here goes out as text.
     public static TdsColumn Describe(string duckType)
     {
         var bare = duckType.ToLowerInvariant();
@@ -40,20 +43,21 @@ static class TdsTypes
         return bare switch
         {
             "boolean" => new TdsColumn(BitN, 1),
-            "tinyint" or "unsignedtinyint" or "smallint" => new TdsColumn(IntN, 2),
-            "integer" or "unsignedsmallint" => new TdsColumn(IntN, 4),
-            "bigint" or "unsignedinteger" => new TdsColumn(IntN, 8),
+            "tinyint" or "unsignedtinyint" or "utinyint" or "smallint" => new TdsColumn(IntN, 2),
+            "integer" or "unsignedsmallint" or "usmallint" => new TdsColumn(IntN, 4),
+            "bigint" or "unsignedinteger" or "uinteger" => new TdsColumn(IntN, 8),
             "float" => new TdsColumn(FloatN, 4),
             "double" => new TdsColumn(FloatN, 8),
             "decimal" => Decimal(duckType),
             // What summing anything integral gives, and what no SQL Server type is wide enough for.
             // A DECIMAL(38,0) carries sixteen bytes of magnitude, which is a HUGEINT exactly; a
             // client whose own decimal is narrower is the one that has to say so.
-            "hugeint" or "unsignedhugeint" or "unsignedbigint" => Decimal(38, 0),
+            "hugeint" or "unsignedhugeint" or "uhugeint" or "unsignedbigint" or "ubigint" => Decimal(38, 0),
             "date" => new TdsColumn(Date),
-            "time" or "timetz" => new TdsColumn(Time, Scale: FractionScale),
-            "timestamp" or "timestamps" or "timestampms" or "timestampns" => new TdsColumn(DateTime2, Scale: FractionScale),
-            "timestamptz" => new TdsColumn(DateTimeOffset, Scale: FractionScale),
+            "time" or "timetz" or "time with time zone" => new TdsColumn(Time, Scale: FractionScale),
+            "timestamp" or "timestamps" or "timestampms" or "timestampns"
+                or "timestamp_s" or "timestamp_ms" or "timestamp_ns" => new TdsColumn(DateTime2, Scale: FractionScale),
+            "timestamptz" or "timestamp with time zone" => new TdsColumn(DateTimeOffset, Scale: FractionScale),
             "uuid" => new TdsColumn(Guid, 16),
             "blob" or "bit" => new TdsColumn(VarBinary, Max),
             _ => new TdsColumn(NVarChar, Max),
@@ -332,99 +336,156 @@ static class TdsTypes
     // ---- parameters ------------------------------------------------------------------------------
 
     /// One RPC parameter: its declared type, read straight off the wire, and then its value.
-    ///
-    /// The type comes back as the column an answer to it would go out in, which is not always the
-    /// one it arrived as: a parameter marked OUTPUT is answered in what the caller declared, and
-    /// what this writes is a narrower set than what a client may send. Text and binary go back as a
-    /// MAX of their own kind, since that is the only length `WriteValue` chunks correctly, and the
-    /// three shapes newer types replaced -- MONEY, the pre-2008 DATETIME, and the legacy LOBs -- go
-    /// back as what replaced them.
     public static (TdsColumn Column, object? Value) ReadParameter(ref TdsReader reader)
+    {
+        var declared = ReadTypeInfo(ref reader);
+        return (Answered(declared), ReadValue(ref reader, declared));
+    }
+
+    /// TYPE_INFO as the client declared it, which is what its values are read by. The same shape
+    /// appears in front of an RPC parameter and in a bulk load's column metadata, so both read it
+    /// here.
+    public static TdsColumn ReadTypeInfo(ref TdsReader reader)
     {
         var token = reader.U8();
         switch (token)
         {
             case IntN or BitN or FloatN or MoneyN or DateTimeN or Guid:
-            {
-                var declared = reader.U8();
-                var length = reader.U8();
-                var column = token switch
-                {
-                    MoneyN => Decimal(19, 4),
-                    DateTimeN => new TdsColumn(DateTime2, Scale: FractionScale),
-                    BitN => new TdsColumn(BitN, 1),
-                    _ => new TdsColumn(token, declared),
-                };
-                return (column, length == 0 ? null : Scalar(token, declared, reader.Bytes(length)));
-            }
+                return new TdsColumn(token, reader.U8());
 
             case DecimalN or NumericN:
             {
-                reader.U8();
+                reader.U8(); // the maximum length, which the precision already decides
                 var precision = reader.U8();
-                var scale = reader.U8();
-                var length = reader.U8();
-                return (Decimal(precision, scale),
-                        length == 0 ? null : ReadDecimal(reader.Bytes(length), scale));
+                return new TdsColumn(token, DecimalLength(precision), precision, reader.U8());
             }
 
             case Date:
-            {
-                var length = reader.U8();
-                return (new TdsColumn(Date), length == 0 ? null : FromDays(reader.Bytes(3)));
-            }
+                return new TdsColumn(Date);
 
             case Time or DateTime2 or DateTimeOffset:
-            {
-                var scale = reader.U8();
-                var length = reader.U8();
-                return (new TdsColumn(token, Scale: FractionScale),
-                        length == 0 ? null : ReadTemporal(token, scale, reader.Bytes(length)));
-            }
+                return new TdsColumn(token, Scale: reader.U8());
 
             case NVarChar or NChar or Char or VarChar:
             {
                 var declared = reader.U16();
                 reader.Skip(5); // collation
-                var bytes = ReadVariable(ref reader, declared);
-                return (new TdsColumn(NVarChar, Max), bytes is null ? null
-                    : token is NVarChar or NChar ? Encoding.Unicode.GetString(bytes) : Encoding.UTF8.GetString(bytes));
+                return new TdsColumn(token, declared);
             }
 
             case VarBinary or Binary:
-            {
-                var declared = reader.U16();
-                return (new TdsColumn(VarBinary, Max), ReadVariable(ref reader, declared));
-            }
+                return new TdsColumn(token, reader.U16());
 
             // The legacy LOB types, which an old client still sends: their declared maximum is four
-            // bytes rather than two, and the value's own length is four bytes with -1 for null.
+            // bytes rather than two.
             case Text or NText or Image:
             {
-                reader.I32();
+                var declared = reader.I32();
                 if (token is Text or NText) reader.Skip(5); // collation
-                var length = reader.I32();
-                var column = new TdsColumn(token == Image ? VarBinary : NVarChar, Max);
-                if (length < 0) return (column, null);
-
-                var bytes = reader.Bytes(length);
-                return (column, token switch
-                {
-                    NText => Encoding.Unicode.GetString(bytes),
-                    Text => Encoding.UTF8.GetString(bytes),
-                    _ => bytes,
-                });
+                return new TdsColumn(token, declared);
             }
 
-            case 0x1F: // NULLTYPE, which is what an untyped null parameter arrives as
-                return (new TdsColumn(NVarChar, Max), null);
+            case NullType:
+                return new TdsColumn(NullType);
 
             default:
                 throw new ProtocolException($"unsupported parameter type 0x{token:X2}");
         }
     }
 
-    static object Scalar(byte token, byte declared, byte[] value) => token switch
+    /// One value in the type its TYPE_INFO declared -- the encoding is the same whether it stands
+    /// behind an RPC parameter or in a bulk load's row.
+    public static object? ReadValue(ref TdsReader reader, TdsColumn declared)
+    {
+        switch (declared.Token)
+        {
+            case IntN or BitN or FloatN or MoneyN or DateTimeN or Guid:
+            {
+                var length = reader.U8();
+                return length == 0 ? null : Scalar(declared.Token, declared.Length, reader.Bytes(length));
+            }
+
+            case DecimalN or NumericN:
+            {
+                var length = reader.U8();
+                return length == 0 ? null : ReadDecimal(reader.Bytes(length), declared.Scale);
+            }
+
+            case Date:
+                return reader.U8() == 0 ? null : FromDays(reader.Bytes(3));
+
+            case Time or DateTime2 or DateTimeOffset:
+            {
+                var length = reader.U8();
+                return length == 0 ? null : ReadTemporal(declared.Token, declared.Scale, reader.Bytes(length));
+            }
+
+            case NVarChar or NChar or Char or VarChar:
+            {
+                var bytes = ReadVariable(ref reader, (ushort)declared.Length);
+                return bytes is null ? null
+                    : declared.Token is NVarChar or NChar ? Encoding.Unicode.GetString(bytes)
+                                                          : Encoding.UTF8.GetString(bytes);
+            }
+
+            case VarBinary or Binary:
+                return ReadVariable(ref reader, (ushort)declared.Length);
+
+            // A legacy LOB's value is four bytes of length with -1 for null, and never chunked.
+            case Text or NText or Image:
+            {
+                var length = reader.I32();
+                if (length < 0) return null;
+
+                var bytes = reader.Bytes(length);
+                return declared.Token switch
+                {
+                    NText => Encoding.Unicode.GetString(bytes),
+                    Text => Encoding.UTF8.GetString(bytes),
+                    _ => bytes,
+                };
+            }
+
+            case NullType: // which carries no value at all
+                return null;
+
+            // ReadTypeInfo refuses what it does not know, but a TdsColumn can also be built by
+            // hand -- and a token read past silently here would desynchronize the stream with no
+            // error anywhere near the fault.
+            default:
+                throw new ProtocolException($"unsupported value type 0x{declared.Token:X2}");
+        }
+    }
+
+    /// One value of a bulk load's row, which differs from a parameter's in exactly one place: a
+    /// decimal is always the sign and sixteen bytes of magnitude. SqlClient repeats the declared
+    /// length in the prefix and writes seventeen bytes regardless, and SQL Server reads it so.
+    public static object? ReadBulkValue(ref TdsReader reader, TdsColumn declared)
+    {
+        if (declared.Token is not (DecimalN or NumericN)) return ReadValue(ref reader, declared);
+
+        var length = reader.U8();
+        return length == 0 ? null : ReadDecimal(reader.Bytes(17), declared.Scale);
+    }
+
+    /// The column an answer goes out in, which is not always the one the value arrived as: a
+    /// parameter marked OUTPUT is answered in what the caller declared, and what this writes is a
+    /// narrower set than what a client may send. Text and binary go back as a MAX of their own
+    /// kind, since that is the only length `WriteValue` chunks correctly, and the three shapes
+    /// newer types replaced -- MONEY, the pre-2008 DATETIME, and the legacy LOBs -- go back as what
+    /// replaced them.
+    static TdsColumn Answered(TdsColumn declared) => declared.Token switch
+    {
+        MoneyN => Decimal(19, 4),
+        DateTimeN => new TdsColumn(DateTime2, Scale: FractionScale),
+        BitN => new TdsColumn(BitN, 1),
+        Time or DateTime2 or DateTimeOffset => declared with { Scale = FractionScale },
+        NVarChar or NChar or Char or VarChar or Text or NText or NullType => new TdsColumn(NVarChar, Max),
+        VarBinary or Binary or Image => new TdsColumn(VarBinary, Max),
+        _ => declared,
+    };
+
+    static object Scalar(byte token, int declared, byte[] value) => token switch
     {
         BitN => value[0] != 0,
         Guid => new Guid(value),

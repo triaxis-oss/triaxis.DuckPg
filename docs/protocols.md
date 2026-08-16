@@ -101,11 +101,11 @@ buffer; nothing else wants smaller packets.
 | `MERGE … WHEN MATCHED THEN UPDATE` — its bulk update | a joined `UPDATE`; the other branches are refused by name |
 | `COUNT`, `COUNT_BIG` | an `int` and a `bigint`, as on SQL Server — DuckDB counts in BIGINT either way |
 | `SUM` of an integer column, `UBIGINT`, `HUGEINT` | `DECIMAL(38,0)` — a number, since no SQL Server integer is that wide |
+| `SqlBulkCopy` — `INSERT BULK` and the bulk load stream | the same insert path a statement takes: keys, references and defaults hold, one transaction per stream |
 
 Not implemented: TLS and SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
-`SqlBulkCopy`, table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA`
-emulation — so SSMS and EF Core scaffolding will not introspect the lake, though hand-written queries
-run.
+table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA` emulation — so SSMS
+and EF Core scaffolding will not introspect the lake, though hand-written queries run.
 
 ## The T-SQL it accepts
 
