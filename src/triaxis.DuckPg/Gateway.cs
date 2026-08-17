@@ -777,7 +777,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             yield return new Check(
                 $"SELECT 1 FROM {child.QualifiedName} AS c, ({keys}) AS k WHERE {matched}{others} LIMIT 1",
                 $"The DELETE statement conflicted with the REFERENCE constraint \"{reference.Name}\". " +
-                $"The conflict occurred in database \"{Config.Schema}\", table \"{reference.Table}\", " +
+                $"The conflict occurred in database \"{Config.DatabaseName}\", table \"{reference.Table}\", " +
                 $"column '{reference.Columns[0]}'.",
                 "23503");
         }

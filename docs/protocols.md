@@ -12,6 +12,12 @@ own: DuckDB's is `main` and PostgreSQL's is `public`, so a lake publishing into 
 wrong one for half its callers. Set `--schema public` if a tool of yours writes `public.orders`
 outright, as an EF Core model built for PostgreSQL does, and the unqualified form keeps working.
 
+The schema is not the database, though it stands in for one unless `--database` says otherwise: a
+lake serves one database, neither door routes on its name, and what the name is for is the ORM
+writing it into a migration and the tool showing it in a connection list. Set it to whatever the
+database this lake stands in for is called, and the connection strings a lake hands out carry that
+instead.
+
 `main` stays behind the lake's schema in the path, because the `pg_catalog` shims live there and
 every client that reads the catalog needs them. The TDS door never needed any of this: `[orders]` and
 `[dbo].[orders]` alike are written into the lake's schema by the T-SQL renderer, whatever it is

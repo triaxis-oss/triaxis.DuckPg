@@ -140,6 +140,48 @@ public class HostingTests : IDisposable
         services.Dispose();
     }
 
+    /// The database a client believes it is connected to is the lake's to name, and naming it moves
+    /// nothing: the tables are still published into the schema, which the two are free to disagree
+    /// about. Unnamed, it is the schema, which is what every client saw before there was a `database`.
+    [Fact]
+    public async Task TheDatabaseNameIsTheLakesToName()
+    {
+        var services = new ServiceCollection()
+            .AddDuckPg(config =>
+            {
+                config.Listen = "127.0.0.1:0";
+                config.Tds = "127.0.0.1:0";
+                config.Schema = "warehouse";
+                config.Database = "erp";
+                config.Layers = [Path.Combine(root, "base")];
+            })
+            .BuildServiceProvider();
+
+        var lake = services.GetRequiredService<Lake>();
+        await lake.StartAsync(TestContext.Current.CancellationToken);
+
+        try
+        {
+            Assert.Contains("Database=erp;", lake.ConnectionString());
+            Assert.Contains("Database=erp;", lake.SqlConnectionString());
+
+            using var pg = new NpgsqlConnection(lake.ConnectionString());
+            pg.Open();
+            using var query = new NpgsqlCommand("SELECT amount FROM warehouse.orders", pg);
+            Assert.Equal(10L, query.ExecuteScalar());
+
+            // What the server sends back in ENVCHANGE, rather than what the connection string said.
+            using var tds = new SqlConnection(lake.SqlConnectionString());
+            tds.Open();
+            Assert.Equal("erp", tds.Database);
+        }
+        finally
+        {
+            await lake.StopAsync(TestContext.Current.CancellationToken);
+            services.Dispose();
+        }
+    }
+
     /// A lake per partition, from one factory: each has its own layers, its own everything, and is
     /// the only thing the caller has to hold or dispose.
     [Fact]

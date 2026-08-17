@@ -56,6 +56,9 @@ public class ServeCommand : LakeCommand
     [Option("--schema", Description = "Schema the published views live in.")]
     public string? Schema { get; set; }
 
+    [Option("--database", Description = "Database name a client sees itself connected to. Defaults to the schema's.")]
+    public string? Database { get; set; }
+
     [Option("--cache", Description = "Directory to write merged copies of multi-layer tables into, as ZSTD parquet. Trades build time and disk for read speed.")]
     public string? Cache { get; set; }
 
@@ -98,6 +101,7 @@ public class ServeCommand : LakeCommand
         if (DeriveIds) config.DeriveIds = true;
         if (SerializeTransactions) config.SerializeTransactions = true;
         if (Schema is not null) config.Schema = Schema;
+        if (Database is not null) config.Database = Database;
         if (Cache is not null) config.Cache = Path.GetFullPath(Cache);
         if (config.Listen is not { Length: > 0 } && config.Tds is not { Length: > 0 })
             config.Listen = DefaultListen;
