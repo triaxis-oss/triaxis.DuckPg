@@ -182,7 +182,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         login["host"] = Field(0);
         login["user"] = Field(1);
         login["application_name"] = Field(3);
-        login["database"] = Field(8) is { Length: > 0 } database ? database : "lake";
+        login["database"] = Field(8) is { Length: > 0 } database ? database : gateway.Config.DatabaseName;
 
         ApplySessionVariables();
 

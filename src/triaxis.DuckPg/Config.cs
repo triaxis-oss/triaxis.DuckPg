@@ -24,6 +24,18 @@ public sealed class Config
     /// session's search path, so an unqualified name finds it without the caller knowing the name.
     public string Schema { get; set; } = "lake";
 
+    /// The name of the database a client believes it is connected to: what the connection strings a
+    /// lake hands out carry, and what a TDS session reports back to a client that named none. It
+    /// decides nothing -- neither door routes on it, there being one lake -- but it is what an ORM
+    /// writes into a migration and what a tool shows in its connection list, so a lake standing in
+    /// for a real database wants the real one's name there rather than the schema's.
+    ///
+    /// Defaults to `Schema`, which is what stood in for it before there was anything else to say.
+    public string? Database { get; set; }
+
+    /// The name to answer with, which is the schema unless a database was named.
+    internal string DatabaseName => Database is { Length: > 0 } named ? named : Schema;
+
     /// Layer directories, lowest first. Each is scanned for `<table>.yaml`, `<table>.json`,
     /// `<table>.parquet` and `<table>/**/*.parquet` alike -- the format is a property of the file,
     /// not of the layer.

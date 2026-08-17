@@ -59,7 +59,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
     /// Ready to hand to Npgsql.
     public string ConnectionString(string user = "admin") =>
         Endpoint is { } endpoint
-            ? $"Host={endpoint.Address};Port={endpoint.Port};Username={user};Database={config.Schema};SSL Mode=Disable"
+            ? $"Host={endpoint.Address};Port={endpoint.Port};Username={user};Database={config.DatabaseName};SSL Mode=Disable"
             : throw new InvalidOperationException("no PostgreSQL front door: set `listen` in the configuration");
 
     /// Ready to hand to Microsoft.Data.SqlClient. `Encrypt=False` is part of the contract rather
@@ -67,7 +67,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
     /// answers PRELOGIN with ENCRYPT_NOT_SUP.
     public string SqlConnectionString(string user = "sa") =>
         TdsEndpoint is { } endpoint
-            ? $"Server={endpoint.Address},{endpoint.Port};Database={config.Schema};User ID={user};" +
+            ? $"Server={endpoint.Address},{endpoint.Port};Database={config.DatabaseName};User ID={user};" +
               "Password=duckpg;Encrypt=False;TrustServerCertificate=True"
             : throw new InvalidOperationException("no TDS front door: set `tds` in the configuration");
 
