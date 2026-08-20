@@ -56,6 +56,21 @@ public class TSqlTests
     [InlineData("SELECT DATEPART(year, d) FROM t", """SELECT date_part('year', "d") FROM "lake"."t" """)]
     [InlineData("SELECT DATEDIFF(dd, a, b) FROM t", """SELECT date_diff('day', "a", "b") FROM "lake"."t" """)]
     [InlineData("SELECT DATEADD(month, 1, d) FROM t", """SELECT ("d" + (1) * INTERVAL '1 month') FROM "lake"."t" """)]
+    [InlineData("SELECT DATEFROMPARTS(2026, 8, 20)", "SELECT make_date(2026, 8, 20)")]
+    // The fraction of a second is an argument of its own in T-SQL and part of the seconds in DuckDB:
+    // milliseconds for the `datetime` one, and units the trailing precision names for the rest.
+    [InlineData("SELECT DATETIMEFROMPARTS(2026, 8, 20, 13, 45, 30, 500)",
+        "SELECT make_timestamp(2026, 8, 20, 13, 45, (30) + (500) / 1000.0)")]
+    [InlineData("SELECT DATETIME2FROMPARTS(2026, 8, 20, 13, 45, 30, 1234567, 7)",
+        "SELECT make_timestamp(2026, 8, 20, 13, 45, (30) + (1234567) / pow(10.0, 7))")]
+    [InlineData("SELECT SMALLDATETIMEFROMPARTS(2026, 8, 20, 13, 45)",
+        "SELECT make_timestamp(2026, 8, 20, 13, 45, 0)")]
+    [InlineData("SELECT TIMEFROMPARTS(13, 45, 30, 5000000, 7)",
+        "SELECT make_time(13, 45, (30) + (5000000) / pow(10.0, 7))")]
+    // The offset is what turns the parts into an instant, since that is all a TIMESTAMPTZ keeps.
+    [InlineData("SELECT DATETIMEOFFSETFROMPARTS(2026, 8, 20, 13, 45, 30, 0, 2, 30, 0)",
+        "SELECT timezone('UTC', make_timestamp(2026, 8, 20, 13, 45, (30) + (0) / pow(10.0, 0)) "
+            + "- (2) * INTERVAL '1 hour' - (30) * INTERVAL '1 minute')")]
     [InlineData("SELECT CEILING(x) FROM t", """SELECT ceil("x") FROM "lake"."t" """)]
     public void RewritesFunctions(string tsql, string expected) => Assert.Equal(expected.Trim(), Translate(tsql));
 

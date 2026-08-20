@@ -1008,6 +1008,57 @@ sealed class TSqlWriter(TSqlContext context)
                 Put($") * INTERVAL '1 {DatePart(args[0])}')");
                 return true;
 
+            case "datefromparts" when args.Count == 3:
+                Call("make_date", args);
+                return true;
+
+            case "datetimefromparts" when args.Count == 7:
+                Put("make_timestamp(");
+                Join(args.Take(5), Expression);
+                Put(", ");
+                Seconds(args[5], args[6]);
+                Put(")");
+                return true;
+
+            case "datetime2fromparts" when args.Count == 8:
+                Put("make_timestamp(");
+                Join(args.Take(5), Expression);
+                Put(", ");
+                Seconds(args[5], args[6], args[7]);
+                Put(")");
+                return true;
+
+            // A `smalldatetime` is minutes and no finer, so the seconds are not an argument at all.
+            case "smalldatetimefromparts" when args.Count == 5:
+                Put("make_timestamp(");
+                Join(args, Expression);
+                Put(", 0)");
+                return true;
+
+            case "timefromparts" when args.Count == 5:
+                Put("make_time(");
+                Join(args.Take(2), Expression);
+                Put(", ");
+                Seconds(args[2], args[3], args[4]);
+                Put(")");
+                return true;
+
+            // A TIMESTAMPTZ is the instant and not the offset it was written with, which is what
+            // `datetimeoffset` maps to everywhere else here -- so the offset is what turns the parts
+            // into that instant rather than something carried alongside it. SQL Server requires the
+            // two halves of the offset to share a sign, so subtracting both is right for either.
+            case "datetimeoffsetfromparts" when args.Count == 10:
+                Put("timezone('UTC', make_timestamp(");
+                Join(args.Take(5), Expression);
+                Put(", ");
+                Seconds(args[5], args[6], args[9]);
+                Put(") - (");
+                Expression(args[7]);
+                Put(") * INTERVAL '1 hour' - (");
+                Expression(args[8]);
+                Put(") * INTERVAL '1 minute')");
+                return true;
+
             case "ceiling" when args.Count == 1:
                 Call("ceil", args);
                 return true;
@@ -1032,6 +1083,28 @@ sealed class TSqlWriter(TSqlContext context)
             default:
                 return false;
         }
+    }
+
+    /// The …FROMPARTS family passes the fraction of a second apart from the seconds -- in
+    /// milliseconds for `datetime`, and in units a trailing precision names for the exact ones --
+    /// where DuckDB wants the whole second as one number.
+    void Seconds(Expr seconds, Expr fraction, Expr? precision = null)
+    {
+        Put("(");
+        Expression(seconds);
+        Put(") + (");
+        Expression(fraction);
+        Put(") / ");
+
+        if (precision is null)
+        {
+            Put("1000.0");
+            return;
+        }
+
+        Put("pow(10.0, ");
+        Expression(precision);
+        Put(")");
     }
 
     void Call(string name, List<Expr> arguments)

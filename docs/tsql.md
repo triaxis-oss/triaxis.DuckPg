@@ -50,6 +50,7 @@ alone — DuckDB's error is better than a cast nobody can justify.
 |---|---|
 | `ISNULL`, `LEN`, `IIF`, `CHARINDEX`, `NEWID`, `GETDATE`, `GETUTCDATE`, `CEILING` | their DuckDB equivalents, argument order and all |
 | `DATEPART(day, d)`, `DATEDIFF`, `DATEADD` | `date_part('day', d)`, `date_diff`, interval arithmetic |
+| `DATEFROMPARTS`, `TIMEFROMPARTS`, `DATETIMEFROMPARTS` and the rest of the family | `make_date`, `make_time`, `make_timestamp`, with the fraction of a second folded into the seconds |
 | `CONVERT(varchar, d, 120)` and the other styles | the date format the style names, applied in .NET |
 | `pwdencrypt`, `pwdcompare` | SQL Server's own hash: version, salt, SHA-512 over UTF-16 |
 
@@ -58,6 +59,11 @@ meaning is .NET's: the styles are the date formats `DateTime.ToString` already k
 SHA-512 over UTF-16 text the way SQL Server writes it — so a hash your real database wrote verifies
 here, and one written here verifies there. They are registered on the database at startup, so both
 front doors find them, and they are not for a view, since these are a managed call per row.
+
+`DATETIME2FROMPARTS` and `TIMEFROMPARTS` take a precision of up to 7, and DuckDB counts a timestamp
+in microseconds — so a hundred nanoseconds is the one digit that does not survive. And
+`DATETIMEOFFSETFROMPARTS` builds the instant its offset names rather than a value carrying that
+offset, because `datetimeoffset` is a `TIMESTAMPTZ` here and a `TIMESTAMPTZ` is the instant.
 
 A declared scalar function from a dacpac is published as a macro and resolves at its call site the
 same way; see [the schema, from a dacpac](schema.md).
