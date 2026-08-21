@@ -34,6 +34,7 @@ publish a temp-directory convention as API.
 | `WriteLayer.cs` | The top layer: DuckDB tables loaded from files, and persisted back to them. |
 | `DacpacSchema.cs` | The declared schema as a service: finds the dacpac, reads `model.xml` for columns, keys, uniques, defaults and views. No DacFx. |
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
+| `Doorway.cs` | A front door's sockets: the listener, the connections it accepted, and closing both. |
 | `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
 | `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |
 | `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
@@ -101,6 +102,10 @@ Each of these is the short form; the note behind it is where the argument is.
   `gate`, never the reverse. [lake](docs/internals/lake.md#two-threads-and-one-duckdb)
 - **A shutdown that is not reached writes nothing**, so every way out has to reach the flush; a lake
   owns what it was built from, or nothing at all.
+  [lake](docs/internals/lake.md#starting-stopping-and-what-a-lake-owns)
+- **A lake that has stopped is a lake nobody is connected to.** A session left on the wire holds a
+  DuckDB connection onto the lake's database, which is the whole lake outliving the last reference
+  to it. `Doorway` owns the sockets as well as the listener.
   [lake](docs/internals/lake.md#starting-stopping-and-what-a-lake-owns)
 - **The lake's schema goes in front of every session's search path, and `main` stays behind it**;
   both front doors are opt-in, and a lake needs one.

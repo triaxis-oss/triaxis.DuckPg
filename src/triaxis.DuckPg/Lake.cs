@@ -107,12 +107,29 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
 
         await stopping.CancelAsync();
         try { await serving!.WaitAsync(cancellation); } catch (OperationCanceledException) { }
+        await DrainAsync(cancellation);
         // Once nothing is serving, so nothing else is on this connection: a materialized lake keeps
         // nothing of its own, and this is where what it was given goes out as a layer.
         gateway.Flush();
         stopping.Dispose();
         stopping = null;
         serving = null;
+    }
+
+    /// The clients dropped, and waited for. Closing the listeners leaves every session that already
+    /// connected running, and a session holds a DuckDB connection onto this lake's database -- so a
+    /// lake stopped with a client still on it is a lake nothing will ever release.
+    async Task DrainAsync(CancellationToken cancellation)
+    {
+        try
+        {
+            await Task.WhenAll(server.DrainAsync(cancellation), tds.DrainAsync(cancellation));
+        }
+        catch (OperationCanceledException)
+        {
+            // A session inside a long query is not worth hanging a shutdown on. Its socket is
+            // already closed, so it ends the moment DuckDB hands it back.
+        }
     }
 
     /// Stops without waiting: the listeners are canceled and the sockets closed, but a serving
@@ -123,6 +140,10 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         disposed = true;
 
         stopping?.Cancel();
+        // The clients go with the listeners, since a session left on the wire holds a connection
+        // onto this database and would outlive the last reference to the lake it is serving.
+        server.Close();
+        tds.Close();
         // Not waited for -- that is what `DisposeAsync` is -- but the writes still have to get out.
         // The listeners are cancelled above, and `Flush` runs on this connection under the gateway's
         // lock, which is what a session's own commit takes to reach it.
@@ -138,10 +159,16 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
         if (disposed) return;
         disposed = true;
 
+        // Unconditionally, since a start that bound one door before failing on the other still has
+        // to give that one back.
+        server.Close();
+        tds.Close();
+
         if (stopping is not null)
         {
             await stopping.CancelAsync();
             try { await serving!.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            await DrainAsync(CancellationToken.None);
             gateway.Flush();
             stopping.Dispose();
             stopping = null;

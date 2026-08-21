@@ -288,11 +288,32 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   call, under `gate`, because it is the lake's own connection and a committing session is on it.
   What the unit tests could not have caught is that none of this is reached: they all called
   `StopAsync`, which worked the whole time.
+- **A lake that has stopped is a lake nobody is connected to.** Cancelling the accept loops stops
+  new clients arriving and does nothing at all to the ones already there: a session blocks on its
+  socket on a thread of its own, holding a DuckDB connection onto the lake's database, and DuckDB
+  keeps a database alive for as long as one connection onto it is open. So a lake stopped with a
+  client still on the wire went on answering it -- and a host starting one lake per tenant kept
+  every lake it ever started, files, memory and all, with the last reference to it long gone.
+  `Doorway` is the connections as well as the listener, and `Close` shuts the sockets so the threads
+  end; `DrainAsync` waits for them, which is what puts the drain before `Gateway.Flush` -- a client
+  that walked away mid-transaction holds the turn the flush needs. The socket is *shut down* rather
+  than disposed, because a session reads the end of its socket as the end of its client, which every
+  protocol here already answers; disposing the stream under a thread inside it is the same
+  connection ending as whichever of half a dozen exceptions the timing lands on -- one of them
+  `NotSupportedException` from a `BufferedStream` over a closed `NetworkStream`, which is not an
+  exception any session would think to catch and which takes the process with it from a thread.
+  What the suite found out about this is that a stopped lake now breaks a *pooled* connection the way
+  a restarted PostgreSQL does: Npgsql keys a pool by the connection string and hands one out without
+  testing it, so two fixtures landing on the same port -- which is what `Listen = "127.0.0.1:0"`
+  invites -- had the second asking its lake over the first one's socket. It used to work, because the
+  first lake was still there answering. `TestLake` puts its own directory in `Application Name`, and
+  the tests that build a lake by hand say `Pooling=false`. SqlClient tests the connection it hands
+  out, so the TDS side never had it.
 - **A lake owns what it was built from, or nothing at all.** A factory-built lake holds its own
   container and releases it on disposal, which is what lets a caller hold one object instead of two
   with an ordering constraint; one resolved from someone else's container owns nothing of theirs.
-  `DisposeAsync` waits for the listeners, `Dispose` only cancels them -- a synchronous dispose that
-  blocked on a serving loop is the sync-over-async this exists to avoid.
+  `DisposeAsync` waits for the listeners and for the clients, `Dispose` only closes them -- a
+  synchronous dispose that blocked on a serving loop is the sync-over-async this exists to avoid.
 - **The lake's schema goes in front of every session's search path, and `main` stays behind it.**
   DuckDB's own default is `main` and PostgreSQL's is `public`, so whatever a lake publishes into is a
   schema some caller does not expect -- and `SELECT * FROM orders` misses it. `DuckDbSession.SearchPath`
