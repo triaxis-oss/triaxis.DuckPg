@@ -127,6 +127,38 @@ static class SqlText
         };
     }
 
+    /// Every identifier a statement names, quoted or bare, in the order they are written. Keywords,
+    /// column names and function names come back among them: what this is for is asking a catalog
+    /// whether it knows a name, and one that does not know `SELECT` is not troubled by being asked.
+    public static IEnumerable<string> Identifiers(string sql)
+    {
+        for (var i = 0; i < sql.Length;)
+        {
+            if (sql[i] == '"')
+            {
+                var quoted = SkipNonCode(sql, i);
+                // Unterminated, which is the client's problem rather than this one's: what is left
+                // is not an identifier anything is named by.
+                if (quoted > i + 1 && sql[quoted - 1] == '"')
+                    yield return sql[(i + 1)..(quoted - 1)].Replace("\"\"", "\"");
+                i = quoted;
+                continue;
+            }
+
+            var skip = SkipNonCode(sql, i);
+            if (skip >= 0) { i = skip; continue; }
+
+            if (char.IsLetter(sql[i]) || sql[i] == '_')
+            {
+                var start = i;
+                while (i < sql.Length && (char.IsLetterOrDigit(sql[i]) || sql[i] is '_' or '$')) i++;
+                yield return sql[start..i];
+                continue;
+            }
+            i++;
+        }
+    }
+
     /// Whether a statement makes a table belonging to the connection rather than to the lake. Only
     /// ever asked of SQL duckpg rendered itself -- a client's `#t` and the gateway's own scratch are
     /// both written here -- so the keyword is known, and a false yes costs only a catalog scan.

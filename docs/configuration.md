@@ -48,6 +48,7 @@ are the whole list: nothing beside the executable is read, and nothing in the wo
 | `writeFormat` | `--write-format` | `Parquet` (default), `Json` or `Yaml`, for tables with no file yet. |
 | `writable` | `--writable` | Accept writes with no directory; they are lost on exit. |
 | `materialize` | `--materialize` | Collapse the layers into real tables; a delta goes out at shutdown. |
+| `lazy` | `--lazy` | Collapse a table when a statement first names it rather than every table at startup. Needs `materialize`. |
 | `store` | `--store` | DuckDB database file a materialized lake's tables live in, rather than memory. Its name becomes the database name, so it cannot be the schema's. |
 | `storeMode` | `--store-mode` | `Keep` (default): the file is the state. `Spill`: only where the tables live. |
 | `compress` | `--compress` | Checkpoint once the lake is built, so DuckDB compresses what it holds in memory. Off by default. |

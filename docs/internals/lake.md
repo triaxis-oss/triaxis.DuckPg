@@ -109,6 +109,37 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   never reads the layers for it again -- `Catalog.Stored` is what asks, and a shape that disagrees
   with what the catalog publishes is refused rather than rebuilt, since rebuilding is the one thing
   a store exists to prevent. No delta is flushed beside one.
+- **`Config.Lazy` defers the collapse and nothing else, and what stands under a deferred table is
+  the merge rather than an empty table waiting to be filled.** That is the whole of why it is safe:
+  the tables a statement is about are found by reading the *text* for names the catalog knows --
+  `SqlText.Identifiers` over `Gateway.Translate`'s input, before anything is translated, since what
+  stands under a name decides whether a write to it is rewritten into four statements or sent as one
+  -- and a scan of text is a thing that can miss. A name it misses is answered by the merge the lake
+  was serving all along: the same rows, at the layered price. An empty table would answer with no
+  rows at all, and nothing about that answer would look like a miss. The scan costs a pass over the
+  statement per statement, so `Catalog.Deferring` is asked first and goes false for good once
+  everything has been named -- a lake that was asked about all of its tables costs an eager one.
+  A declared view or macro is followed rather than left merged, `Catalog.Reads` recording what each
+  one's own definition names, because a statement through a view names the view and nothing under
+  it. Measured at 5.57 s to serve against 3.32, and ~7 ms a table on the statement that first names
+  one. [performance](performance.md#paying-the-merge-once)
+- **What moves with it is when the layers are found to be wrong.** A stack that puts two rows under
+  one declared key is refused by `ALTER TABLE … ADD PRIMARY KEY`, which an eager lake reaches at
+  startup and a lazy one reaches at the statement that first names the table. So a failed collapse
+  leaves the table *deferred*: the next statement naming it fails the same way rather than the lake
+  serving a table whose key quietly went missing -- which, since a materialized lake leaves the key
+  to DuckDB, is a lake that would then accept a duplicate. `Catalog.Flush` skips what is still
+  deferred for the same reason there is nothing to skip: a write names its table, so a table nothing
+  named was never written to, and its write layer still holds -- in the files, untouched -- whatever
+  the run before this one left there. Measuring a delta for it would measure those writes away.
+- **A store is the one thing that carries a deferred table's view into the next run**, which is why
+  `Catalog.Standing` asks once what each name is already holding and `Catalog.Materialize` drops a
+  view before it creates the table. DuckDB refuses to drop a table as a view or a view as a table,
+  and every combination is reachable: `Keep` finds its own tables and serves them (nothing about
+  those is deferred -- the layers are not read for them either way), `Spill` finds the last run's
+  tables and has to make way for the views, and a lake switching between `--lazy` and plain
+  `--materialize` over the same file finds whichever the other mode left. Asked in one question
+  rather than per table, and only where there is a file at all, for the reason `Shapes` is.
 - **What a store *means* is one answer, and `Catalog.Keeping` is where it is given.** The file is
   either the lake's state or only somewhere for its tables to live, and the two halves -- whether the
   layers are read for a table the file already carries, and whether a delta is written at shutdown --
