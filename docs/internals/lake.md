@@ -133,7 +133,9 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   named was never written to, and its write layer still holds -- in the files, untouched -- whatever
   the run before this one left there. Measuring a delta for it would measure those writes away.
 - **A store is the one thing that carries a deferred table's view into the next run**, which is why
-  `Catalog.Standing` asks once what each name is already holding and `Catalog.Materialize` drops a
+  `Catalog.Standing` asks once what each name is already holding -- the shape it has and whether
+  DuckDB is keeping its key with it, which is what a stored start would otherwise ask table by table
+  ([performance](performance.md#what-a-start-asks-the-catalog)) and `Catalog.Materialize` drops a
   view before it creates the table. DuckDB refuses to drop a table as a view or a view as a table,
   and every combination is reachable: `Keep` finds its own tables and serves them (nothing about
   those is deferred -- the layers are not read for them either way), `Spill` finds the last run's

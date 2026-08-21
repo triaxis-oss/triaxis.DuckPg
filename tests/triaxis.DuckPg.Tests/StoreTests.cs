@@ -90,6 +90,26 @@ public class StoreTests : IDisposable
         Assert.Equal(["1"], lake.Query("SELECT extra_id FROM lake.extras"));
     }
 
+    /// A reload over a store finds the tables it left there and keeps them, key and all -- the store
+    /// is the state, and a reload is not a way of asking the layers again. The key is the half that
+    /// can only go wrong once: it is already on the table, and asking DuckDB for it a second time is
+    /// an error rather than a no-op.
+    [Fact]
+    public void AReloadKeepsWhatTheStoreHolds()
+    {
+        using (var connection = Open())
+            new SqlCommand("UPDATE [orders] SET [note] = 'written' WHERE [order_id] = 1", connection)
+                .ExecuteNonQuery();
+
+        lake.Query("CALL duckpg_reload()");
+
+        Assert.Equal(["1=written", "2=base", "3=base"],
+                     lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id"));
+        Assert.Equal(["1"], lake.Query(
+            "SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'lake' " +
+            "AND table_name = 'orders' AND constraint_type = 'PRIMARY KEY'"));
+    }
+
     /// A store made of another schema is refused by name. Rebuilding it here would be the one thing
     /// a store exists to prevent, and serving it would fail on the first query naming the column.
     [Fact]
@@ -170,6 +190,19 @@ public class SpillTests : IDisposable
         Assert.Equal(["BASE TABLE"], lake.Query(
             "SELECT table_type FROM information_schema.tables " +
             "WHERE table_schema = 'lake' AND table_name = 'orders'"));
+    }
+
+    /// Every start makes the tables again, so every start makes their keys again: the table the last
+    /// run left carried one, and the one this run replaced it with is a different table. A lake that
+    /// took the file's word for it would publish a table with no key and no sign of it.
+    [Fact]
+    public void TheKeyIsMadeAgainWithTheTable()
+    {
+        lake.Restart();
+
+        Assert.Equal(["1"], lake.Query(
+            "SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'lake' " +
+            "AND table_name = 'orders' AND constraint_type = 'PRIMARY KEY'"));
     }
 
     /// The file is not the state, so the layers still are: a change underneath is read on the next
