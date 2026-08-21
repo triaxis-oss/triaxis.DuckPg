@@ -11,7 +11,7 @@ namespace triaxis.DuckPg;
 /// One SqlClient connection: the TDS state machine, its own DuckDB connection, and the T-SQL that
 /// arrives on it. Statements are parsed and rendered into DuckDB SQL, then handed to the same
 /// gateway the PostgreSQL side uses -- both front doors write the same files.
-sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck, TdsServer server, ILogger logger)
+sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck, ILogger logger)
     : IDisposable
 {
     readonly TdsWire wire = new(client.GetStream(), logger);
@@ -1237,7 +1237,6 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     public void Dispose()
     {
-        server.Unregister(this);
         Release();
         duck.Dispose();
         client.Dispose();

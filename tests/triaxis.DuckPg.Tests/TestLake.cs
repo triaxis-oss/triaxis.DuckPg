@@ -189,8 +189,13 @@ sealed class TestLake : IDisposable
     internal Catalog Catalog => Running.Catalog;
 
     /// For Npgsql. `Include Error Detail` is on, because a test that fails wants the detail.
+    ///
+    /// The application name is what keeps this fixture's pool its own. Npgsql keys a pool by the
+    /// connection string and hands a pooled connection out without testing it, and port 0 means the
+    /// OS is free to give a fixture starting the port a fixture that stopped just handed back -- at
+    /// which point the new lake is asked over the old lake's closed socket.
     public string ConnectionString(string user = "admin") =>
-        Running.ConnectionString(user) + ";Include Error Detail=true";
+        Running.ConnectionString(user) + $";Include Error Detail=true;Application Name={Path.GetFileName(Root)}";
 
     /// For Microsoft.Data.SqlClient, once `WithTds()` has opened that door.
     public string SqlConnectionString(string user = "sa") =>

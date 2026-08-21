@@ -26,72 +26,42 @@ sealed class PgServer(Config config, Gateway gateway, DuckDBConnection root, ILo
             session.Cancel();
     }
 
-    TcpListener? listener;
-
     /// A front door is opt-in, the same way the TDS one is: a consumer speaking only SQL Server
     /// should not have to open a PostgreSQL listener it never uses.
-    public bool Enabled => config.Listen is { Length: > 0 };
+    readonly Doorway? door = config.Listen is { Length: > 0 } listen
+        ? new Doorway(listen, 55432, loggers.CreateLogger<PgServer>())
+        : null;
+
+    public bool Enabled => door is not null;
 
     /// Where the server actually bound, which is not what was configured when the port was 0.
-    public IPEndPoint Endpoint => (IPEndPoint)(listener ?? throw new InvalidOperationException("not started")).LocalEndpoint;
+    public IPEndPoint Endpoint =>
+        (door ?? throw new InvalidOperationException("no PostgreSQL front door")).Endpoint;
 
     /// Binding is separate from accepting so that a caller can learn the port before the first
     /// client arrives.
     public void Start()
     {
-        if (!Enabled) return;
+        if (door is null) return;
 
-        var (host, port) = Split(config.Listen!);
-        listener = new TcpListener(IPAddress.Parse(host), port);
-        listener.Start();
-        logger.LogInformation("duckpg listening on {Endpoint}", Endpoint);
+        door.Start();
+        logger.LogInformation("duckpg listening on {Endpoint}", door.Endpoint);
     }
 
-    public async Task ListenAsync(CancellationToken cancellation)
-    {
-        if (!Enabled) return;
-        if (listener is null) Start();
+    public Task ListenAsync(CancellationToken cancellation) =>
+        door?.ListenAsync(Serve, cancellation) ?? Task.CompletedTask;
 
-        try
-        {
-            while (true)
-            {
-                var client = await listener!.AcceptTcpClientAsync(cancellation);
-                // A session blocks on its socket and owns a DuckDB connection, so it gets a thread.
-                new Thread(() => Serve(client)) { IsBackground = true }.Start();
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            logger.LogInformation("shutting down");
-        }
-        finally
-        {
-            listener!.Stop();
-        }
-    }
+    public void Close() => door?.Close();
+
+    public Task DrainAsync(CancellationToken cancellation) =>
+        door?.DrainAsync(cancellation) ?? Task.CompletedTask;
 
     void Serve(TcpClient client)
     {
-        client.NoDelay = true;
-        try
-        {
-            var connection = DuckDbSession.Of(root);
-            connection.Open();
-            DuckDbSession.SearchPath(connection, gateway.Config);
-            using var session = new PgSession(client, gateway, connection, this, loggers.CreateLogger<PgSession>());
-            session.Run();
-        }
-        catch (Exception e) when (e is IOException or SocketException or ProtocolException)
-        {
-            logger.LogDebug("connection dropped: {Reason}", e.Message);
-            client.Dispose();
-        }
-    }
-
-    static (string Host, int Port) Split(string listen)
-    {
-        var colon = listen.LastIndexOf(':');
-        return colon < 0 ? (listen, 55432) : (listen[..colon], int.Parse(listen[(colon + 1)..]));
+        var connection = DuckDbSession.Of(root);
+        connection.Open();
+        DuckDbSession.SearchPath(connection, gateway.Config);
+        using var session = new PgSession(client, gateway, connection, this, loggers.CreateLogger<PgSession>());
+        session.Run();
     }
 }

@@ -23,6 +23,12 @@ public class HostingTests : IDisposable
         try { Directory.Delete(root, recursive: true); } catch (IOException) { }
     }
 
+    /// A pool of this test's own. Npgsql keys one by the connection string and hands a pooled
+    /// connection out without testing it, and port 0 means the OS is free to give a lake starting
+    /// the port a lake that stopped just handed back.
+    NpgsqlConnection Connect(Lake lake) =>
+        new(lake.ConnectionString() + $";Application Name={Path.GetFileName(root)}");
+
     /// The lake starts with the host and stops with it, and the port it bound is readable as soon
     /// as the host is up -- which is what makes port 0 usable from a fixture.
     [Fact]
@@ -43,7 +49,7 @@ public class HostingTests : IDisposable
         Assert.NotEqual(0, lake.Endpoint!.Port);
         Assert.NotNull(lake.TdsEndpoint);
 
-        using (var pg = new NpgsqlConnection(lake.ConnectionString()))
+        using (var pg = Connect(lake))
         {
             pg.Open();
             using var command = new NpgsqlCommand("SELECT amount FROM lake.orders", pg);
@@ -78,7 +84,7 @@ public class HostingTests : IDisposable
 
         try
         {
-            using var pg = new NpgsqlConnection(lake.ConnectionString());
+            using var pg = Connect(lake);
             pg.Open();
             using var command = new NpgsqlCommand("SELECT amount FROM warehouse.orders", pg);
             Assert.Equal(10L, command.ExecuteScalar());
@@ -109,7 +115,7 @@ public class HostingTests : IDisposable
 
         try
         {
-            using var pg = new NpgsqlConnection(lake.ConnectionString());
+            using var pg = Connect(lake);
             pg.Open();
             using var command = new NpgsqlCommand("SELECT amount FROM lake.orders", pg);
             Assert.Equal(10L, command.ExecuteScalar());
@@ -165,7 +171,7 @@ public class HostingTests : IDisposable
             Assert.Contains("Database=erp;", lake.ConnectionString());
             Assert.Contains("Database=erp;", lake.SqlConnectionString());
 
-            using var pg = new NpgsqlConnection(lake.ConnectionString());
+            using var pg = Connect(lake);
             pg.Open();
             using var query = new NpgsqlCommand("SELECT amount FROM warehouse.orders", pg);
             Assert.Equal(10L, query.ExecuteScalar());
