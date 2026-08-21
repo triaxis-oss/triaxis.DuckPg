@@ -80,7 +80,9 @@ database file is needed anywhere.
 
 That merge is bound by DuckDB on every execution, which on a wide table over several layers is most
 of the cost of a read. `--cache` writes the merged rows out once as parquet, and `--materialize`
-collapses the stack into real tables at build — worth about 3.7× on a small ORM query.
+collapses the stack into real tables at build — worth about 3.7× on a small ORM query. `--lazy`
+collapses a table when a statement first names it instead, so a lake pays for the tables it serves
+rather than for the ones it publishes.
 
 ## Baking the layers
 

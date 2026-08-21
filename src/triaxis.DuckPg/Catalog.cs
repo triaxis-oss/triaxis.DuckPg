@@ -95,6 +95,45 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// question is worth.
     readonly Dictionary<string, long> rows = new(StringComparer.OrdinalIgnoreCase);
 
+    /// Which tables a lazy lake still publishes as the merge, waiting for something to name one. A
+    /// table leaves this set by being collapsed, so a lake that has been asked about everything it
+    /// holds costs what an eager one costs and asks nothing more.
+    readonly HashSet<string> deferred = new(StringComparer.OrdinalIgnoreCase);
+
+    /// What each declared view and macro names, of the things this catalog publishes. A statement
+    /// through a view names the view and not the tables under it, and a deferred table nothing ever
+    /// names is a table nothing ever collapses.
+    readonly Dictionary<string, string[]> reads = new(StringComparer.OrdinalIgnoreCase);
+
+    /// What each name in the lake's schema was already holding when this build started, which only a
+    /// store can carry from one run into the next: a table where a run collapsed one into the file,
+    /// a view where a lazy run deferred it.
+    Dictionary<string, string> standing = new(StringComparer.OrdinalIgnoreCase);
+
+    const string AsTable = "BASE TABLE";
+    const string AsView = "VIEW";
+
+    string? Held(string name) => standing.GetValueOrDefault(name);
+
+    /// Asked in one question rather than per table: `information_schema` is answered by scanning the
+    /// whole catalog, so 300 tables asking about themselves cost two orders of magnitude more than
+    /// one question naming none of them. Asked at all only where there is a file to have kept
+    /// something -- an in-memory lake starts with an empty catalog every time.
+    Dictionary<string, string> Standing(DuckDBConnection conn)
+    {
+        var held = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (config.Store is not { Length: > 0 }) return held;
+
+        using var command = conn.CreateCommand();
+        command.CommandText = "SELECT table_name, table_type FROM information_schema.tables " +
+                              "WHERE table_catalog = current_database() AND table_schema = ?";
+        command.Parameters.Add(new DuckDBParameter(config.Schema));
+
+        using var reader = command.ExecuteReader();
+        while (reader.Read()) held[reader.GetString(0)] = reader.GetString(1);
+        return held;
+    }
+
     bool flushed;
 
     /// Schema holding the materialized YAML and JSON layers.
@@ -142,6 +181,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     void FromLayers(DuckDBConnection conn)
     {
+        standing = Standing(conn);
+
         foreach (var (name, sources, declaredWrite) in Sources())
         {
             var settings = config.Table(name);
@@ -175,6 +216,18 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                                   writable || config.Collapsed, writeSource, settings.Filter,
                                   config.Collapsed);
             Diagnose(table);
+
+            // A lazy lake publishes the merge and cuts the table out of it when something first
+            // names it -- unless the collapse is already done, which a store that is the state is:
+            // its table is what the lake serves, and the layers are not read for it either way.
+            if (table.Materialized && config.Lazy && !(Keeping && Held(name) == AsTable))
+            {
+                // A store that is only where the tables live holds the last run's table under this
+                // name, and a view cannot be published over a name a table has.
+                if (Held(name) == AsTable) Exec(conn, $"DROP TABLE {table.QualifiedName}");
+                deferred.Add(name);
+                table = table with { Materialized = false };
+            }
 
             if (table.Materialized)
             {
@@ -483,6 +536,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         promoted.Clear();
         tombstoned.Clear();
         copies.Clear();
+        deferred.Clear();
+        reads.Clear();
         Build(conn);
     }
 
@@ -773,6 +828,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                 pending[function.Name] =
                     $"CREATE OR REPLACE MACRO {SqlText.Quote(config.Schema)}.{SqlText.Quote(function.Name)}" +
                     $"({parameters}) AS (CAST({body} AS {function.ReturnType}))";
+                if (config.Lazy) Reads(function.Name, body);
             }
             catch (Exception e)
             {
@@ -845,6 +901,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
                     Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} " +
                                   $"AS {translated[0].Sql}");
+                    if (config.Lazy) Reads(name, translated[0].Sql);
                     pending.Remove(name);
                     published++;
                 }
@@ -1264,7 +1321,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // so asking it for its write branch by name would point the merge at itself.
         var stacked = table with { Materialized = false };
         var carries = table.Writable && write.Carries(stacked);
-        if (carries) write.Prepare(conn, stacked);
+        // A deferred table was published as the merge and has had its branch loaded since the build;
+        // preparing it again would only read the same files back over the same rows.
+        if (carries && !Promoted(table)) write.Prepare(conn, stacked);
 
         // A store already carrying this table is the state, and the layers are not consulted for it
         // again: rebuilding would throw away everything written since it was made. What the file
@@ -1295,6 +1354,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Exec(conn, $"CREATE OR REPLACE VIEW {Baseline(table)} AS " +
                    Merged(stacked, writable: false, tombstones: false));
 
+        // A view may be standing under the name -- this build deferred the table and something has
+        // now named it, or a lazy run before this one left the view in the store. DuckDB replaces a
+        // table with a table, and refuses to drop either as the other.
+        if (deferred.Contains(table.Name) || Held(table.Name) == AsView)
+            Exec(conn, $"DROP VIEW {table.QualifiedName}");
+
         // What it serves is that baseline with the previous run's delta on top of it: the whole
         // stack, evaluated once.
         Exec(conn, $"CREATE OR REPLACE TABLE {table.QualifiedName} AS " +
@@ -1307,6 +1372,57 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Stamps(conn, table);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
     }
+
+    /// Whether anything is still published as the merge, which is the only reason to read a
+    /// statement before translating it. False for every lake but a lazy one, and for a lazy one
+    /// once it has been asked about everything it holds.
+    public bool Deferring => deferred.Count > 0;
+
+    /// Collapses every deferred table a statement names, before that statement runs -- so what the
+    /// gateway then translates it against is the table, and a write to it is the write a
+    /// materialized lake sends rather than the four a layered one has to.
+    ///
+    /// The names are read out of the text rather than parsed out of it, which is why what stands
+    /// under a deferred name is the merge and not an empty table waiting to be filled: a name this
+    /// misses costs the merge it was always going to cost, and the answer is the same answer. An
+    /// empty table would answer with no rows at all, and nothing about that would look like a
+    /// miss.
+    ///
+    /// A collapse that fails -- layers that put two rows under one declared key, which an eager lake
+    /// refuses to start over -- leaves the table deferred, so the next statement naming it fails the
+    /// same way rather than the lake quietly serving a table with the key dropped off it.
+    public void Touch(DuckDBConnection conn, string sql)
+    {
+        foreach (var name in SqlText.Identifiers(sql)) Reached(conn, name, 0);
+    }
+
+    void Reached(DuckDBConnection conn, string name, int depth)
+    {
+        if (deferred.Contains(name))
+        {
+            var table = Tables[name] with { Materialized = true };
+            logger.LogDebug("collapsing {Table}, named by a statement", name);
+            Materialize(conn, table);
+            // Replacing what is under a key another session may be reading, never adding one: the
+            // entry is there and what changes is which `Table` it holds.
+            Tables[name] = table;
+            deferred.Remove(name);
+        }
+        // A view over a view is ordinary, and a view naming itself through another catalog is not
+        // impossible -- so the chain is walked rather than assumed to be one deep, and bounded
+        // rather than tracked, there being nothing at the bottom of it worth a set per statement.
+        else if (depth < 8 && reads.TryGetValue(name, out var named))
+            foreach (var reach in named) Reached(conn, reach, depth + 1);
+    }
+
+    /// What a declared view or macro would reach if something named it: the tables its definition
+    /// names, and the other declared things whose own definitions may name one -- a view calls a
+    /// function, and the function's body is where the table actually is.
+    void Reads(string name, string sql) =>
+        reads[name] = [.. SqlText.Identifiers(sql).Where(Declares).Distinct(StringComparer.OrdinalIgnoreCase)];
+
+    bool Declares(string name) =>
+        Tables.ContainsKey(name) || schema.Views.ContainsKey(name) || schema.Functions.Any(f => Same(f.Name, name));
 
     /// The declared defaults, put back onto the table the collapse produced. A materialized table is
     /// the write branch as well as the read layers, and the two halves of a default are different
@@ -1469,7 +1585,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (!config.Collapsed || write.Directory is null || Keeping || flushed) return;
         flushed = true;
 
-        foreach (var table in Tables.Values.Where(t => t.Writable))
+        // A table still published as the merge was never written to -- a write names it, and a
+        // statement that names it collapses it first -- so what its write layer holds is what the
+        // run before this one left in the files, and rewriting those from a branch this run only
+        // read would be measuring a delta against itself.
+        foreach (var table in Tables.Values.Where(t => t.Writable && t.Materialized))
         {
             var stacked = table with { Materialized = false };
             var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));

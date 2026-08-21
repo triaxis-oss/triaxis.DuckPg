@@ -31,6 +31,9 @@ public class ServeCommand : LakeCommand
     [Option("--materialize", Description = "Collapse the layers into real DuckDB tables and serve those; nothing is kept but a delta at shutdown.")]
     public bool Materialize { get; set; }
 
+    [Option("--lazy", Description = "Collapse a table when a statement first names it, rather than every table at startup. Needs --materialize.")]
+    public bool Lazy { get; set; }
+
     [Option("--store", Description = "Hold a materialized lake's tables in this DuckDB database file rather than in memory.")]
     public string? Store { get; set; }
 
@@ -93,6 +96,7 @@ public class ServeCommand : LakeCommand
         if (Writable) config.Writable = true;
         if (Base is not null) config.Base = Path.GetFullPath(Base);
         if (Materialize) config.Materialize = true;
+        if (Lazy) config.Lazy = true;
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;
         if (Compress) config.Compress = true;

@@ -35,6 +35,31 @@ declares past the key becomes an index here too. It also means the layers have t
 that publishes one key twice, leaves the key empty, or breaks a declared unique cannot be built, and
 the lake says so at startup rather than serving it.
 
+**`--lazy`** pays that build a table at a time, when a statement first names one, rather than all of
+it before the first client connects. What is deferred is the collapse and only the collapse — the
+rest of the build is what a layered lake does anyway — so an application that reads twenty of three
+hundred tables collapses twenty. Measured on 300 tables of 200 rows over two layers, reading twenty
+of them:
+
+| | to serving | first read of the 20 | 20 reads by key after |
+|---|---|---|---|
+| layers | **3.25 s** | 34 ms | 42 ms |
+| `--materialize` | 5.57 s | 19 ms | **20 ms** |
+| `--materialize --lazy` | **3.32 s** | 153 ms | **17 ms** |
+
+The collapse is not avoided, it is moved: ~7 ms a table on the statement that first names one, and
+everything after that is what a materialized table costs. What it buys is 2.2 s of startup and the
+memory of 280 tables nobody asked about — both of which grow with the tables a lake publishes and
+not with the ones it serves.
+
+What stands under a table nothing has named yet is the merge, exactly as a layered lake publishes it,
+so a reference that goes unspotted answers with the same rows at the layered price rather than with
+no rows at all. Two things move with it. The first statement to name a big table waits for its
+collapse, where an eager lake had already paid. And layers that break a declared key or unique are
+refused by that statement rather than by the start — the same refusal, and the same one every time
+the table is named, rather than the key quietly dropped so the next statement can pass. `--compress`
+covers what was collapsed when the build ended, which in a lazy lake is nothing.
+
 A write by key is then sent as the one statement it already is. Over the layers, an `UPDATE` has to
 be rewritten into four — collect the rows, collect the keys, evict, re-insert — because a written row
 has to stand over the ones below it. A materialized table has nothing below it, so DuckDB's own

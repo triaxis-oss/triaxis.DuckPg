@@ -57,6 +57,18 @@ public sealed class Config
     /// directory gets on a clean shutdown.
     public bool Materialize { get; set; }
 
+    /// Cut a table out of the merge when a statement first names it, rather than every table when
+    /// the lake is built. What `Materialize` costs is the whole stack collapsed at startup, and a
+    /// client that reads twenty of three hundred tables paid for all three hundred; deferred, it
+    /// pays for the twenty, as it reaches them, and holds nothing for the rest.
+    ///
+    /// A table nothing has named yet is published exactly as a layered lake publishes it -- as the
+    /// merge over its layers -- so a statement whose tables were not spotted answers with the same
+    /// rows, more slowly. What moves is when the layers are found to be wrong: a stack that puts two
+    /// rows under one declared key is refused by the statement that first names the table rather
+    /// than by the start.
+    public bool Lazy { get; set; }
+
     /// A baked database served instead of layers: the tables a materialized lake would have built,
     /// already built, with their keys, indexes, defaults and declared views in them. It is copied on
     /// the way up and never written to -- what a run does to its copy goes out as a delta against it
@@ -260,6 +272,15 @@ public sealed class Config
             throw new DuckPgConfigurationException(
                 "`store` keeps a materialized lake, so it needs `materialize`: without it a lake " +
                 "publishes views over the layer files, and there is nothing in a database file to keep");
+
+        // What `lazy` defers is the collapse `materialize` does, and a base is one somebody else
+        // already did: there is nothing left in either lake to put off.
+        if (Lazy && !Materialize)
+            throw new DuckPgConfigurationException(
+                Base is { Length: > 0 }
+                    ? "`lazy` defers collapsing the layers, and `base` serves a lake already collapsed"
+                    : "`lazy` says when the layers are collapsed, so it needs `materialize`: without it " +
+                      "a lake publishes the merge and never collapses anything");
 
         if (StoreMode != StoreMode.Keep && Store is not { Length: > 0 })
             throw new DuckPgConfigurationException(

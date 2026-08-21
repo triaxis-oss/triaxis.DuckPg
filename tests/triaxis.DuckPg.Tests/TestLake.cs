@@ -83,6 +83,14 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// Collapsed a table at a time, when a statement first names one, rather than all of them when
+    /// the lake is built.
+    public TestLake Lazily()
+    {
+        Config.Lazy = true;
+        return this;
+    }
+
     /// Held in a DuckDB database file under the lake's own directory rather than in memory. Kept by
     /// default, so a restart opens what the run before it left rather than collapsing the layers
     /// again; spilled, the file is only where the tables live and everything else is unchanged.
