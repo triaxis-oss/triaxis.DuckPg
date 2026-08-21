@@ -51,6 +51,21 @@ public class MaterializeTests : IDisposable
             "WHERE table_schema = 'lake' AND table_name = 'orders'"));
     }
 
+    /// A reload makes every table again, so the keys have to be made again with them: CTAS carries
+    /// no constraint over, and a lake that took the key it saw before the reload for the one the new
+    /// table has would publish a table holding none.
+    [Fact]
+    public void AReloadRebuildsTheTablesAndTheirKeys()
+    {
+        lake.Query("CALL duckpg_reload()");
+
+        Assert.Equal(["base", "shadowed", "base"],
+                     lake.Query("SELECT note FROM lake.orders ORDER BY order_id"));
+        Assert.Equal(["1"], lake.Query(
+            "SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'lake' " +
+            "AND table_name = 'orders' AND constraint_type = 'PRIMARY KEY'"));
+    }
+
     /// A write goes where the reads come from. Nothing is promoted, because there is nothing to
     /// promote: no branch above the rows and none below them.
     [Fact]

@@ -243,6 +243,34 @@ Every number here was measured on this code. The user-facing summary is [perform
   why a string and a blob are typed only where it saves a type test, and `Objects` keeps the old
   behaviour for anything with no pair: read as it comes, converted from whatever it turns out to be.
 
+## What a start asks the catalog
+
+- **A question per table is a catalog scan per table, and a start that asks two of them spends most
+  of itself asking.** `information_schema` and `duckdb_constraints` are table functions like
+  `duckdb_tables()` below: every table in every attached database is materialized before the `WHERE`
+  chooses any of them, so what one costs is the catalog and not the answer. `Catalog.Materialize`
+  used to ask each table for its columns (was this one already in the store?) and each table for its
+  key (is DuckDB holding it already?). Measured on a 300-table store of 50-row tables:
+
+  | | per table | in one question |
+  |---|---|---|
+  | the columns of a stored table | 5666 ms | **23 ms** |
+  | whether DuckDB holds its key | 1002 ms | **6 ms** |
+  | `count(*)` and `max(<identity>)` | 137 / 180 ms | left alone |
+
+  Which is 73% of what a restart over that store cost. `Catalog.Standing` takes both in two
+  questions naming no table -- the same move `Shapes` makes for a baked database -- and the start
+  falls from **9143 ms to 2150**, the first one that builds the store from **13764 to 4472**.
+- **It is a snapshot of what the run before left, not a reading of what is there**, which is the only
+  reason one question can answer for a build that is creating tables while it runs. That also
+  settles the key: `Keyed` is *told* whether DuckDB already holds one rather than asking, because
+  the two callers know without looking. A table the store carried has whatever it was given; a table
+  this build just made with `CREATE OR REPLACE TABLE … AS` has none, since CTAS carries no
+  constraint over -- which is why a spilled store, rebuilt from the layers every start, has to make
+  the key again with the table. `SpillTests.TheKeyIsMadeAgainWithTheTable` and
+  `StoreTests.AReloadKeepsWhatTheStoreHolds` are the two halves, and each fails if the other's
+  answer is given.
+
 ## What a pooled checkout costs
 
 - **`duckdb_tables()` costs the whole catalog, not the rows it is filtered to.** It is a table

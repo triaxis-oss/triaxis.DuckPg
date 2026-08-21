@@ -105,33 +105,58 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// names is a table nothing ever collapses.
     readonly Dictionary<string, string[]> reads = new(StringComparer.OrdinalIgnoreCase);
 
-    /// What each name in the lake's schema was already holding when this build started, which only a
-    /// store can carry from one run into the next: a table where a run collapsed one into the file,
-    /// a view where a lazy run deferred it.
-    Dictionary<string, string> standing = new(StringComparer.OrdinalIgnoreCase);
+    /// One name the lake's schema was already holding: what it is, the shape it has, and whether
+    /// DuckDB is keeping its key.
+    sealed record Kept(string Type, List<string> Columns, bool Keyed);
+
+    /// What the schema held when this build started, which only a store can carry from one run into
+    /// the next: a table where a run collapsed one into the file, a view where a lazy run deferred
+    /// it. Empty for an in-memory lake, which starts with an empty catalog every time.
+    Dictionary<string, Kept> standing = new(StringComparer.OrdinalIgnoreCase);
 
     const string AsTable = "BASE TABLE";
     const string AsView = "VIEW";
 
-    string? Held(string name) => standing.GetValueOrDefault(name);
+    Kept? Held(string name) => standing.GetValueOrDefault(name);
 
-    /// Asked in one question rather than per table: `information_schema` is answered by scanning the
-    /// whole catalog, so 300 tables asking about themselves cost two orders of magnitude more than
-    /// one question naming none of them. Asked at all only where there is a file to have kept
-    /// something -- an in-memory lake starts with an empty catalog every time.
-    Dictionary<string, string> Standing(DuckDBConnection conn)
+    /// Two questions naming no table, rather than two per table. `information_schema` and
+    /// `duckdb_constraints` are table functions: every table in every attached database is
+    /// materialized before the `WHERE` chooses any of them, so what a question costs is the catalog
+    /// and not the answer. Measured on a 300-table store, that is 5666 ms of asking each table for
+    /// its columns against 23 for asking once, and 1002 ms of asking each for its key against 6 --
+    /// out of a 9.1 s start.
+    ///
+    /// A snapshot rather than a live reading, which is what makes it answer the question that is
+    /// actually being asked: not "what is there now", since this build is creating tables as it
+    /// goes, but "what did the run before this one leave behind".
+    Dictionary<string, Kept> Standing(DuckDBConnection conn)
     {
-        var held = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        if (config.Store is not { Length: > 0 }) return held;
+        var kept = new Dictionary<string, Kept>(StringComparer.OrdinalIgnoreCase);
+        if (config.Store is not { Length: > 0 }) return kept;
+
+        var keys = new HashSet<string>(
+            Query(conn, "SELECT table_name FROM duckdb_constraints() WHERE database_name = current_database() " +
+                        $"AND schema_name = {SqlText.Literal(config.Schema)} AND constraint_type = 'PRIMARY KEY'"),
+            StringComparer.OrdinalIgnoreCase);
 
         using var command = conn.CreateCommand();
-        command.CommandText = "SELECT table_name, table_type FROM information_schema.tables " +
-                              "WHERE table_catalog = current_database() AND table_schema = ?";
+        command.CommandText =
+            "SELECT t.table_name, t.table_type, c.column_name FROM information_schema.tables t " +
+            "LEFT JOIN information_schema.columns c ON c.table_catalog = t.table_catalog " +
+            "AND c.table_schema = t.table_schema AND c.table_name = t.table_name " +
+            "WHERE t.table_catalog = current_database() AND t.table_schema = ? " +
+            "ORDER BY t.table_name, c.ordinal_position";
         command.Parameters.Add(new DuckDBParameter(config.Schema));
 
         using var reader = command.ExecuteReader();
-        while (reader.Read()) held[reader.GetString(0)] = reader.GetString(1);
-        return held;
+        while (reader.Read())
+        {
+            var name = reader.GetString(0);
+            if (!kept.TryGetValue(name, out var held))
+                kept[name] = held = new Kept(reader.GetString(1), [], keys.Contains(name));
+            if (!reader.IsDBNull(2)) held.Columns.Add(reader.GetString(2));
+        }
+        return kept;
     }
 
     bool flushed;
@@ -220,11 +245,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             // A lazy lake publishes the merge and cuts the table out of it when something first
             // names it -- unless the collapse is already done, which a store that is the state is:
             // its table is what the lake serves, and the layers are not read for it either way.
-            if (table.Materialized && config.Lazy && !(Keeping && Held(name) == AsTable))
+            if (table.Materialized && config.Lazy && !(Keeping && Held(name) is { Type: AsTable }))
             {
                 // A store that is only where the tables live holds the last run's table under this
                 // name, and a view cannot be published over a name a table has.
-                if (Held(name) == AsTable) Exec(conn, $"DROP TABLE {table.QualifiedName}");
+                if (Held(name) is { Type: AsTable }) Exec(conn, $"DROP TABLE {table.QualifiedName}");
                 deferred.Add(name);
                 table = table with { Materialized = false };
             }
@@ -1329,18 +1354,18 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // again: rebuilding would throw away everything written since it was made. What the file
         // holds has to be what the catalog says it publishes, though -- a store made before a column
         // was declared would fail on every query naming that column, and nowhere near here.
-        if (Keeping && Stored(conn, table) is { Count: > 0 } stored)
+        if (Keeping && Held(table.Name) is { Type: AsTable } stored)
         {
             var declared = table.Columns.Select(c => c.Name);
-            if (!stored.SequenceEqual(declared, StringComparer.OrdinalIgnoreCase))
+            if (!stored.Columns.SequenceEqual(declared, StringComparer.OrdinalIgnoreCase))
                 throw new DuckPgConfigurationException(
-                    $"the store holds {table.Name} as ({string.Join(", ", stored)}), and this lake " +
+                    $"the store holds {table.Name} as ({string.Join(", ", stored.Columns)}), and this lake " +
                     $"publishes it as ({string.Join(", ", declared)}) -- the store is of another " +
                     "schema, and rebuilding it here would discard what has been written to it");
 
             promoted.Add(table.Name);
             rows[table.Name] = Count(conn, table);
-            Keyed(conn, table);
+            Keyed(conn, table, stored.Keyed);
             Stamps(conn, table);
             foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             return;
@@ -1357,7 +1382,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // A view may be standing under the name -- this build deferred the table and something has
         // now named it, or a lazy run before this one left the view in the store. DuckDB replaces a
         // table with a table, and refuses to drop either as the other.
-        if (deferred.Contains(table.Name) || Held(table.Name) == AsView)
+        if (deferred.Contains(table.Name) || Held(table.Name) is { Type: AsView })
             Exec(conn, $"DROP VIEW {table.QualifiedName}");
 
         // What it serves is that baseline with the previous run's delta on top of it: the whole
@@ -1365,10 +1390,12 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Exec(conn, $"CREATE OR REPLACE TABLE {table.QualifiedName} AS " +
                    Merged(stacked, carries, carries && write.HasTombstones(stacked)));
 
-        // Nothing is earned here: the branch a write would have to make is the table itself.
+        // Nothing is earned here: the branch a write would have to make is the table itself. The
+        // key is never already there: whatever stood under the name, what holds it now is a table
+        // this statement made, and CTAS carries no constraint over.
         promoted.Add(table.Name);
         rows[table.Name] = Count(conn, table);
-        Keyed(conn, table);
+        Keyed(conn, table, held: false);
         Stamps(conn, table);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
     }
@@ -1458,9 +1485,14 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// being published without the `QUALIFY` that dedupes, there being nothing to shadow -- or one
     /// that leaves the key empty. Both are the lake saying the layers are wrong at startup rather
     /// than serving a row nobody can name.
-    void Keyed(DuckDBConnection conn, Table table)
+    ///
+    /// `held` is whether DuckDB is keeping the key already, which only a store carrying the table
+    /// from a previous run is -- and asking for it twice is an error rather than a no-op. Told
+    /// rather than asked: a table this build just made never holds one, and the store's answer for
+    /// every table it does hold was taken in one question before any of them was touched.
+    void Keyed(DuckDBConnection conn, Table table, bool held)
     {
-        if (table.Key.Length > 0 && !Holds(conn, table))
+        if (table.Key.Length > 0 && !held)
             Exec(conn, $"ALTER TABLE {table.QualifiedName} ADD PRIMARY KEY " +
                        $"({string.Join(", ", table.Key.Select(SqlText.Quote))})");
 
@@ -1513,20 +1545,6 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     static bool Covers(string[] key, string[] columns) =>
         key.Length == columns.Length && key.All(k => columns.Any(c => Same(k, c)));
 
-    /// Whether DuckDB is already holding this table's key, which a store carrying the table from a
-    /// previous run is -- and asking for it twice is an error rather than a no-op.
-    static bool Holds(DuckDBConnection conn, Table table)
-    {
-        using var command = conn.CreateCommand();
-        command.CommandText = "SELECT 1 FROM duckdb_constraints() WHERE schema_name = ? AND table_name = ? " +
-                              "AND constraint_type = 'PRIMARY KEY'";
-        command.Parameters.Add(new DuckDBParameter(table.Schema));
-        command.Parameters.Add(new DuckDBParameter(table.Name));
-
-        using var reader = command.ExecuteReader();
-        return reader.Read();
-    }
-
     /// A store the lake's state lives in, rather than one that is only somewhere for its tables to
     /// live. It is what decides both halves of the bargain -- whether the layers are read for a table
     /// the file already carries, and whether a delta is written at shutdown -- and they have to be
@@ -1538,25 +1556,6 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         using var command = conn.CreateCommand();
         command.CommandText = $"SELECT count(*) FROM {table.QualifiedName}";
         return Convert.ToInt64(command.ExecuteScalar());
-    }
-
-    /// The columns a store already holds for a table, in order, or nothing when it holds no such
-    /// table. A view is not a table: a store written by a build that is no longer this one may carry
-    /// either, and only a table is state worth keeping.
-    static List<string> Stored(DuckDBConnection conn, Table table)
-    {
-        using var command = conn.CreateCommand();
-        command.CommandText =
-            "SELECT column_name FROM information_schema.columns c WHERE c.table_schema = ? AND c.table_name = ? " +
-            "AND EXISTS (SELECT 1 FROM information_schema.tables t WHERE t.table_schema = c.table_schema " +
-            "AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE') ORDER BY ordinal_position";
-        command.Parameters.Add(new DuckDBParameter(table.Schema));
-        command.Parameters.Add(new DuckDBParameter(table.Name));
-
-        using var reader = command.ExecuteReader();
-        var columns = new List<string>();
-        while (reader.Read()) columns.Add(reader.GetString(0));
-        return columns;
     }
 
     /// What the layers said before anything was written to them, for the shutdown delta.
