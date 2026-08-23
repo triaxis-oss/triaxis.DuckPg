@@ -211,9 +211,10 @@ Every number here was measured on this code. The user-facing summary is [perform
   scan still goes out without its limit, and past 2048 rows `Copy` answers -- measured by someone
   else as 3x *slower* than leaving it off, which is exactly what the number says it should be.
   And the sort key has to be a **number or an instant**: text is a collation DuckDB owns and
-  `string.CompareTo` is not it, so text is left where it works. Nulls sort last either direction,
-  which is DuckDB's `default_null_order` rather than SQL Server's -- the lake renders the clause
-  through today, so DuckDB is what this has to agree with.
+  `string.CompareTo` is not it, so text is left where it works. A null sorts below every value --
+  first ascending and last descending, which is SQL Server's order and neither of the ones
+  `default_null_order` gives: the writer says `NULLS FIRST`/`NULLS LAST` on every term it renders,
+  so the statement DuckDB is asked and the sort done here are the same question.
 - **A number is not always ordered the same in both, and NaN is where they part.** DuckDB sorts it
   as the largest value there is -- ahead of infinity, behind only a null, and flipping with the
   direction the way any other value does. .NET's `CompareTo` puts it *below* negative infinity. So

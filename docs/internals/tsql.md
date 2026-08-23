@@ -20,6 +20,14 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   and always answers at least one row; `LIMIT n%` rounds down and answers none for a small enough
   share. `TSqlWriter.Percent` limits by `CEIL(count(*) * n / 100)` over the body it just rendered --
   reusing the text rather than rendering it twice, so a CTE the body reads is still in scope.
+- **A null's place in an ordering is written down, since every dialect puts it somewhere else.**
+  SQL Server orders a null below every value -- first ascending, last descending. DuckDB's
+  `default_null_order` puts it last either way, and PostgreSQL's answer is the third one, so
+  `TSqlWriter.Order` says `NULLS FIRST`/`NULLS LAST` on every term rather than leaving it to a
+  setting: the setting is the database's and both front doors share it. `SortedRows` orders the same
+  way, which is what keeps the [small-table
+  sort](performance.md#sorting-a-small-table-here-rather-than-in-duckdb) answering what DuckDB was
+  asked.
 - **A `bit` is converted for arithmetic, and only where the column resolves to one.** T-SQL makes a
   `bit` an integer to multiply it; DuckDB refuses `BOOLEAN * INTEGER` outright. The cast is written
   by `TSqlWriter.Operand`, which asks `TypeOf` what the column actually is -- `TSqlContext.Tables`

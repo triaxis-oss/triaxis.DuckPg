@@ -361,10 +361,14 @@ sealed class TSqlWriter(TSqlContext context)
         Put(" / 100.0) AS BIGINT) FROM (").Put(body).Put(") AS \"_percent\")");
     }
 
+    /// SQL Server orders a null below every value -- first ascending, last descending -- where
+    /// DuckDB's `default_null_order` puts it last either way. Said on the term rather than left to
+    /// that setting, which is the database's and not a session's: the other front door is
+    /// PostgreSQL's, whose answer differs again.
     void Order(OrderTerm term)
     {
         Expression(term.Expr);
-        if (term.Descending) Put(" DESC");
+        Put(term.Descending ? " DESC NULLS LAST" : " NULLS FIRST");
     }
 
     void Body(QueryBody body)

@@ -31,9 +31,12 @@ public class TSqlTests
     // TOP is a LIMIT in the wrong place.
     [InlineData("SELECT TOP 5 * FROM orders", """SELECT * FROM "lake"."orders" LIMIT 5""")]
     [InlineData("SELECT TOP (5) * FROM orders ORDER BY id",
-        """SELECT * FROM "lake"."orders" ORDER BY "id" LIMIT 5""")]
+        """SELECT * FROM "lake"."orders" ORDER BY "id" NULLS FIRST LIMIT 5""")]
     [InlineData("SELECT * FROM orders ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
-        """SELECT * FROM "lake"."orders" ORDER BY "id" LIMIT 5 OFFSET 10""")]
+        """SELECT * FROM "lake"."orders" ORDER BY "id" NULLS FIRST LIMIT 5 OFFSET 10""")]
+    // A null is the smallest value SQL Server knows, which is neither of DuckDB's defaults.
+    [InlineData("SELECT * FROM orders ORDER BY id DESC, amount",
+        """SELECT * FROM "lake"."orders" ORDER BY "id" DESC NULLS LAST, "amount" NULLS FIRST""")]
     // A Unicode literal is just a literal.
     [InlineData("SELECT N'hello' AS greeting", """SELECT 'hello' AS "greeting" """)]
     [InlineData("SELECT 'it''s' AS x", """SELECT 'it''s' AS "x" """)]
@@ -216,7 +219,7 @@ public class TSqlTests
     [InlineData("SELECT COUNT(*) OVER (PARTITION BY a) FROM t",
         """SELECT CAST(COUNT(*) OVER (PARTITION BY "a") AS INTEGER) FROM "lake"."t" """)]
     [InlineData("SELECT row_number() OVER (PARTITION BY a ORDER BY b DESC) FROM t",
-        """SELECT row_number() OVER (PARTITION BY "a" ORDER BY "b" DESC) FROM "lake"."t" """)]
+        """SELECT row_number() OVER (PARTITION BY "a" ORDER BY "b" DESC NULLS LAST) FROM "lake"."t" """)]
     [InlineData("WITH c AS (SELECT 1 AS x) SELECT * FROM c",
         """WITH "c" AS (SELECT 1 AS "x") SELECT * FROM "c" """)]
     [InlineData("SELECT a FROM t UNION ALL SELECT b FROM u",
@@ -649,7 +652,7 @@ public class TSqlTests
     public void TopPercentCountsTheRows()
     {
         Assert.Equal(
-            """SELECT * FROM "lake"."orders" ORDER BY "id" LIMIT (SELECT CAST(CEIL(count(*) * 50 / 100.0) """ +
+            """SELECT * FROM "lake"."orders" ORDER BY "id" NULLS FIRST LIMIT (SELECT CAST(CEIL(count(*) * 50 / 100.0) """ +
             """AS BIGINT) FROM (SELECT * FROM "lake"."orders") AS "_percent")""",
             Translate("SELECT TOP 50 PERCENT * FROM orders ORDER BY id"));
     }
@@ -713,7 +716,7 @@ public class TSqlTests
         """INSERT INTO "lake"."Orders" ("OrderID", "Amount") VALUES ($p1, $p2)""")]
     // Its paging shape: TOP with a parameter over a row-numbered derived table.
     [InlineData("SELECT TOP(@p2) [LPA_L1].[OrderID] FROM (SELECT ROW_NUMBER() OVER(ORDER BY [dbo].[Orders].[OrderID] ASC) AS [__rn], [dbo].[Orders].[OrderID] FROM [dbo].[Orders]) [LPA_L1] WHERE [LPA_L1].[__rn] > @p1",
-        """SELECT "LPA_L1"."OrderID" FROM (SELECT ROW_NUMBER() OVER (ORDER BY "lake"."Orders"."OrderID") AS "__rn", "lake"."Orders"."OrderID" FROM "lake"."Orders") AS "LPA_L1" WHERE "LPA_L1"."__rn" > $p1 LIMIT $p2""")]
+        """SELECT "LPA_L1"."OrderID" FROM (SELECT ROW_NUMBER() OVER (ORDER BY "lake"."Orders"."OrderID" NULLS FIRST) AS "__rn", "lake"."Orders"."OrderID" FROM "lake"."Orders") AS "LPA_L1" WHERE "LPA_L1"."__rn" > $p1 LIMIT $p2""")]
     public void RendersWhatAnOrmSends(string tsql, string expected) =>
         Assert.Equal(expected.Trim(), Translate(tsql, "p1", "p2"));
 

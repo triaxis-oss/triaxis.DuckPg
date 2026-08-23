@@ -548,6 +548,28 @@ public class TdsTests : IDisposable
         Assert.Equal(["1/10.50/2026-08-01/first", "2/20.00/2026-08-02/second", "3/30.00/2026-08-03/null"], rows);
     }
 
+    /// SQL Server orders a null below every value, where DuckDB's `default_null_order` puts it last
+    /// whichever way the column is sorted. It holds inside a window as well as over the rows, which
+    /// is the paging shape an ORM sends -- a row numbered from the wrong end pages the wrong rows.
+    [Fact]
+    public void ANullOrdersBelowEveryValue()
+    {
+        using var connection = Open();
+
+        using var rows = new SqlCommand("SELECT order_id FROM orders ORDER BY note", connection);
+        using (var reader = rows.ExecuteReader())
+        {
+            var order = new List<int>();
+            while (reader.Read()) order.Add(reader.GetInt32(0));
+            Assert.Equal([3, 1, 2], order);
+        }
+
+        using var first = new SqlCommand(
+            "SELECT order_id FROM (SELECT order_id, ROW_NUMBER() OVER (ORDER BY note) AS rn FROM orders) AS t " +
+            "WHERE rn = 1", connection);
+        Assert.Equal(3, first.ExecuteScalar());
+    }
+
     /// An application written against SQL Server casts what COUNT returns to `int`, and DuckDB
     /// counts in BIGINT -- so the count comes back narrowed, and COUNT_BIG is how to ask for the
     /// wide one, exactly as it is on the database this stands in for.

@@ -66,6 +66,21 @@ public class OrderingTests : IDisposable
         Assert.Equal(Ask(Lake(false), sql), Ask(Lake(true), sql));
     }
 
+    /// Two paths agreeing is worth only as much as the order they agree on, and null placement is
+    /// where both of them used to be DuckDB's rather than SQL Server's: a null is the smallest value
+    /// there is, so it comes first ascending and last descending.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ANullSortsBelowEveryValue(bool fast)
+    {
+        var lake = Lake(fast);
+        Assert.Equal(["2|<null>", "5|<null>", "4|-3.25", "1|10.5", "3|10.5", "6|99"],
+                     Ask(lake, "SELECT [id], [amount] FROM [rows] ORDER BY [amount], [id]"));
+        Assert.Equal(["6|99", "1|10.5", "3|10.5", "4|-3.25", "2|<null>", "5|<null>"],
+                     Ask(lake, "SELECT [id], [amount] FROM [rows] ORDER BY [amount] DESC, [id]"));
+    }
+
     /// A tie has to break the same way too, or a TOP 1 picks a different row from each path. Ordered
     /// by a column with duplicates, so what decides the rest is whatever each path does with equals.
     [Fact]
