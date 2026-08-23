@@ -230,9 +230,10 @@ abstract class Sorted : IDisposable
     public abstract void Fill(IValues values, int column);
     public abstract void Dispose();
 
-    /// Where one row falls against another by this key alone. Nulls last whichever way the column is
-    /// sorted, which is what DuckDB's `default_null_order` means -- so the direction is taken here
-    /// rather than by negating an answer that already placed them.
+    /// Where one row falls against another by this key alone. A null is below every value, the way
+    /// SQL Server orders one, so it turns with the direction like anything else -- and the direction
+    /// is taken here rather than by negating an answer, since a `CompareTo` is only promised to have
+    /// the right sign.
     public abstract int Compare(int left, int right, bool descending);
 
     /// The types `FastOrder.Sortable` lets through, each with an array of its own; nothing else can
@@ -286,15 +287,18 @@ class Sorted<T>(int rows) : Sorted where T : IComparable<T>
     }
 
     public override int Compare(int left, int right, bool descending) =>
-        nulls[left] ? (nulls[right] ? 0 : 1)
-        : nulls[right] ? -1
-        : descending ? Order(values[right], values[left]) : Order(values[left], values[right]);
+        descending ? Ascending(right, left) : Ascending(left, right);
+
+    int Ascending(int left, int right) =>
+        nulls[left] ? (nulls[right] ? 0 : -1)
+        : nulls[right] ? 1
+        : Order(values[left], values[right]);
 
     protected virtual int Order(T left, T right) => left.CompareTo(right);
 }
 
-/// DuckDB sorts NaN as the largest value there is -- ahead of infinity, behind only a null, and it
-/// flips with the direction the way any other value does. .NET's `CompareTo` puts it below negative
+/// DuckDB sorts NaN as the largest value there is -- ahead of infinity, and it flips with the
+/// direction the way any other value does. .NET's `CompareTo` puts it below negative
 /// infinity, so a column holding one comes back in an order DuckDB would never have produced.
 sealed class Real<T>(int rows) : Sorted<T>(rows) where T : INumberBase<T>, IComparable<T>
 {
@@ -321,7 +325,10 @@ sealed class Boxed(int rows) : Sorted
     public override void Dispose() => ArrayPool<object?>.Shared.Return(values, clearArray: true);
 
     public override int Compare(int left, int right, bool descending) =>
-        values[left] is not { } a ? (values[right] is null ? 0 : 1)
-        : values[right] is not { } b ? -1
-        : descending ? Comparer<object>.Default.Compare(b, a) : Comparer<object>.Default.Compare(a, b);
+        descending ? Ascending(right, left) : Ascending(left, right);
+
+    int Ascending(int left, int right) =>
+        values[left] is not { } a ? (values[right] is null ? 0 : -1)
+        : values[right] is not { } b ? 1
+        : Comparer<object>.Default.Compare(a, b);
 }

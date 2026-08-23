@@ -20,6 +20,7 @@ default expressions, so everything below is what those may contain too.
 |---|---|
 | `SELECT TOP 5`, `OFFSET … FETCH NEXT` | `LIMIT` / `OFFSET` |
 | `SELECT TOP 50 PERCENT … ORDER BY …` | `LIMIT` the counted share, rounded up as SQL Server rounds it |
+| `ORDER BY x`, `ORDER BY x DESC` | the same, with `NULLS FIRST` / `NULLS LAST` — a null sorts below every value, as SQL Server sorts one |
 | `a LEFT JOIN b JOIN c ON … ON …` — a join nested in a join | the same tree, parenthesized |
 | `INNER LOOP JOIN`, `HASH`, `MERGE`, `REMOTE` join hints | dropped |
 | `WITH (NOLOCK)` and other table hints | dropped |
