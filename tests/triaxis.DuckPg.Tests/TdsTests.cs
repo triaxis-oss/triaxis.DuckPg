@@ -1295,6 +1295,74 @@ public class TdsTests : IDisposable
         Assert.Equal(3, parameter.Value);
     }
 
+    /// A variable the batch declared is one of its parameters with nobody on the other end: it is
+    /// bound where the caller's are, so everything reads it the same way.
+    [Fact]
+    public void ADeclaredVariableIsBoundLikeAParameter()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "DECLARE @amount decimal(10,2) = 20.00 SELECT order_id FROM orders WHERE amount = @amount", connection);
+
+        Assert.Equal(2, command.ExecuteScalar());
+    }
+
+    /// Declared and not given anything is null, which is what SQL Server starts one as.
+    [Fact]
+    public void ADeclaredVariableStartsNull()
+    {
+        using var connection = Open();
+        Assert.Equal(DBNull.Value, new SqlCommand("DECLARE @n int; SELECT @n", connection).ExecuteScalar());
+    }
+
+    /// `SET @x = …` and `SELECT @x = …` are the same statement here, and what either puts in the
+    /// variable is what the rest of the batch reads out of it.
+    [Fact]
+    public void AnAssignmentIsWhatTheRestOfTheBatchReads()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "DECLARE @n int; SET @n = (SELECT COUNT(*) FROM orders); SELECT @n = @n * 2; SELECT @n", connection);
+
+        Assert.Equal(6, command.ExecuteScalar());
+    }
+
+    /// The initializer is a query like any other -- it may name a table, and it may name a variable
+    /// declared before it.
+    [Fact]
+    public void ADeclaredVariableIsInitializedByAQuery()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "DECLARE @top int = (SELECT MAX(order_id) FROM orders), @next int = @top + 1; SELECT @next", connection);
+
+        Assert.Equal(4, command.ExecuteScalar());
+    }
+
+    /// A variable belongs to the batch that declared it, so the next statement on the same
+    /// connection has never heard of it -- which is what SQL Server does with one too.
+    [Fact]
+    public void AVariableDoesNotOutliveItsBatch()
+    {
+        using var connection = Open();
+        new SqlCommand("DECLARE @n int = 1; SELECT @n", connection).ExecuteScalar();
+
+        var error = Assert.Throws<SqlException>(() => new SqlCommand("SELECT @n", connection).ExecuteScalar());
+        Assert.Contains("undeclared variable", error.Message);
+    }
+
+    /// What a table variable declares is a table, and it is refused by name rather than mistaken
+    /// for something a lake can make.
+    [Fact]
+    public void ATableVariableIsRefused()
+    {
+        using var connection = Open();
+        var error = Assert.Throws<SqlException>(
+            () => new SqlCommand("DECLARE @t TABLE (id int)", connection).ExecuteNonQuery());
+
+        Assert.Contains("table variable", error.Message);
+    }
+
     /// Assigning and returning at once is neither, and SQL Server refuses it too.
     [Fact]
     public void ASelectCannotBothAssignAndReturn()

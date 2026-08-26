@@ -66,6 +66,18 @@ The dialect as a client meets it is [tsql.md](../tsql.md); this is how the parse
   tokens for the parameters the RPC marked BY_REF_VALUE. The DONE token carries no count, because
   SQL Server does not report one for an assignment select -- `INSERT …; SELECT @id = …` through
   `ExecuteNonQuery` has to answer 1 rather than 2.
+- **A declared variable is a parameter the batch bound itself, and the batch is where it lives.**
+  `TdsSession.Run` copies the caller's parameters into a dictionary of the batch's own and
+  `DeclareStatement` puts a variable there, so `TSqlWriter.Variable` renders it as the `$name` it
+  already renders a parameter as and nothing below the statement knows the difference. The copy is
+  the scope: a variable goes when the batch ends, which is what SQL Server does with one, and what
+  goes back to the caller stays `assigned` rather than this. An assignment writes to both -- the
+  caller's answer and the value the next statement in the batch reads are not the same thing.
+  `TSqlParser` keeps the declared types so an assignment casts to what the variable *is*: a
+  parameter's type came off the wire with its value and is left alone, since the caller's own
+  declaration is what it goes back in. A table variable is refused rather than made a temporary
+  table: `SELECT … INTO #t` already makes one, and quietly answering `@t` with something of another
+  name and another lifetime is worse than saying no.
 - **DuckDB has no savepoints, and half a transaction cannot be made out of what it does have.**
   `SAVE TRANSACTION` renders to nothing -- marking a point costs nothing -- but
   `ROLLBACK TRANSACTION <name>` throws instead of rendering a plain `ROLLBACK` or nothing at all:
