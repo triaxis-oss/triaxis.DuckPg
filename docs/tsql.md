@@ -142,6 +142,27 @@ through `ExecuteNonQuery`; the values go back as the call's return values, in th
 declared, and a statement that both assigned and returned is refused the way SQL Server refuses it.
 A query that found no rows leaves the parameters as they went in.
 
+A batch may also declare variables of its own:
+
+```sql
+DECLARE @cutoff date = DATEADD(day, -7, GETDATE()), @orders int
+SET @orders = (SELECT COUNT(*) FROM [orders] WHERE [ordered_on] >= @cutoff)
+SELECT @orders
+```
+
+A declared variable is a parameter the batch bound itself: it is read wherever one is, it starts
+null, and `SET @x = …` and `SELECT @x = …` are the same statement — both assign, and what either
+puts in a variable is what the rest of the batch reads out of it. What it holds is what it was
+declared as rather than what the expression happened to make, so `DECLARE @n int = 1.7` is 1. It
+lives as long as the batch does: the next statement on the same connection has never heard of it,
+which is what SQL Server does with one too. A table variable is refused by name — what `@t TABLE (…)`
+declares is a table, and a lake's tables are the files under it; `SELECT … INTO #t` is how a batch
+makes one of its own.
+
+Two differences from SQL Server: a variable declared twice is not an error here, and `SET @x =
+(SELECT …)` over several rows takes the last of them rather than failing, which is what the `SELECT`
+form does.
+
 An ORM that qualifies everything it writes — LLBLGen Pro among them — is what all of this is for:
 table references, column references and `TOP(@p)` paging over a row-numbered derived table all land
 on the lake without the application knowing what it is talking to.
@@ -186,7 +207,7 @@ query, EXPLAIN is DuckDB's own plan; where it is several, it lists them in order
 ## What is refused
 
 A style or a hash format that is not covered is named rather than approximated, and so is a statement
-the parser does not cover at all: DDL, procedural batches, cursors, `DECLARE` and the `MERGE`
+the parser does not cover at all: DDL, procedural batches, cursors, table variables and the `MERGE`
 branches above are refused with a syntax error naming them and its position, rather than passed
 through to fail somewhere less obvious. `LIKE` patterns use `%` and `_`; SQL Server's `[a-z]` ranges
 have no DuckDB equivalent.

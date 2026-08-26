@@ -157,6 +157,48 @@ public class TSqlTests
         Assert.Contains("assigns to variables or returns rows", refused.Message);
     }
 
+    /// A variable holds what it was declared as rather than what it was given, so the initializer
+    /// and every later assignment are cast -- which is the whole difference between a declared
+    /// variable and a parameter the caller bound, whose type came off the wire with its value.
+    [Fact]
+    public void ADeclaredVariableIsAssignedInTheTypeItWasDeclared()
+    {
+        var statements = TSqlParser.Parse("DECLARE @a int = 1.7, @b nvarchar(10); SET @a = @b; SELECT @a = 2.5");
+        var context = new TSqlContext("lake", new Dictionary<string, string>(),
+            new HashSet<string>(["a", "b"], StringComparer.OrdinalIgnoreCase), "sa");
+
+        var declare = Assert.IsType<DeclareStatement>(statements[0]);
+        Assert.Equal(["a", "b"], declare.Variables.Select(v => v.Name));
+        Assert.Equal("CAST(1.7 AS INTEGER)", TSqlWriter.Write(declare.Variables[0].Value!, context));
+
+        // One with no initializer is null until something puts a value in it.
+        Assert.Null(declare.Variables[1].Value);
+
+        // Both assignment forms are the same statement, and both cast to the declared type.
+        Assert.Equal("SELECT CAST($b AS INTEGER)", TSqlWriter.Write(statements[1], context));
+        Assert.Equal("SELECT CAST(2.5 AS INTEGER)", TSqlWriter.Write(statements[2], context));
+        Assert.Equal(["a"], Assert.IsType<AssignStatement>(statements[1]).Variables);
+    }
+
+    /// A parameter the caller declared is left alone: what it goes back in is the caller's own
+    /// declaration, and a cast here would be one this end made up.
+    [Fact]
+    public void AnAssignmentToACallersParameterIsNotCast()
+    {
+        var context = new TSqlContext("lake", new Dictionary<string, string>(),
+            new HashSet<string>(["p1"], StringComparer.OrdinalIgnoreCase), "sa");
+
+        Assert.Equal("SELECT 1.7", TSqlWriter.Write(TSqlParser.Parse("SELECT @p1 = 1.7")[0], context));
+    }
+
+    /// What a table variable declares is a table, and a lake's tables are the files under it.
+    [Fact]
+    public void ATableVariableIsRefused()
+    {
+        var refused = Assert.Throws<TSqlException>(() => TSqlParser.Parse("DECLARE @t TABLE ([id] int)"));
+        Assert.Contains("table variable", refused.Message);
+    }
+
     /// The generated key is written into the statement as the value it has now, in the type SQL
     /// Server answers all three with.
     [Fact]

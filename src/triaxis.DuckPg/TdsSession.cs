@@ -287,9 +287,15 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     /// Runs one client statement, or several: a batch is a list of statements sharing a response,
     /// and every statement but the last says there is more to come.
-    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken)
+    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> bound, byte doneToken)
     {
         var statements = TSqlParser.Parse(sql);
+
+        // What the batch has to work with: the caller's parameters, and whatever it declares of its
+        // own beside them. A copy, because a variable lives as long as the batch that declared it
+        // and no longer -- and because what goes back to the caller is what the batch assigned,
+        // which is `assigned` rather than this.
+        var parameters = new Dictionary<string, Parameter>(bound, StringComparer.OrdinalIgnoreCase);
 
         if (statements.Count == 0)
         {
@@ -323,6 +329,17 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 // next message lands, and the stream is what writes.
                 case InsertBulkStatement armed:
                     bulk = armed;
+                    Done(msg, done, status, 0);
+                    continue;
+
+                // A variable is a parameter the batch bound itself, so declaring one is putting it
+                // where the caller's are: everything below already renders `@x` as the value under
+                // that name. One with no initializer is null, which is what SQL Server starts one as.
+                case DeclareStatement declare:
+                    foreach (var variable in declare.Variables)
+                        parameters[variable.Name] = new Parameter(
+                            variable.Value is null ? null : Value(variable.Value, parameters),
+                            new TdsColumn(TdsTypes.NVarChar, TdsTypes.Max), false);
                     Done(msg, done, status, 0);
                     continue;
             }
@@ -359,7 +376,18 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             gateway.Config.SortSmallTables ? gateway.Catalog.Rows : null,
             identity, gateway.IdentityOf);
 
-    void Execute(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken, bool last,
+    /// What a declared variable starts as. The initializer is produced by a query like any other --
+    /// it may name a table, or another variable declared before it -- and what the variable holds is
+    /// read off the row that query makes.
+    object? Value(Expr expr, Dictionary<string, Parameter> parameters)
+    {
+        var plan = gateway.Translate("SELECT " + TSqlWriter.Write(expr, Context(parameters)));
+        using var command = Command(plan.Steps[^1], parameters);
+        using var reader = Execute(command);
+        return reader.Read() && !reader.IsDBNull(0) ? reader.GetValue(0) : null;
+    }
+
+    void Execute(TdsMsg msg, Plan plan, Dictionary<string, Parameter> parameters, byte doneToken, bool last,
                  Translated? translated = null)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
@@ -386,7 +414,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         gateway.ExitTurn();
     }
 
-    void Perform(TdsMsg msg, Plan plan, IReadOnlyDictionary<string, Parameter> parameters, byte doneToken,
+    void Perform(TdsMsg msg, Plan plan, Dictionary<string, Parameter> parameters, byte doneToken,
                  bool last, Translated? translated)
     {
         Checked(plan, parameters);
@@ -411,7 +439,16 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 while (reader.Read())
                 {
                     for (var i = 0; i < variables.Count; i++)
-                        assigned[variables[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    {
+                        var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                        assigned[variables[i]] = value;
+
+                        // The same value to the rest of the batch, which reads a variable as what
+                        // was last put in it -- an assignment the caller never asked back for is
+                        // still one the next statement is about.
+                        if (parameters.TryGetValue(variables[i], out var parameter))
+                            parameters[variables[i]] = parameter with { Value = value };
+                    }
                     rows++;
                 }
 

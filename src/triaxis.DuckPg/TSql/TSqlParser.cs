@@ -7,6 +7,11 @@ sealed class TSqlParser
     readonly List<Token> tokens;
     int pos;
 
+    /// What each variable the batch declared was declared as, which is what an assignment to it
+    /// casts to -- the type belongs to the variable rather than to whatever is put in it. A
+    /// parameter the caller bound is not in here: its type came off the wire with its value.
+    readonly Dictionary<string, TypeRef> declared = new(StringComparer.OrdinalIgnoreCase);
+
     TSqlParser(List<Token> tokens) => this.tokens = tokens;
 
     public static List<Statement> Parse(string sql)
@@ -96,6 +101,7 @@ sealed class TSqlParser
         if (Peek.Is("update")) return Update();
         if (Peek.Is("delete")) return Delete();
         if (Peek.Is("merge")) return Merge();
+        if (Peek.Is("declare")) return Declare();
         if (Peek.Is("set")) return SetOption();
         if (Peek.Is("exec") || Peek.Is("execute")) return Execute();
         if (Peek.Is("begin") || Peek.Is("commit") || Peek.Is("rollback") || Peek.Is("save")) return Transaction();
@@ -128,7 +134,7 @@ sealed class TSqlParser
     /// a comparison against a variable is projected by parenthesising it. All of the list or none of
     /// it, which is where SQL Server draws the line too -- a statement that both assigned and
     /// returned would be neither.
-    static Statement? Assigning(Query query)
+    Statement? Assigning(Query query)
     {
         if (query.Body is not SelectBody body) return null;
 
@@ -145,9 +151,45 @@ sealed class TSqlParser
         {
             Body = body with
             {
-                Items = [.. body.Items.Select(item => new SelectItem(((BinaryExpr)item.Expr).Right, null))],
+                Items = [.. body.Items.Select((item, i) =>
+                    new SelectItem(Assigned(targets[i]!, ((BinaryExpr)item.Expr).Right), null))],
             },
         });
+    }
+
+    /// What a variable is given, in the type it was declared as. A parameter the caller bound keeps
+    /// whatever the expression makes, since the caller's own declaration is what it goes back in.
+    Expr Assigned(string variable, Expr value) =>
+        declared.TryGetValue(variable, out var type) ? new CastExpr(value, type) : value;
+
+    /// `DECLARE @a int = 1, @b nvarchar(50)`. A table variable is refused by name rather than
+    /// parsed: what it declares is a table, and a lake's tables are the files under it.
+    Statement Declare()
+    {
+        Expect("declare");
+        var variables = new List<VariableDeclaration>();
+
+        do
+        {
+            if (Peek.Kind != TokenKind.Variable) throw Unexpected("expected a variable name");
+            var name = Take().Text;
+            Accept("as");
+
+            if (Peek.Is("table"))
+                throw new TSqlException($"@{name} is a table variable, which is not supported: a lake's tables " +
+                                        "are the files under it, and `SELECT … INTO #t` makes a temporary one",
+                                        Peek.Position);
+
+            var type = Type();
+            var value = AcceptOperator("=") ? new CastExpr(Expression(), type) : null;
+
+            // Declared as the statement is read, so the initializer of the one after it in the same
+            // DECLARE assigns in this type rather than in whatever the expression made.
+            declared[name] = type;
+            variables.Add(new VariableDeclaration(name, type, value));
+        } while (AcceptOperator(","));
+
+        return new DeclareStatement(variables);
     }
 
     /// `DROP TABLE [IF EXISTS] #t`, which is how a client clears the scratch table it made. What a
@@ -651,16 +693,13 @@ sealed class TSqlParser
     static readonly HashSet<string> StatementStarters = new(StringComparer.OrdinalIgnoreCase)
     {
         "select", "insert", "update", "delete", "merge", "set", "exec", "execute",
-        "begin", "commit", "rollback", "save", "drop", "with", "values", "explain",
+        "begin", "commit", "rollback", "save", "drop", "with", "values", "explain", "declare",
     };
 
-    /// `SET` here is only the session-option form; `SET @x = …` needs variables, which a lake has
-    /// no place to keep.
     Statement SetOption()
     {
         Expect("set");
-        if (Peek.Kind == TokenKind.Variable)
-            throw new TSqlException("SET of a variable is not supported", Peek.Position);
+        if (Peek.Kind == TokenKind.Variable) return SetVariable();
 
         var words = new List<string>();
         while (Peek.Kind is TokenKind.Word or TokenKind.Number or TokenKind.String
@@ -672,6 +711,21 @@ sealed class TSqlParser
 
         if (words.Count == 0) throw Unexpected("expected an option name");
         return new SetOptionStatement(string.Join(' ', words));
+    }
+
+    /// `SET @x = <expr>`, which is `SELECT @x = <expr>` with one variable and nothing to select
+    /// from -- and is the same statement here, so one path assigns. What SQL Server does that this
+    /// does not is refuse a subquery that found more than one row; here the last one wins, as it
+    /// does for the SELECT form.
+    Statement SetVariable()
+    {
+        var name = Take().Text;
+        ExpectOperator("=");
+        var value = Assigned(name, Expression());
+
+        return new AssignStatement([name],
+            new Query([], new SelectBody(false, null, false, [new SelectItem(value, null)],
+                                         null, null, null, [], null), [], null, null));
     }
 
     /// A procedure call, arguments and all. `EXEC ('…')` and `EXEC @rc = …` are refused here rather

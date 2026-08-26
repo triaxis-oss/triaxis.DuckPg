@@ -21,6 +21,16 @@ sealed record ExplainStatement(Statement Inner, bool Analyze) : Statement;
 /// like any other; `Variables` names what each of its columns fills, in order.
 sealed record AssignStatement(List<string> Variables, Query Query) : Statement;
 
+/// `DECLARE @a int = 1, @b nvarchar(50)` — the variables a batch has of its own, which are the
+/// caller's parameters with nobody on the other end: they live as long as the batch does and go
+/// nowhere when it ends. A table variable is not one of these — what `@t TABLE (…)` declares is a
+/// table — and is refused rather than parsed.
+sealed record DeclareStatement(List<VariableDeclaration> Variables) : Statement;
+
+/// `Value` is the initializer, already wrapped in the cast the declaration implies: what a variable
+/// holds is what it was declared as, not what the expression it was given happened to be.
+sealed record VariableDeclaration(string Name, TypeRef Type, Expr? Value);
+
 /// `SELECT … INTO #t FROM …` — T-SQL's CTAS, and a statement rather than a query: what it returns
 /// is a table. Only a temporary one, since a lake's tables are its files.
 sealed record SelectIntoStatement(TableName Target, Query Query) : Statement;
