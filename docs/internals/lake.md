@@ -64,6 +64,17 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   plain scalars. The conversion walks the node model and writes through `Utf8JsonWriter`.
 - JSON type inference reads every integer as `BIGINT`; that is why a parquet layer's type wins, and
   why a dacpac is worth having.
+- **A parquet source's columns are read out of the footers, not learned by binding a statement.**
+  `Layer.Footers` asks `parquet_schema` once for every glob a lake holds, before the first table is
+  built, and `Layer.Columns` takes the answer from there; a source it cannot answer for -- files that
+  disagree, a nested column, a `k=v` partition -- is described as it always was. The reasoning, and
+  what the bind was costing, is in
+  [performance](performance.md#what-a-start-asks-the-catalog). What matters here is that the
+  attribution is duckpg's: DuckDB is asked about every file at once and answers with file names, so
+  `Reaches` is what says which source asked for one. It knows exactly the globs `Entries` writes --
+  literal segments, `*` for a partition directory, `**` for any depth, a name or `*.parquet` at the
+  end -- and a glob it fails to match costs the description it was always going to cost rather than
+  the wrong columns.
 
 ## The write path
 

@@ -228,17 +228,145 @@ static class Layer
         return columns;
     }
 
+    /// The same, for a source the footers already answered for. What a `DESCRIBE` costs is the bind,
+    /// which is flat -- the same price whatever the file holds -- so a lake of many tables pays it
+    /// per table for something every one of those files already says out loud.
+    ///
+    /// A partitioned source is still asked. What a `k=v` directory contributes is a column of the
+    /// path rather than of the file, and what type it is, is DuckDB's own reading of the value:
+    /// there is nothing in a footer to read it out of.
+    public static List<Column> Columns(DuckDBConnection conn, LayerSource source,
+                                       IReadOnlyDictionary<string, List<Column>> footers) =>
+        footers.TryGetValue(Glob(source), out var own)
+            ? source.Hive ? [.. own, .. Partitioned(conn, source, source.Path, own)] : own
+            : Columns(conn, source);
+
     /// The columns a source really has: its files' own, plus the partitions the layer declares.
     /// A partition key taken from the path *above* the layer is an artifact of where the lake
     /// sits, so a scan with hive off is what says which columns are the files' own.
     static List<Column> Columns(DuckDBConnection conn, LayerSource source, string glob)
     {
         var own = Describe(conn, Query(source, glob, hive: false));
-        if (!source.Hive) return own;
+        return source.Hive ? [.. own, .. Partitioned(conn, source, glob, own)] : own;
+    }
 
-        return [.. own, .. Describe(conn, Query(source, glob, hive: true))
+    static IEnumerable<Column> Partitioned(DuckDBConnection conn, LayerSource source, string glob,
+                                           List<Column> own) =>
+        Describe(conn, Query(source, glob, hive: true))
             .Where(c => source.Partitions.Contains(c.Name, StringComparer.OrdinalIgnoreCase)
-                        && !own.Any(o => o.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)))];
+                        && !own.Any(o => o.Name.Equals(c.Name, StringComparison.OrdinalIgnoreCase)));
+
+    // ---- footers ---------------------------------------------------------------------------------
+
+    /// Every parquet source's columns, out of the files' own footers and in one question. A lake
+    /// starting otherwise binds a statement a table to learn what the table already says: binding is
+    /// flat in the column count, the catalog size and the query shape, so there is no cheaper
+    /// statement to issue and the only thing left is to issue none. `parquet_schema` is DuckDB
+    /// reading the same footers a `DESCRIBE` reads, for every file at once, and `duckdb_type` is its
+    /// own mapping of them -- so the answer is DuckDB's rather than a second reading of the format.
+    ///
+    /// Keyed by the source's path, which is what its file set is.
+    ///
+    /// Only a source whose files all say the same thing is answered here. `union_by_name` widens a
+    /// column to a type holding what every file put in it and appends what a later file adds, and
+    /// that arithmetic is the binder's rather than anything a footer holds -- so a source whose
+    /// files disagree is left to be described, as is one carrying a nested column, which a footer
+    /// spreads over a row a level and DuckDB only puts together as it binds.
+    public static Dictionary<string, List<Column>> Footers(DuckDBConnection conn,
+                                                           IEnumerable<LayerSource> sources)
+    {
+        var found = new Dictionary<string, List<Column>>(StringComparer.Ordinal);
+        var globs = sources.Where(s => s.Format == LayerFormat.Parquet).Select(Glob)
+                           .Distinct(StringComparer.Ordinal).ToList();
+        if (globs.Count == 0) return found;
+
+        Dictionary<string, List<Column>?> files;
+        try
+        {
+            files = Schemas(conn, globs);
+        }
+        catch (DuckDBException)
+        {
+            // One question about every file answers for all of them or for none, so a glob that has
+            // stopped matching -- or a DuckDB whose `parquet_schema` has no `duckdb_type` to give --
+            // leaves every source to be asked for itself, which is where the answer came from
+            // before there was a question this cheap.
+            return found;
+        }
+
+        // Split once each rather than once a glob each is held up against. Either separator, since
+        // what comes back is the platform's own path and the glob that asked for it was normalized.
+        var paths = files.Keys.ToDictionary(f => f, f => f.Split('/', '\\'), StringComparer.Ordinal);
+
+        foreach (var glob in globs)
+        {
+            var segments = glob.Split('/');
+            List<Column>? columns = null;
+
+            foreach (var own in files.Where(f => Reaches(segments, 0, paths[f.Key], 0))
+                                     .Select(f => f.Value))
+            {
+                if (own is null || (columns is not null && !columns.SequenceEqual(own)))
+                {
+                    columns = null;
+                    break;
+                }
+                columns = own;
+            }
+
+            // `filename` is the scan's own column, injected and re-exposed as the internal `_file`.
+            if (columns is not null) found[glob] = [.. columns.Where(c => c.Name != "filename")];
+        }
+
+        return found;
+    }
+
+    /// What each file's footer says, or null for one holding a column no single footer row describes.
+    static Dictionary<string, List<Column>?> Schemas(DuckDBConnection conn, List<string> globs)
+    {
+        var files = new Dictionary<string, List<Column>?>(StringComparer.Ordinal);
+
+        using var command = conn.CreateCommand();
+        command.CommandText = "SELECT file_name, name, duckdb_type, column_id FROM parquet_schema([" +
+                              string.Join(", ", globs.Select(SqlText.Literal)) + "])";
+        using var reader = command.ExecuteReader();
+
+        while (reader.Read())
+        {
+            var file = reader.GetString(0);
+            // Column 0 is the schema's root, which every file starts with and no column is.
+            if (Convert.ToInt64(reader.GetValue(3)) == 0) files[file] = [];
+            else if (reader.IsDBNull(2) || files.GetValueOrDefault(file) is not { } own) files[file] = null;
+            else own.Add(new Column(reader.GetString(1), reader.GetString(2)));
+        }
+
+        return files;
+    }
+
+    static string Glob(LayerSource source) => source.Path.Replace('\\', '/');
+
+    /// Whether a glob reaches a file DuckDB expanded it to, which is what says who asked for it. The
+    /// globs are the ones `Entries` writes and nothing else: literal segments, `*` for one partition
+    /// directory, `**` for any number of them, and a name or `*.parquet` at the end.
+    static bool Reaches(string[] glob, int g, string[] path, int p)
+    {
+        for (; g < glob.Length; g++, p++)
+        {
+            if (glob[g] == "**")
+                return Enumerable.Range(p, path.Length - p + 1)
+                                 .Any(from => Reaches(glob, g + 1, path, from));
+            if (p == path.Length) return false;
+
+            var reached = glob[g] switch
+            {
+                "*" => true,
+                ['*', .. var suffix] => path[p].EndsWith(suffix, StringComparison.Ordinal),
+                var literal => literal == path[p],
+            };
+            if (!reached) return false;
+        }
+
+        return p == path.Length;
     }
 
     public static List<Column> Describe(DuckDBConnection conn, string scan)

@@ -1,7 +1,44 @@
+using DuckDB.NET.Data;
+using Microsoft.Extensions.Logging.Abstractions;
+
 namespace triaxis.DuckPg.Tests;
 
 public class LayerTests
 {
+    /// The whole of what reading the footers promises: the same answer describing would have given,
+    /// for every shape a layer directory comes in. It is the shapes it declines to answer for that
+    /// make this worth asserting -- a reading that quietly stopped covering the ordinary one would
+    /// still pass a test that only compared what it did answer.
+    [Fact]
+    public void ReadingAFooterSaysWhatDescribingWouldHave()
+    {
+        using var lake = new TestLake()
+            .Parquet("layer", "flat", "SELECT 1::INTEGER AS id, 'a' AS nm, 1.5::DECIMAL(9,2) AS amount")
+            .Parquet("layer", "nested", "SELECT 1 AS id, [1, 2] AS xs, {'a': 1, 'b': 'x'} AS s")
+            .Parquet("layer", "gathered", "SELECT 1 AS id, 'a' AS nm", "gathered/one")
+            .Parquet("layer", "gathered", "SELECT 2 AS id, 'b' AS nm", "gathered/deep/two")
+            .Parquet("layer", "ragged", "SELECT 1::INTEGER AS id", "ragged/one")
+            .Parquet("layer", "ragged", "SELECT 2::BIGINT AS id, 9 AS extra", "ragged/two")
+            .Parquet("layer", "orders", "SELECT 1 AS id, 'o' AS nm", "db=one/y=2020/orders")
+            .Parquet("layer", "orders", "SELECT 2 AS id, 'p' AS nm", "db=two/y=2021/orders");
+
+        DuckDbLibrary.Register();
+        using var duck = new DuckDBConnection("Data Source=:memory:");
+        duck.Open();
+
+        var scanned = Layer.Scan(lake.At("layer"), 0, NullLogger.Instance).ToList();
+        var footers = Layer.Footers(duck, scanned.Select(s => s.Source));
+
+        foreach (var (table, source) in scanned)
+            Assert.Equal(Layer.Columns(duck, source), Layer.Columns(duck, source, footers));
+
+        // `flat`, `gathered` and `orders`. A nested column is not in one footer row, and `ragged`'s
+        // files disagree -- what `union_by_name` makes of that is the binder's arithmetic.
+        Assert.Equal(3, footers.Count);
+        Assert.Equal(["flat", "gathered", "nested", "orders", "ragged"],
+            scanned.Select(s => s.Table).Order(StringComparer.Ordinal));
+    }
+
     [Fact]
     public void FormatsStackInOneList()
     {

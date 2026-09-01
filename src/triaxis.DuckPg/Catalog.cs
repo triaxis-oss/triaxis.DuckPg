@@ -170,6 +170,13 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     public void Build(DuckDBConnection conn)
     {
+        // A parquet footer is read to build the catalog, again to bind each view over it, and again
+        // by every statement through one -- a view is bound on every execution. Global rather than
+        // this connection's: every session borrows a connection of its own onto this database, and
+        // a cache none of them can see is one they all pay around. A file that changes is read
+        // again, which is what keeps a rewritten write layer honest.
+        Exec(conn, "SET GLOBAL parquet_metadata_cache=true");
+
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {SqlText.Quote(config.Schema)}");
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {LayerSchema}");
         Exec(conn, $"CREATE SCHEMA IF NOT EXISTS {WriteLayer.Schema}");
@@ -208,7 +215,15 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     {
         standing = Standing(conn);
 
-        foreach (var (name, sources, declaredWrite) in Sources())
+        var found = Sources().ToList();
+
+        // Every parquet file's columns, before the first table is built. Asked per table it is the
+        // largest thing a lake serving views does: 89.7% of a start's CPU was DuckDB binding one
+        // statement a table to learn the shape the files were already carrying.
+        var footers = Layer.Footers(conn, found.SelectMany(
+            s => s.Write is null ? s.Layers : [.. s.Layers, s.Write]));
+
+        foreach (var (name, sources, declaredWrite) in found)
         {
             var settings = config.Table(name);
 
@@ -223,10 +238,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             foreach (var files in shapes.Append(writeShapes)) Diagnose(name, keyed, files);
 
             var layers = Materialize(conn, name,
-                [.. sources.Zip(shapes, (source, files) => Layer.Keyed(source, keyed, files)!)]);
+                [.. sources.Zip(shapes, (source, files) => Layer.Keyed(source, keyed, files)!)], footers);
             var writeSource = Layer.Keyed(declaredWrite, keyed, writeShapes);
             var describedWrite = writeSource is null ? null
-                : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource));
+                : new TableLayer(writeSource, "", Layer.Columns(conn, writeSource, footers));
 
             List<Column> columns = schema.Columns(name) is { } declared
                 ? [.. declared.Select(c => Defaulted(conn, name, c))]
@@ -623,7 +638,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     /// Parquet is scanned where it lies -- that is what the format is for. Everything else is
     /// materialized once, so a query neither re-reads the file nor pays type inference again.
-    List<TableLayer> Materialize(DuckDBConnection conn, string name, List<LayerSource> sources)
+    List<TableLayer> Materialize(DuckDBConnection conn, string name, List<LayerSource> sources,
+                                 IReadOnlyDictionary<string, List<Column>> footers)
     {
         var layers = new List<TableLayer>();
         foreach (var source in sources.OrderBy(s => s.Seq))
@@ -631,7 +647,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (source.Format == LayerFormat.Parquet)
             {
                 layers.Add(new TableLayer(source, Layer.Query(source, source.Path, source.Hive),
-                                          Layer.Columns(conn, source)));
+                                          Layer.Columns(conn, source, footers)));
                 continue;
             }
 
