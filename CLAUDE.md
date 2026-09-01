@@ -70,6 +70,11 @@ Each of these is the short form; the note behind it is where the argument is.
   write layer is n; `QUALIFY … ORDER BY _seq DESC` is what shadows, and a tombstone hides only rows
   with `_seq < writeSeq`. A partition column joins the key, and `hive_partitioning` is always passed
   explicitly. [lake](docs/internals/lake.md#layers-and-files)
+- **A parquet source's columns come out of the footers, and nothing about a lake's shape is learned
+  by binding a statement per table.** What a bind costs is flat, so the only way to make a start
+  cheaper is to issue fewer statements; `Layer.Footers` asks once for every file, and a source it
+  cannot answer for is described rather than approximated.
+  [performance](docs/internals/performance.md#what-a-start-asks-the-catalog)
 - **The write layer holds effective state, not a log**, it is persisted only after DuckDB commits,
   and a write branch is earned rather than assumed.
   [lake](docs/internals/lake.md#the-write-path)

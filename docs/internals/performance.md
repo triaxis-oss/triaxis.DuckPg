@@ -271,6 +271,43 @@ Every number here was measured on this code. The user-facing summary is [perform
   the key again with the table. `SpillTests.TheKeyIsMadeAgainWithTheTable` and
   `StoreTests.AReloadKeepsWhatTheStoreHolds` are the two halves, and each fails if the other's
   answer is given.
+- **What a bind costs is flat, so a start that binds a statement a table cannot be made cheaper --
+  only made to bind nothing.** A lake serving views over parquet spent 36% of a host's whole CPU
+  starting, and 89.7% of that was DuckDB's parser and binder: `Catalog.Materialize` learned each
+  layer's columns with a `DESCRIBE SELECT * FROM read_parquet(…)`, which is one bind a source. The
+  bind does not vary with the column count, the catalog size, the query shape, or whether the file
+  is warm -- measured against a view over read_parquet at 0.379 ms, of which 0.124 is binding
+  anything at all, 0.090 more is re-binding a view body from its text and 0.165 is the table
+  function opening the file. So there is no cheaper statement to issue:
+
+  | 152 parquet sources, 148 tables | |
+  |---|---|
+  | a `DESCRIBE` each | 210–250 ms |
+  | `Layer.Footers`, one question naming every glob | 24–43 ms |
+  | the five it declines to answer for, described | 11–14 ms |
+
+  Which took a start of that lake from **676 ms of CPU to 414**, and its wall clock from 475 to 266.
+  The column names, their order and their types are in the footers, and `parquet_schema` is DuckDB
+  reading exactly those, for every file at once -- `duckdb_type` is its own mapping of them, so the
+  answer is DuckDB's and not a second reading of the format.
+- **The reading is declined rather than approximated, because the bar is the same catalog and not a
+  close one.** A source of one file, or of files that all say the same thing, is the whole of what a
+  footer can answer for. Where files disagree, `union_by_name` widens each column to a type holding
+  what every file put in it and appends what a later file adds; that is the binder's arithmetic, not
+  a fact in any footer, and reimplementing it would be a second answer to drift from the first. A
+  nested column is the same problem in the small -- a footer spreads one over a row a level, and
+  `STRUCT(a INTEGER, b VARCHAR)` is something DuckDB puts together as it binds. Both are left to be
+  described. So is a partitioned source's `k=v` columns: what type a partition value has is DuckDB's
+  own reading of the *path*, so a hive source still binds -- one statement rather than the two it
+  used to. `LayerTests.ReadingAFooterSaysWhatDescribingWouldHave` holds every shape up against what
+  describing it says, and counts the ones answered, since an equality that quietly stopped covering
+  the ordinary shape would still pass.
+- **`parquet_metadata_cache` is worth ~15% of every bind that remains**, and every one does remain:
+  a view is bound on every execution, so the footer a start read is read again to create the view
+  and again by every statement through it. `SET GLOBAL` rather than a plain `SET`, which DuckDB
+  scopes to the connection issuing it -- every session borrows a connection of its own onto this
+  database, and a cache none of them can see is one they all pay around. A file that changes is read
+  again, which is what keeps a rewritten write layer honest.
 
 ## What a pooled checkout costs
 
