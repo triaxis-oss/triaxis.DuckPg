@@ -114,6 +114,16 @@ sealed class TestLake : IDisposable
         return this;
     }
 
+    /// Published as the merge itself in every statement rather than as views DuckDB holds. The SQL
+    /// Server door alone, since it is the only one whose reads go through a parser that can put the
+    /// merge where the name was -- which is what the configuration insists on too.
+    public TestLake Inlined()
+    {
+        Config.Inline = true;
+        Config.Listen = null;
+        return WithTds();
+    }
+
     /// Merged copies of multi-layer tables, kept beside the lake rather than inside it.
     public TestLake WithCache()
     {

@@ -421,7 +421,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $"SELECT 1 FROM (SELECT {KeyList(table)}, count(*) AS \"_count\" FROM \"_keys\" " +
             $"GROUP BY {KeyList(table)}) AS r WHERE r.\"_count\" > 1 " +
             $"UNION ALL SELECT 1 FROM \"_keys\" AS r " +
-            $"SEMI JOIN {table.QualifiedName} AS t ON {matched}{kept} LIMIT 1",
+            $"SEMI JOIN {Catalog.Scan(table, "t")} ON {matched}{kept} LIMIT 1",
             refused.Message, refused.SqlState)], refused);
     }
 
@@ -591,7 +591,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // everything the statement did not assign has to say which table it came from. A clause
         // opening with the target itself carries the whole join tree the rows are picked through,
         // target included, so the tree stands alone as the scan.
-        var target = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
+        var target = Catalog.Scan(table, alias);
         var scan = target;
         var qualifier = "";
 
@@ -683,7 +683,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var joined = SqlText.FindKeyword(sql, "USING", reference.End);
         var where = SqlText.FindKeyword(sql, "WHERE", joined < 0 ? reference.End : joined + 5);
 
-        var scan = alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
+        var scan = Catalog.Scan(table, alias);
         var qualifier = "";
 
         // With another table in scope the key columns have to say which side they came from -- both
@@ -780,7 +780,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 : "";
 
             yield return new Check(
-                $"SELECT 1 FROM {child.QualifiedName} AS c, ({keys}) AS k WHERE {matched}{others} LIMIT 1",
+                $"SELECT 1 FROM {Catalog.Scan(child, "c")}, ({keys}) AS k WHERE {matched}{others} LIMIT 1",
                 $"The DELETE statement conflicted with the REFERENCE constraint \"{reference.Name}\". " +
                 $"The conflict occurred in database \"{Config.DatabaseName}\", table \"{reference.Table}\", " +
                 $"column '{reference.Columns[0]}'.",
@@ -882,8 +882,15 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// the scan and nothing is put beside it. Nobody else writes this: SQL Server refuses the
     /// doubled name outright, and reading it as a self-join is what has to be avoided here, since
     /// DuckDB does exactly that rather than refusing -- see `Detached`.
-    static bool Embedded(string clause, (string? Schema, string Name, int Start, int End) target, string? alias)
+    bool Embedded(string clause, (string? Schema, string Name, int Start, int End) target, string? alias)
     {
+        // An inlined lake wrote the target in as a subquery, so there is no name in the text to
+        // recognise it by -- what identifies it is the name that subquery carries, which is the
+        // write's own alias and the table's where it has none.
+        if (Catalog.Inlined(target.Name) is not null)
+            return Opening(clause) is { } carried &&
+                   carried.Equals(alias ?? target.Name, StringComparison.OrdinalIgnoreCase);
+
         var first = SqlText.ReadTableRef(clause, 0);
         if (!string.Equals(first.Schema, target.Schema, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(first.Name, target.Name, StringComparison.OrdinalIgnoreCase)) return false;
@@ -896,6 +903,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         return string.Equals(bound, alias, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// The name a clause's first source carries when that source is an inlined merge: the subquery,
+    /// and then the alias every one of them is written with. Null when the clause opens with
+    /// anything else -- a temporary table joined through a graph of its own, which `Detached` takes.
+    static string? Opening(string clause)
+    {
+        var text = clause.TrimStart();
+        if (!text.StartsWith('(')) return null;
+
+        var after = text[(MatchingParen(text) + 1)..];
+        var word = SqlText.ReadTableRef(after, 0);
+        return word.Name.Equals("AS", StringComparison.OrdinalIgnoreCase)
+            ? SqlText.ReadTableRef(after, word.End).Name
+            : word.Name;
+    }
+
     /// The tree-carrying spelling against a table the lake does not publish -- a session's `#temp`
     /// joined through a graph of its own. There is no declared key to collect the rows by, but the
     /// table is DuckDB's own, so its rowid takes the key's place: the tree moves into a subquery
@@ -905,7 +927,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// *separate* binding and deletes every row pairing with any the tree kept, which on a three-row
     /// scratch table filtered to two deletes all three. Nothing says it went wrong, which is why
     /// this path exists rather than a refusal: keeping the one binding one is the whole of it.
-    static string Detached(string sql, (string? Schema, string Name, int Start, int End) reference)
+    string Detached(string sql, (string? Schema, string Name, int Start, int End) reference)
     {
         var alias = DeleteAlias(sql, reference.End);
         var joined = SqlText.FindKeyword(sql, "USING", reference.End);
@@ -926,7 +948,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// tree, so it cannot move aside into a subquery the way a DELETE's rowids can. Refused here,
     /// while the statement can still be named for what it is -- handed on, it would be read as a
     /// self-join and write the wrong rows without saying so, which is what `Detached` measures.
-    static string Grounded(string sql, (string? Schema, string Name, int Start, int End) reference)
+    string Grounded(string sql, (string? Schema, string Name, int Start, int End) reference)
     {
         var set = SqlText.FindKeyword(sql, "SET", reference.End);
         var from = set < 0 ? -1 : SqlText.FindKeyword(sql, "FROM", set + 3);
@@ -977,12 +999,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             promote.Add((child, true));
 
             steps.Add($"CREATE OR REPLACE TEMP TABLE {childKeys} AS SELECT DISTINCT {collected} " +
-                      $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {matched}");
+                      $"FROM {Catalog.Scan(child, "c")}, {keys} AS k WHERE {matched}");
             if (!child.Materialized) steps.Add(Tombstone(child, childKeys));
             steps.Add(Evict(child, childKeys));
 
             Cascading(child, childKeys,
-                      $"SELECT DISTINCT {collected} FROM {child.QualifiedName} AS c, ({keyed}) AS k WHERE {matched}",
+                      $"SELECT DISTINCT {collected} FROM {Catalog.Scan(child, "c")}, ({keyed}) AS k WHERE {matched}",
                       steps, checks, promote);
         }
 
@@ -1013,7 +1035,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             promote.Add((child, false));
 
             steps.Add($"CREATE OR REPLACE TEMP TABLE {cleared} AS SELECT {projection} " +
-                      $"FROM {child.QualifiedName} AS c, {keys} AS k WHERE {Matching(reference)}");
+                      $"FROM {Catalog.Scan(child, "c")}, {keys} AS k WHERE {Matching(reference)}");
             steps.Add(Evict(child, cleared));
             steps.Add($"INSERT INTO {child.WriteName} ({columns}) SELECT {columns} FROM {cleared}");
         }

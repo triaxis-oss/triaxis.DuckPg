@@ -29,7 +29,10 @@ sealed record TSqlContext(
     /// answer. The session's own, so one connection cannot read the key another was handed.
     decimal? Identity = null,
     /// The last identity generated for a table by anybody, which is what `IDENT_CURRENT` answers.
-    Func<string, decimal?>? Identities = null);
+    Func<string, decimal?>? Identities = null,
+    /// The merge to read in place of a table's name, for a lake that publishes no views. Null for
+    /// every other lake, and for every name that is not one of its tables.
+    Func<string, string?>? Inlined = null);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -185,6 +188,18 @@ sealed class TSqlWriter(TSqlContext context)
                     throw new TSqlException("sp_tablecollations_100 takes the name of a table, written as a string", 0);
 
                 var table = LastPart(literal.Text);
+
+                // An inlined lake put nothing in `information_schema`, so the columns are asked of
+                // the merge itself -- which is the same list in the same order, and the one the
+                // client is about to be sent rows in either way.
+                if (context.Inlined?.Invoke(table) is { } merge)
+                {
+                    Put("SELECT row_number() OVER ()::INT AS colid, column_name AS name, " +
+                        "NULL::BLOB AS tds_collation, NULL::VARCHAR AS collation_name FROM (DESCRIBE ")
+                        .Put(merge).Put(")");
+                    return;
+                }
+
                 Put("SELECT ordinal_position::INT AS colid, column_name AS name, NULL::BLOB AS tds_collation, " +
                     "NULL::VARCHAR AS collation_name FROM information_schema.columns WHERE table_schema = ")
                     .Put(SqlText.Literal(context.Schema))
@@ -492,8 +507,7 @@ sealed class TSqlWriter(TSqlContext context)
         switch (source)
         {
             case NamedTableSource named:
-                Table(named.Name);
-                if (named.Alias is not null) Put(" AS ").Put(Quote(named.Alias));
+                Scan(named.Name, named.Alias);
                 return;
 
             case DerivedTableSource derived:
@@ -550,8 +564,39 @@ sealed class TSqlWriter(TSqlContext context)
 
     void Qualifier(List<Name> parts)
     {
-        if (parts.Count < 2) Join(parts, part => Put(Quote(part)), ".");
-        else Table(new TableName(parts));
+        if (parts.Count < 2) { Join(parts, part => Put(Quote(part)), "."); return; }
+
+        var name = new TableName(parts);
+        // An inlined table is a subquery carrying its own name, so that is what qualifies its
+        // columns -- the schema in front of it would name a relation this lake never published.
+        if (Inlined(name) is not null) Put(Quote(name.Table));
+        else Table(name);
+    }
+
+    /// A table in a FROM clause. Where the lake publishes no view for it, the merge goes in as a
+    /// subquery under the name the statement gave it -- or the table's own, which is what a column
+    /// the statement qualifies has to find.
+    void Scan(TableName name, Name? alias)
+    {
+        if (Inlined(name) is { } merge) Put("(").Put(merge).Put(") AS ").Put(Quote(alias ?? name.Table));
+        else
+        {
+            Table(name);
+            if (alias is not null) Put(" AS ").Put(Quote(alias));
+        }
+    }
+
+    /// The merge to read instead of this name, or null where the name is the answer. Only ever a
+    /// table the lake publishes: a CTE, a temporary table and a name qualified with somebody else's
+    /// schema are all resolved by DuckDB exactly as they were written.
+    string? Inlined(TableName name)
+    {
+        if (context.Inlined is null) return null;
+        if (name.Parts.Count == 1 && (defined.Contains(name.Table.Text) || Temporary(name))) return null;
+        if (name.Schema is { } schema && !schema.Text.Equals("dbo", StringComparison.OrdinalIgnoreCase)
+            && !schema.Text.Equals(context.Schema, StringComparison.OrdinalIgnoreCase)) return null;
+
+        return context.Inlined(name.Table.Text);
     }
 
     /// A client says `dbo.orders`, or `[app].[dbo].[orders]`, and means the one table the lake

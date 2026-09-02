@@ -163,6 +163,24 @@ public sealed class Config
     /// Off by default: a lake serving readers pays nothing for DuckDB's own concurrency.
     public bool SerializeTransactions { get; set; }
 
+    /// Publish each table as the merge itself, put into every statement that names it, rather than
+    /// as a view DuckDB holds. What a `CREATE VIEW` costs is a bind and a catalog entry -- ~0.8 ms
+    /// on a lake of flat parquet, of which ~0.5 is the entry -- and a lake of 150 tables pays it a
+    /// table every start, for nothing but the name. Inlined, a start creates no relation at all.
+    ///
+    /// The name is what it costs. Nothing in DuckDB's catalog says the table exists, so nothing that
+    /// reads that catalog can find it: `information_schema`, `duckdb_columns()`, `pg_class` and the
+    /// `pg_constraint` shim over it all answer as though the lake were empty, and a client that
+    /// discovers a schema rather than being told one has nothing to discover. What still works is
+    /// what goes through the parser -- which is every statement the SQL Server door takes, and none
+    /// of the PostgreSQL door's reads, since those are handed to DuckDB as the client wrote them.
+    /// So this is refused for a lake with a PostgreSQL front door, rather than left to surface as
+    /// "table does not exist" on the first query.
+    ///
+    /// Off, because a name is what a database is for. It is worth turning on where a lake is short
+    /// lived and its client is one application that already knows the schema.
+    public bool Inline { get; set; }
+
     /// Key used by any table that neither names its own nor takes one from the schema.
     public string[] DefaultKey { get; set; } = [];
 
@@ -220,6 +238,14 @@ public sealed class Config
         if (Listen is not { Length: > 0 } && Tds is not { Length: > 0 })
             throw new DuckPgConfigurationException(
                 "no front door to open: set `listen` for the PostgreSQL protocol, `tds` for SQL Server's, or both");
+
+        // A read through the PostgreSQL door is handed to DuckDB as the client wrote it -- there is
+        // no parser on that side to put the merge where the name was -- so a lake with no views is
+        // a lake that door cannot read at all. Said here rather than left to the first query.
+        if (Inline && Listen is { Length: > 0 })
+            throw new DuckPgConfigurationException(
+                "`inline` publishes no views, and a name is all the PostgreSQL door has: its reads go " +
+                "to DuckDB as they were written. Serve this lake through `tds` alone, or drop `inline`");
 
         if (TdsPacketSize is < 512 or > 32767)
             throw new DuckPgConfigurationException(
@@ -281,6 +307,14 @@ public sealed class Config
                     ? "`lazy` defers collapsing the layers, and `base` serves a lake already collapsed"
                     : "`lazy` says when the layers are collapsed, so it needs `materialize`: without it " +
                       "a lake publishes the merge and never collapses anything");
+
+        // What `inline` skips is the view a layered table is published as. A collapsed lake publishes
+        // tables, which are what a write goes to as well as what a read comes from -- there is no
+        // view to skip, and a subquery is not something a name in an UPDATE can be replaced with.
+        if (Inline && Collapsed)
+            throw new DuckPgConfigurationException(
+                $"`inline` puts the merge where a view would be, and {(Base is { Length: > 0 } ? "`base`" : "`materialize`")} " +
+                "publishes real tables rather than views -- there is nothing left to inline");
 
         if (StoreMode != StoreMode.Keep && Store is not { Length: > 0 })
             throw new DuckPgConfigurationException(

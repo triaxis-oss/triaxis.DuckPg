@@ -283,7 +283,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (carries && write.HasTombstones(table)) tombstoned.Add(name);
 
             if (!carries && Cached(conn, table) is { } file) copies[name] = file;
-            Exec(conn, ViewDefinition(table, carries, tombstoned.Contains(name)));
+            // An inlined lake publishes no relation at all: what would have gone into the view goes
+            // into each statement that names the table, which is `Scan`.
+            if (!config.Inline) Exec(conn, ViewDefinition(table, carries, tombstoned.Contains(name)));
             if (carries) foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
             Tables[name] = table;
         }
@@ -858,7 +860,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                 var context = new TSqlContext(
                     config.Schema, new Dictionary<string, string>(),
                     new HashSet<string>(function.Parameters, StringComparer.OrdinalIgnoreCase),
-                    Environment.UserName, Types, declared, Macro: true);
+                    Environment.UserName, Types, declared, Macro: true, Inlined: Inlined);
 
                 var body = TSqlWriter.Write(TSqlParser.ParseExpression(answer), context);
                 var parameters = string.Join(", ", function.Parameters.Select(SqlText.Quote));
@@ -921,8 +923,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     void Declared(DuckDBConnection conn)
     {
+        // A declared view is still a view, and its body names the tables under it -- which have
+        // no names of their own on an inlined lake, so the merge goes into the body instead.
         var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
-                                      new HashSet<string>(), Environment.UserName, Types, macros);
+                                      new HashSet<string>(), Environment.UserName, Types, macros,
+                                      Inlined: Inlined);
         var pending = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var refused = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1638,6 +1643,24 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     string ViewDefinition(Table table, bool writable, bool tombstones) =>
         $"CREATE OR REPLACE VIEW {table.QualifiedName} AS {Merged(table, writable, tombstones)}";
 
+    /// The merge a statement naming this table should read instead of the table, or null where the
+    /// lake published a view and the name is the whole answer. A materialized table is never one of
+    /// these: it *is* the rows, and it is what a write goes to as well.
+    public string? Inlined(string name) => Tables.GetValueOrDefault(name) is { } table ? Inlined(table) : null;
+
+    /// The same, for a table in hand rather than by name -- which is what a build asks, since a
+    /// table is published before it is put in `Tables`.
+    string? Inlined(Table table) =>
+        config.Inline && !table.Materialized ? Merged(table, Promoted(table), Tombstoned(table)) : null;
+
+    /// How a statement reads a table, under the name the statement gave it -- and under the table's
+    /// own where it gave none, since an inlined merge is a subquery and a column qualified by the
+    /// table's name has nothing else to resolve against.
+    public string Scan(Table table, string? alias = null) =>
+        Inlined(table) is { } merge
+            ? $"({merge}) AS {SqlText.Quote(alias ?? table.Name)}"
+            : alias is null ? table.QualifiedName : $"{table.QualifiedName} AS {SqlText.Quote(alias)}";
+
     /// The copy standing in for the read layers it was made from. A write adds a branch above it
     /// rather than replacing it: the copy *is* the read layers, and a write does not touch those.
     /// Only a copy of a plain merge can serve -- one made under a filter or a virtual column has
@@ -1651,7 +1674,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     public string[] Promotion(DuckDBConnection conn, Table table, bool tombstones) =>
         [.. Sequences(conn, table),
          .. write.Definition(table, ifNotExists: true),
-         ViewDefinition(table, writable: true, tombstones || Tombstoned(table))];
+         // Nothing to republish where there is no view: the next statement naming the table is
+         // written against the branch this just made, because `Scan` reads `promoted` as it goes.
+         .. config.Inline ? (string[])[] : [ViewDefinition(table, writable: true, tombstones || Tombstoned(table))]];
 
     /// Where a store-generated column draws its values from, one sequence per column and both named
     /// after it, in the write layer's own schema.
@@ -1669,7 +1694,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         {
             using var command = conn.CreateCommand();
             command.CommandText =
-                $"SELECT coalesce(max({SqlText.Quote(column.Name)}), 0) + 1 FROM {table.QualifiedName}";
+                $"SELECT coalesce(max({SqlText.Quote(column.Name)}), 0) + 1 FROM {Scan(table)}";
             sequences.Add($"CREATE SEQUENCE IF NOT EXISTS {Sequence(table, column)} " +
                           $"START {Convert.ToInt64(command.ExecuteScalar())}");
         }

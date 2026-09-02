@@ -52,6 +52,31 @@ everything after that is what a materialized table costs. What it buys is 2.2 s 
 memory of 280 tables nobody asked about — both of which grow with the tables a lake publishes and
 not with the ones it serves.
 
+**`--inline`** is the other end of the same question: not what a table costs to read, but what it
+costs to *publish*. A view is a bind and a catalog entry — ~0.8 ms on a lake of flat parquet, of
+which ~0.5 is the entry and would be paid over a plain table too — and a lake of 150 tables pays it
+a table on every start, buying nothing but the name. Inlined, a start creates no relation at all:
+what would have gone into the view goes into each statement that names the table. Measured on 149
+single-file parquet tables:
+
+| | start | a point query by key |
+|---|---|---|
+| views | 294 ms CPU | 3.33 ms CPU |
+| `--inline` | **151 ms CPU** | 3.43 ms CPU |
+
+So a start halves, and every statement pays ~3% more for carrying its own merge — the trade is worth
+making where a lake is started far more often than it is queried, and not otherwise.
+
+The name is what it costs. Nothing in DuckDB's catalog says the tables exist, so nothing that reads
+that catalog can find them: `information_schema`, `duckdb_columns()`, `pg_class` and the
+`pg_constraint` shim over it all answer as though the lake were empty, and a client that discovers a
+schema rather than being told one has nothing to discover. What still works is everything that goes
+through the parser — which is every statement the SQL Server door takes, and none of the PostgreSQL
+door's reads, since those are handed to DuckDB as the client wrote them. So `inline` needs `tds`
+alone and is refused beside `listen`, rather than being left to surface as "table does not exist" on
+the first query. It is refused with `materialize` and `base` too: those publish real tables, which
+are what a write goes to as well as what a read comes from, and there is nothing left to inline.
+
 What stands under a table nothing has named yet is the merge, exactly as a layered lake publishes it,
 so a reference that goes unspotted answers with the same rows at the layered price rather than with
 no rows at all. Two things move with it. The first statement to name a big table waits for its
