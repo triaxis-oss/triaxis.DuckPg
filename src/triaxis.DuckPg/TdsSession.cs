@@ -374,7 +374,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             (IReadOnlySet<string>)parameters.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase), login["user"],
             gateway.Catalog.Types, gateway.Catalog.Functions, false,
             gateway.Config.SortSmallTables ? gateway.Catalog.Rows : null,
-            identity, gateway.IdentityOf);
+            identity, gateway.IdentityOf, gateway.Catalog.Inlined);
 
     /// What a declared variable starts as. The initializer is produced by a query like any other --
     /// it may name a table, or another variable declared before it -- and what the variable holds is

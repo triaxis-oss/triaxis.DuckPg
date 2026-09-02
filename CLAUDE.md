@@ -75,6 +75,11 @@ Each of these is the short form; the note behind it is where the argument is.
   cheaper is to issue fewer statements; `Layer.Footers` asks once for every file, and a source it
   cannot answer for is described rather than approximated.
   [performance](docs/internals/performance.md#what-a-start-asks-the-catalog)
+- **A published table is a name, and `Config.Inline` is what it costs to have one.** Inlined, no
+  relation is created and `Catalog.Scan` puts the merge where the name would have been -- so
+  everything that reads DuckDB's catalog rather than duckpg's finds nothing, and the flag is the SQL
+  Server door's alone because that is the only door whose reads go through a parser.
+  [performance](docs/internals/performance.md#what-a-start-asks-the-catalog)
 - **The write layer holds effective state, not a log**, it is persisted only after DuckDB commits,
   and a write branch is earned rather than assumed.
   [lake](docs/internals/lake.md#the-write-path)

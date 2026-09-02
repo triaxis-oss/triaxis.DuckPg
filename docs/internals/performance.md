@@ -302,6 +302,33 @@ Every number here was measured on this code. The user-facing summary is [perform
   used to. `LayerTests.ReadingAFooterSaysWhatDescribingWouldHave` holds every shape up against what
   describing it says, and counts the ones answered, since an equality that quietly stopped covering
   the ordinary shape would still pass.
+- **What is left after that is the views, and the only way not to pay for one is not to have it.**
+  `CREATE VIEW` is ~0.8 ms on a lake of flat parquet and does not batch: 149 of them cost 235 ms as
+  separate commands, 232 inside one `BEGIN`/`COMMIT` and 237 as one 149-statement command, so there
+  is no per-statement overhead to amortise. Nor is it the catalog filling up -- 40 lakes' worth of
+  views into one instance drifts from ~1.65 to ~2.4 ms a view over 6000 of them, which is real and
+  is not the story. Serving from a baked database, the one existing path that publishes no views at
+  all, is *worse*: 419 ms of start against 1608, because `BakedBase` copies the file every run.
+  `Config.Inline` is what is left -- no relation is created, and `Catalog.Scan` puts the merge where
+  the name would have been. 294 ms of start against 151, and ~3% on every statement.
+- **It is the SQL Server door's alone, because that door is the only one with a parser.**
+  `Gateway.Translate`'s default arm is `Plan.Rows(sql)`: a PostgreSQL-door read goes to DuckDB
+  exactly as the client wrote it, so there is no tree to put the merge into and text substitution is
+  the thing this codebase does not do -- a CTE named `orders`, a column named `orders`, the name
+  inside a literal. `Config.Validate` refuses the pair rather than letting it surface as a missing
+  table. What the flag costs even on its own door is everything that reads DuckDB's catalog instead
+  of the parser: the `pg_constraint` shim joins `duckpg_constraints` to `pg_class` and
+  `pg_attribute` *by relation and column name*, so with no relation there are no keys and no
+  references to be read back. `sp_tablecollations_100` is the one such reader the TDS door itself
+  needs -- SqlBulkCopy asks it before sending anything and refuses an empty answer -- and it is
+  answered from `DESCRIBE` over the merge, which is the same list in the same order.
+- **Two places had to learn there is no name, and the suite is what found them.** A declared
+  identity's sequence starts past `max(<column>)` of what the table publishes, which was read by
+  name; and `Embedded` recognises a joined write whose clause already carries its own target by
+  reading that target's name out of the translated text, which an inlined target does not have --
+  so it compares the subquery's alias instead, and without that the target went in twice under one
+  alias. Both were found by running the whole TDS suite against an inlined lake rather than by
+  reading the code: 643 tests, and those two shapes were the only ones that broke.
 - **`parquet_metadata_cache` is worth ~15% of every bind that remains**, and every one does remain:
   a view is bound on every execution, so the footer a start read is read again to create the view
   and again by every statement through it. `SET GLOBAL` rather than a plain `SET`, which DuckDB

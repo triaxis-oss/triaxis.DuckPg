@@ -82,7 +82,10 @@ That merge is bound by DuckDB on every execution, which on a wide table over sev
 of the cost of a read. `--cache` writes the merged rows out once as parquet, and `--materialize`
 collapses the stack into real tables at build — worth about 3.7× on a small ORM query. `--lazy`
 collapses a table when a statement first names it instead, so a lake pays for the tables it serves
-rather than for the ones it publishes.
+rather than for the ones it publishes. `--inline` answers the other half — what publishing a table
+*costs* — by not publishing one: every statement carries the merge for the tables it names, which
+halves a start on a lake of many tables and leaves nothing in DuckDB's catalog to find them by, so
+it needs the SQL Server door alone.
 
 ## Baking the layers
 

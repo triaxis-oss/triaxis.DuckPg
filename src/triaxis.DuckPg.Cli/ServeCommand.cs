@@ -34,6 +34,11 @@ public class ServeCommand : LakeCommand
     [Option("--lazy", Description = "Collapse a table when a statement first names it, rather than every table at startup. Needs --materialize.")]
     public bool Lazy { get; set; }
 
+    [Option("--inline", Description = "Publish no views: every statement carries the merge for the tables it names. " +
+                                      "Starts without creating a relation a table, and needs --tds alone -- " +
+                                      "nothing in DuckDB's catalog says the tables are there.")]
+    public bool Inline { get; set; }
+
     [Option("--store", Description = "Hold a materialized lake's tables in this DuckDB database file rather than in memory.")]
     public string? Store { get; set; }
 
@@ -97,6 +102,7 @@ public class ServeCommand : LakeCommand
         if (Base is not null) config.Base = Path.GetFullPath(Base);
         if (Materialize) config.Materialize = true;
         if (Lazy) config.Lazy = true;
+        if (Inline) config.Inline = true;
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;
         if (Compress) config.Compress = true;
