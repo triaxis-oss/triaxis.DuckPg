@@ -260,6 +260,14 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   macro when it is *created*, not when it is called, so one calling another must be made second --
   hence the pass that stops when it makes no progress. A body that is not one `RETURN` is refused
   and logged, because half-translating a procedure is worse than not having it.
+- **A file is read once for the process, whichever lake asks.** A real model is several MB of XML:
+  35 to 85 ms of `XDocument` a start, and ~35 MB allocated for it -- 8 gen2 collections over 30
+  lakes in one process, ~20 ms a lake of pause landing wherever the allocator happened to be. A
+  fleet of lakes over one schema was paying that per lake for an answer the first already had.
+  `DacpacSchema.Shared` keeps one `Model` a path, keyed by a hash of the file's bytes rather than
+  its stamp: hashing is a fraction of a millisecond against tens to parse, and a stamp can miss a
+  rebuild that lands within its granularity. A rebuilt file replaces its own reading rather than
+  growing the process, and the format warnings are said when the file is read, once.
 - **The suite's dacpac writer is not the format.** `Dacpac.cs` writes what the readers expect, so
   the two can agree and both be wrong -- which is exactly what happened to `OnDeleteAction`.
   `tests/.../Schema/sample.dacpac` is DacFx's own output, checked in and *not* built by the test run,

@@ -128,16 +128,35 @@ public class DacpacFormatTests : IDisposable
         Assert.DoesNotContain(warnings.Messages, m => m.Contains("SqlTable"));
     }
 
-    DacpacSchema Load(string model = Model)
+    /// The same file is one reading however many lakes ask -- the second gets the first's own
+    /// lists -- and a file rebuilt in place is read again, by its bytes rather than its stamp.
+    [Fact]
+    public void OneFileIsReadOnceUntilItsBytesChange()
+    {
+        var path = Write(Model);
+        var first = new DacpacSchema(new Config { Dacpac = path }, warnings);
+        var second = new DacpacSchema(new Config { Dacpac = path }, warnings);
+        Assert.Same(first.Columns("Orders"), second.Columns("Orders"));
+
+        Write(Model.Replace("[dbo].[Orders].[Created]", "[dbo].[Orders].[Renamed]"), path);
+        var third = new DacpacSchema(new Config { Dacpac = path }, warnings);
+        Assert.NotSame(first.Columns("Orders"), third.Columns("Orders"));
+        Assert.Contains("Renamed", third.Columns("Orders")!.Select(c => c.Name));
+    }
+
+    DacpacSchema Load(string model = Model) => new(new Config { Dacpac = Write(model) }, warnings);
+
+    string Write(string model, string? path = null)
     {
         Directory.CreateDirectory(root);
-        var path = Path.Combine(root, $"{Guid.NewGuid():N}.dacpac");
+        path ??= Path.Combine(root, $"{Guid.NewGuid():N}.dacpac");
+        File.Delete(path);
 
         using (var archive = ZipFile.Open(path, ZipArchiveMode.Create))
         using (var entry = archive.CreateEntry("model.xml").Open())
             entry.Write(Encoding.UTF8.GetBytes(model));
 
-        return new DacpacSchema(new Config { Dacpac = path }, warnings);
+        return path;
     }
 
     /// Enough of an `ILogger` to read back what the schema complained about.

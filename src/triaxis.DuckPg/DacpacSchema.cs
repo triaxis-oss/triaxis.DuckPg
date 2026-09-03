@@ -1,4 +1,6 @@
+using System.Collections.Concurrent;
 using System.IO.Compression;
+using System.Security.Cryptography;
 using System.Xml.Linq;
 using Microsoft.Extensions.Logging;
 
@@ -26,17 +28,18 @@ sealed record ScalarFunction(string Name, string[] Parameters, string ReturnType
 ///
 /// One of these exists whether or not a dacpac does: without one it declares nothing, so a lake
 /// with a schema and a lake without answer the same questions.
+///
+/// What a file declares is read once for the process and shared by every lake over that file. A
+/// fleet of lakes over one schema -- one per exported database, say -- would otherwise parse the
+/// same model on every start: a real model is several MB of XML, tens of milliseconds to read and
+/// tens of MB of `XDocument` to collect afterwards, for an answer the first lake already has. The
+/// reading is keyed by the file's bytes, so a dacpac rebuilt between two starts is read again.
 sealed class DacpacSchema
 {
-    static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
+    static readonly ConcurrentDictionary<string, (byte[] Hash, DacpacModel Model)> models =
+        new(StringComparer.Ordinal);
 
-    readonly Dictionary<string, List<Column>> columns = new(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<string, string[]> keys = new(StringComparer.OrdinalIgnoreCase);
-    readonly Dictionary<(string Table, string Column), string> defaults = new();
-    readonly Dictionary<string, string> views = new(StringComparer.OrdinalIgnoreCase);
-    readonly List<Reference> references = [];
-    readonly List<Unique> uniques = [];
-    readonly List<ScalarFunction> functions = [];
+    readonly DacpacModel model;
 
     public DacpacSchema(Config config, ILogger<DacpacSchema> logger)
     {
@@ -48,33 +51,73 @@ sealed class DacpacSchema
         if (config.Dacpac is { Length: > 0 } named && !File.Exists(named))
             throw new DuckPgConfigurationException($"dacpac not found: {named}");
 
-        if (path is not null) Read(path, logger);
+        model = path is null ? new DacpacModel() : Shared(path, logger);
     }
 
-    public IReadOnlyCollection<string> Tables => columns.Keys;
+    public IReadOnlyCollection<string> Tables => model.Columns.Keys;
 
-    public List<Column>? Columns(string table) => columns.GetValueOrDefault(table);
+    public List<Column>? Columns(string table) => model.Columns.GetValueOrDefault(table);
 
-    public string[] Key(string table) => keys.GetValueOrDefault(table) ?? [];
+    public string[] Key(string table) => model.Keys.GetValueOrDefault(table) ?? [];
 
     /// The T-SQL a column defaults to, as the dacpac spells it -- `(getdate())`, `((0))`.
-    public string? Default(string table, string column) => defaults.GetValueOrDefault((table, column));
+    public string? Default(string table, string column) =>
+        model.Defaults.GetValueOrDefault((table, column));
 
     /// What the declared schema says points at what.
-    public IReadOnlyList<Reference> References => references;
+    public IReadOnlyList<Reference> References => model.References;
 
     /// Every uniqueness rule it declares that is not a table's key.
-    public IReadOnlyList<Unique> Uniques => uniques;
+    public IReadOnlyList<Unique> Uniques => model.Uniques;
 
     /// The scalar functions it declares, in the order the model lists them.
-    public IReadOnlyList<ScalarFunction> Functions => functions;
+    public IReadOnlyList<ScalarFunction> Functions => model.Functions;
 
     /// Each declared view and the query it stands for, in the dialect it was written in.
-    public IReadOnlyDictionary<string, string> Views => views;
+    public IReadOnlyDictionary<string, string> Views => model.Views;
 
-    void Read(string path, ILogger logger)
+    /// The file's reading, made once. The bytes are hashed rather than the file stamped: a model
+    /// is a fraction of a millisecond to hash and tens to parse, and a stamp can miss a rewrite
+    /// that lands within its granularity. One reading a path, so a file rebuilt in place replaces
+    /// its own rather than growing the process. Two lakes starting at once may both read it, and
+    /// either reading is the file's.
+    static DacpacModel Shared(string path, ILogger logger)
     {
-        using var archive = ZipFile.OpenRead(path);
+        var bytes = File.ReadAllBytes(path);
+        var hash = SHA256.HashData(bytes);
+        if (models.TryGetValue(path, out var held) && held.Hash.AsSpan().SequenceEqual(hash))
+            return held.Model;
+
+        var model = DacpacModel.Read(bytes, path, logger);
+        models[path] = (hash, model);
+        return model;
+    }
+}
+
+/// What one file declares. Filled as it is read and never afterwards, which is what lets every
+/// lake over the file hold the same one.
+sealed class DacpacModel
+{
+    static readonly XNamespace Dac = "http://schemas.microsoft.com/sqlserver/dac/Serialization/2012/02";
+
+    public readonly Dictionary<string, List<Column>> Columns = new(StringComparer.OrdinalIgnoreCase);
+    public readonly Dictionary<string, string[]> Keys = new(StringComparer.OrdinalIgnoreCase);
+    public readonly Dictionary<(string Table, string Column), string> Defaults = new();
+    public readonly Dictionary<string, string> Views = new(StringComparer.OrdinalIgnoreCase);
+    public readonly List<Reference> References = [];
+    public readonly List<Unique> Uniques = [];
+    public readonly List<ScalarFunction> Functions = [];
+
+    public static DacpacModel Read(byte[] bytes, string path, ILogger logger)
+    {
+        var model = new DacpacModel();
+        model.Read(new MemoryStream(bytes), path, logger);
+        return model;
+    }
+
+    void Read(Stream file, string path, ILogger logger)
+    {
+        using var archive = new ZipArchive(file, ZipArchiveMode.Read);
         var model = archive.GetEntry("model.xml")
             ?? throw new InvalidOperationException($"{path} has no model.xml");
         using var stream = model.Open();
@@ -127,7 +170,7 @@ sealed class DacpacSchema
 
         if (declared.Count == 0) return false;
 
-        columns[name] = declared;
+        Columns[name] = declared;
         return true;
     }
 
@@ -139,7 +182,7 @@ sealed class DacpacSchema
         var key = Indexed(constraint);
         if (key.Length == 0) return false;
 
-        keys[name] = key;
+        Keys[name] = key;
         return true;
     }
 
@@ -161,7 +204,7 @@ sealed class DacpacSchema
         var columns = Indexed(element);
         if (table is null || columns.Length == 0) return false;
 
-        uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns));
+        Uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns));
         return true;
     }
 
@@ -183,11 +226,11 @@ sealed class DacpacSchema
         var parent = Unqualify(Reference(constraint, "ForeignTable"));
         if (child is null || parent is null) return false;
 
-        var columns = Columns(constraint, "Columns");
-        var referenced = Columns(constraint, "ForeignColumns");
+        var columns = Referenced(constraint, "Columns");
+        var referenced = Referenced(constraint, "ForeignColumns");
         if (columns.Length == 0 || columns.Length != referenced.Length) return false;
 
-        references.Add(new Reference(
+        References.Add(new Reference(
             Unqualify(constraint.Attribute("Name")?.Value) ?? $"FK_{child}_{parent}",
             child, columns, parent, referenced,
             DeleteAction(Property(constraint, "OnDeleteAction"))));
@@ -207,7 +250,7 @@ sealed class DacpacSchema
         _ => $"OnDeleteAction={code}",
     };
 
-    static string[] Columns(XElement constraint, string relationship) =>
+    static string[] Referenced(XElement constraint, string relationship) =>
         [.. Related(constraint, relationship)
             .Concat(constraint.Elements(Dac + "Relationship")
                 .Where(r => r.Attribute("Name")?.Value == relationship)
@@ -221,7 +264,7 @@ sealed class DacpacSchema
         if (Unqualify(view.Attribute("Name")?.Value) is not { } name) return false;
         if (Property(view, "QueryScript") is not { Length: > 0 } query) return false;
 
-        views[name] = query;
+        Views[name] = query;
         return true;
     }
 
@@ -231,7 +274,7 @@ sealed class DacpacSchema
         if (Property(constraint, "DefaultExpressionScript") is not { Length: > 0 } expression) return false;
         if (Parts(Reference(constraint, "ForColumn")) is not [.., var table, var column]) return false;
 
-        defaults[(table, column)] = expression;
+        Defaults[(table, column)] = expression;
         return true;
     }
 
@@ -255,9 +298,10 @@ sealed class DacpacSchema
             ? DuckDbType(specifier)
             : "VARCHAR";
 
-        functions.Add(new ScalarFunction(name, parameters, returns, body));
+        Functions.Add(new ScalarFunction(name, parameters, returns, body));
         return true;
     }
+
 
     /// Elements reached through a named relationship, which in this format always nests as
     /// Relationship / Entry / Element.
@@ -305,7 +349,7 @@ sealed class DacpacSchema
             .Where(r => r.Attribute("Name")?.Value == "Type")
             .Descendants(Dac + "References").FirstOrDefault()?.Attribute("Name")?.Value) ?? "nvarchar";
 
-        string? Property(string name) => DacpacSchema.Property(specifier, name);
+        string? Property(string name) => DacpacModel.Property(specifier, name);
 
         return sql.ToLowerInvariant() switch
         {
