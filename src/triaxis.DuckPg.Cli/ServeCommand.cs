@@ -48,6 +48,9 @@ public class ServeCommand : LakeCommand
     [Option("--compress", Description = "Checkpoint once the lake is built, so DuckDB compresses what it holds in memory.")]
     public bool Compress { get; set; }
 
+    [Option("--threads", Description = "Threads DuckDB serves with. Default: one per core. The catalog is built on one either way.")]
+    public int? Threads { get; set; }
+
     [Option("--no-sort-small-tables", Description = "Leave a small materialized table's sorting and limiting to DuckDB, which is on by default.")]
     public bool NoSortSmallTables { get; set; }
 
@@ -106,6 +109,7 @@ public class ServeCommand : LakeCommand
         if (Store is not null) config.Store = Path.GetFullPath(Store);
         if (StoreMode is { } storeMode) config.StoreMode = storeMode;
         if (Compress) config.Compress = true;
+        if (Threads is { } threads) config.Threads = threads;
         if (NoSortSmallTables) config.SortSmallTables = false;
         if (NoCheckKeys) config.CheckKeys = false;
         if (DeriveIds) config.DeriveIds = true;

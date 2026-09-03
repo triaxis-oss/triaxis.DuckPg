@@ -107,6 +107,17 @@ public sealed class Config
     /// nothing checkpoints a second time.
     public bool Compress { get; set; }
 
+    /// How many threads DuckDB serves with, or null for its own default -- one per core. A process
+    /// running many lakes at once is running that many DuckDBs, each with a pool sized for the whole
+    /// machine, and this is where a fleet is told to share it.
+    ///
+    /// The catalog is built on one thread whatever this says. A start is hundreds of small statements
+    /// and no scan, and DuckDB's floor per statement halves with one thread: 0.21 ms to 0.10 for
+    /// `SELECT 1`, 693 ms to 552 for the whole build of a lake of a few hundred tables. A materialized lake is
+    /// the exception -- its build is the collapse, which wants the cores -- so it builds with what it
+    /// serves with.
+    public int? Threads { get; set; }
+
     /// Sort and limit a small materialized table's rows here rather than in DuckDB. DuckDB's sort
     /// costs what a row is *wide* rather than what a table is long -- ~1.3 ms plus ~50 µs a column,
     /// unchanged between twelve rows and twelve hundred -- so on the table an ORM keeps asking about
@@ -246,6 +257,9 @@ public sealed class Config
             throw new DuckPgConfigurationException(
                 "`inline` publishes no views, and a name is all the PostgreSQL door has: its reads go " +
                 "to DuckDB as they were written. Serve this lake through `tds` alone, or drop `inline`");
+
+        if (Threads is < 1)
+            throw new DuckPgConfigurationException($"`threads: {Threads}` is not a number of threads to serve with");
 
         if (TdsPacketSize is < 512 or > 32767)
             throw new DuckPgConfigurationException(

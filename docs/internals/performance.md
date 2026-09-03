@@ -311,6 +311,20 @@ Every number here was measured on this code. The user-facing summary is [perform
   all, is *worse*: 419 ms of start against 1608, because `BakedBase` copies the file every run.
   `Config.Inline` is what is left -- no relation is created, and `Catalog.Scan` puts the merge where
   the name would have been. 294 ms of start against 151, and ~3% on every statement.
+- **The build runs on one thread, and serving runs on what `Config.Threads` says.** DuckDB's floor
+  per statement is scheduling as much as parsing: `SELECT 1` costs 0.21 ms on this machine's four
+  threads and 0.10 on one, and a trivial `CREATE VIEW` 0.28 against 0.10. A start is hundreds of
+  such statements and no scan -- measured on a lake of a few hundred tables, `SET threads=1` around the build took
+  the `CREATE VIEW`s from 188 ms to 138, the defaults from 42 to 26, the shims from 13 to 11, and
+  the whole build from 693 to 552. `threads` is a global setting, so `Lake.StartAsync` sets it back
+  -- to the configured count, or `RESET` -- before a door opens. A materialized lake builds with what
+  it serves with, because its build is the collapse and a collapse is a scan: one 5M-row table
+  collapses in 177 ms on four threads and 671 on one. The same few hundred small tables collapse faster on
+  one thread (2.1 s against 3.1), since there the build is statements again, but a lake cannot tell
+  which it is going to be before it has read the files -- so `Threads` is what says so, and a fleet
+  of small materialized lakes sets it to 1 and gets both.
+  `Threads` itself is a knob for a fleet: a process running many lakes at once is running that many
+  DuckDBs, each with a pool sized for the whole machine.
 - **It is the SQL Server door's alone, because that door is the only one with a parser.**
   `Gateway.Translate`'s default arm is `Plan.Rows(sql)`: a PostgreSQL-door read goes to DuckDB
   exactly as the client wrote it, so there is no tree to put the merge into and text substitution is
