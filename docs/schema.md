@@ -73,8 +73,9 @@ unchecked, and a reference to columns that are not the table's key is skipped.
 already knows by name is there without being rewritten as a layer. The query goes through the same
 translator as a statement a client sends, so a view over `[dbo].[orders]` reads the stacked layers,
 and `ISNULL`, `TOP`, joins and a view of a view come with it. Order does not matter — a view that
-reads another is retried once the other is in. One that still fails is named in a warning and left out
-rather than stopping the lake, as is one whose name a layer already carries as a table: the files win.
+reads another is made once the other is in. One that fails is named in a warning and left out rather
+than stopping the lake, and so is one that reads it or calls a function that was not published, by
+the name it reads; so is one whose name a layer already carries as a table: the files win.
 Views are read-only.
 
 **A declared scalar function is published as a macro**, so `[dbo].[Doubled]([order_id])` resolves onto

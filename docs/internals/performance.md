@@ -335,6 +335,15 @@ Every number here was measured on this code. The user-facing summary is [perform
   scopes to the connection issuing it -- every session borrows a connection of its own onto this
   database, and a cache none of them can see is one they all pay around. A file that changes is read
   again, which is what keeps a rewritten write layer honest.
+- **A declared view is made once the views it reads are, and one that reads a refused view is
+  refused by that name rather than by DuckDB.** The model lists views in no useful order, and
+  `Catalog.Declared` used to make each round whatever it could and retry the rest -- which rebound
+  every refused view once per round, and a bind fails no cheaper than it succeeds: on a schema of a
+  few hundred tables and two dozen views, half of them refused (functions with a body that is not an
+  expression, and the views calling them), the ones that publish cost 58 ms and the retries 115.
+  `TSqlContext.Reaches`
+  is what the writer resolved onto the lake, collected off the tree as the query is rendered, so the
+  order is known before anything is asked of DuckDB and a view naming a refused one is never sent.
 
 ## What a pooled checkout costs
 
