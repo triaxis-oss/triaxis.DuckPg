@@ -183,6 +183,24 @@ public class SchemaTests
         Assert.Equal(["1|"], lake.Query("SELECT order_id, status FROM lake.orders"));
     }
 
+    /// The defaults are evaluated together, and one that cannot be answered must not take the
+    /// others down with it: the broken one is dropped by name and the rest still fill.
+    [Fact]
+    public void ABrokenDefaultIsDroppedAloneAndTheRestStillFill()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1, "amount": 5}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            Stamped with { Defaults = [("status", "('new')"), ("created", "(newsequentialid())"), ("amount", "((2.5))")] });
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Equal(["1|5|new|"], lake.Query("SELECT order_id, amount, status, created FROM lake.orders"));
+        Assert.Contains(lake.Logged, m => m.Contains("default (newsequentialid()) ignored"));
+        Assert.DoesNotContain(lake.Logged, m => m.Contains("default ('new') ignored"));
+    }
+
     /// The views are listed the wrong way round on purpose: `big` reads `sent`, which the model
     /// only declares afterwards, and nothing in the model says so.
     [Fact]

@@ -302,6 +302,15 @@ Every number here was measured on this code. The user-facing summary is [perform
   used to. `LayerTests.ReadingAFooterSaysWhatDescribingWouldHave` holds every shape up against what
   describing it says, and counts the ones answered, since an equality that quietly stopped covering
   the ordinary shape would still pass.
+- **The declared defaults are one question too.** A real schema declares a default on most columns
+  of a few hundred tables, which collapse to a few dozen distinct expressions, and each of those
+  used to be a statement to evaluate it and one or two more to ask `typeof` of what it came to:
+  42 ms of a start, nearly all of it the per-statement floor. `Catalog.Evaluate` now casts every
+  distinct default in one `SELECT` (3.6 ms for a few dozen against 17 one at a time), falling back to one
+  at a time only when the batch fails, since one statement cannot say which default is the broken
+  one. What `typeof` says of a literal is DuckDB's type system and nothing the lake decides, so
+  `Catalog.Literal` keeps the answer for the process and a fleet of lakes over one schema asks each
+  question once.
 - **What is left after that is the views, and the only way not to pay for one is not to have it.**
   `CREATE VIEW` is ~0.8 ms on a lake of flat parquet and does not batch: 149 of them cost 235 ms as
   separate commands, 232 inside one `BEGIN`/`COMMIT` and 237 as one 149-statement command, so there

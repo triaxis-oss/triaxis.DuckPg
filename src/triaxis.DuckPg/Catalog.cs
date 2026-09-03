@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Data.Common;
 using System.Security.Cryptography;
 using System.Text;
@@ -222,6 +223,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // statement a table to learn the shape the files were already carrying.
         var footers = Layer.Footers(conn, found.SelectMany(
             s => s.Write is null ? s.Layers : [.. s.Layers, s.Write]));
+
+        // Every declared default in one question, for the same reason as the footers: what one
+        // costs is the statement, not the expression.
+        Evaluate(conn, found.Select(s => s.Name));
 
         foreach (var (name, sources, declaredWrite) in found)
         {
@@ -1126,65 +1131,108 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         type is "TINYINT" or "SMALLINT" or "INTEGER" or "BIGINT"
              or "UTINYINT" or "USMALLINT" or "UINTEGER" or "UBIGINT";
 
-    Column Defaulted(DuckDBConnection conn, string table, Column column) =>
-        schema.Default(table, column.Name) is { } expression
-            ? column with { Default = Evaluate(conn, expression, column.Type) }
-            : column;
-
-    /// The declared default, translated on the tree like any other T-SQL, and then also run once to
-    /// see what it says. A default DuckDB cannot answer at build time it could not answer at write
-    /// time either, so one that throws is dropped with a warning and the column keeps its NULL.
-    ColumnDefault? Evaluate(DuckDBConnection conn, string expression, string type)
+    Column Defaulted(DuckDBConnection conn, string table, Column column)
     {
-        if (evaluated.TryGetValue((expression, type), out var declared)) return declared;
+        if (schema.Default(table, column.Name) is not { } expression) return column;
+
+        // Already answered by the pass over every table, unless this one was not in it.
+        if (!evaluated.ContainsKey((expression, column.Type))) Evaluate(conn, [(expression, column.Type)]);
+        return column with { Default = evaluated[(expression, column.Type)] };
+    }
+
+    /// What these tables' declared defaults are worth, asked before any of them is built.
+    void Evaluate(DuckDBConnection conn, IEnumerable<string> tables) =>
+        Evaluate(conn, [.. tables
+            .SelectMany(table => (schema.Columns(table) ?? [])
+                .Select(column => (Expression: schema.Default(table, column.Name), column.Type)))
+            .Where(d => d.Expression is not null && !evaluated.ContainsKey((d.Expression, d.Type)))
+            .Select(d => (d.Expression!, d.Type))
+            .Distinct()]);
+
+    /// The declared defaults, each translated on the tree like any other T-SQL and then run once to
+    /// see what it says -- all of them in one statement, since a statement costs the same whether it
+    /// answers one expression or fifty and a real schema declares dozens of distinct ones.
+    ///
+    /// A default DuckDB cannot answer at build time it could not answer at write time either, so one
+    /// that throws is dropped with a warning and the column keeps its NULL. One statement cannot say
+    /// which of them that was, so a batch that fails is asked again one default at a time -- what
+    /// every default cost before there was a batch, and only paid on a schema with a broken one.
+    void Evaluate(DuckDBConnection conn, List<(string Expression, string Type)> defaults)
+    {
+        var translated = new List<(string Expression, string Type, string Expr)>();
+        foreach (var (expression, type) in defaults)
+            try
+            {
+                // Nobody is connected when the lake is built, so `SUSER_SNAME()` in a default is the
+                // account duckpg runs as -- the only user there is at that point.
+                var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                              new HashSet<string>(), Environment.UserName);
+                translated.Add((expression, type, TSqlWriter.Write(TSqlParser.ParseExpression(expression), context)));
+            }
+            catch (Exception e)
+            {
+                Ignored((expression, type), e);
+            }
+
+        if (translated.Count == 0) return;
 
         try
         {
-            // Nobody is connected when the lake is built, so `SUSER_SNAME()` in a default is the
-            // account duckpg runs as -- the only user there is at that point.
-            var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
-                                          new HashSet<string>(), Environment.UserName);
-            var expr = TSqlWriter.Write(TSqlParser.ParseExpression(expression), context);
-
             using var command = conn.CreateCommand();
-            command.CommandText = $"SELECT CAST({expr} AS {type})::VARCHAR";
-            declared = command.ExecuteScalar() is string value
-                ? new ColumnDefault(expr, Literal(conn, value, type))
-                : null;
-            logger.LogDebug("default {Expression} is {Expr}, worth {Value}",
-                expression, expr, declared?.Value ?? "NULL");
+            command.CommandText = "SELECT " + string.Join(", ", translated.Select(t => $"CAST({t.Expr} AS {t.Type})::VARCHAR"));
+            using var reader = command.ExecuteReader();
+            reader.Read();
+
+            foreach (var (i, (expression, type, expr)) in translated.Index())
+            {
+                var declared = reader.IsDBNull(i) ? null : new ColumnDefault(expr, Literal(conn, reader.GetString(i), type));
+                logger.LogDebug("default {Expression} is {Expr}, worth {Value}", expression, expr, declared?.Value ?? "NULL");
+                evaluated[(expression, type)] = declared;
+            }
+        }
+        catch (Exception) when (translated.Count > 1)
+        {
+            foreach (var (expression, type, _) in translated) Evaluate(conn, [(expression, type)]);
         }
         catch (Exception e)
         {
-            logger.LogWarning("default {Expression} ignored: {Reason}", expression, e.Message.ReplaceLineEndings(" "));
-            declared = null;
+            Ignored((translated[0].Expression, translated[0].Type), e);
         }
-
-        evaluated[(expression, type)] = declared;
-        return declared;
     }
+
+    void Ignored((string Expression, string Type) declared, Exception e)
+    {
+        logger.LogWarning("default {Expression} ignored: {Reason}", declared.Expression, e.Message.ReplaceLineEndings(" "));
+        evaluated[declared] = null;
+    }
+
+    /// What DuckDB says a literal is, kept for the process: the answer is DuckDB's type system and
+    /// nothing a lake decides, and a fleet of lakes over one schema asks the same handful of
+    /// questions on every start.
+    static readonly ConcurrentDictionary<(string Value, string Type), string> literals = new();
 
     /// A default is written into every read layer's branch, so it is worth one expression rather
     /// than two -- but only where the bare literal already is the column's type. DuckDB is asked
     /// rather than guessed at: a literal of any other type would let the `COALESCE` around it widen
     /// the branch past what the catalog publishes, and `1.0` is a `DECIMAL` where the column is a
     /// `DOUBLE`.
-    static string Literal(DuckDBConnection conn, string value, string type)
-    {
-        foreach (var candidate in (string[])[value, SqlText.Literal(value)])
-            try
-            {
-                using var command = conn.CreateCommand();
-                command.CommandText = $"SELECT typeof({candidate})";
-                if (command.ExecuteScalar() is string actual && Same(actual, type)) return candidate;
-            }
-            catch (DuckDBException)
-            {
-                // Not an expression at all -- an unquoted string, say. The cast covers it.
-            }
+    static string Literal(DuckDBConnection conn, string value, string type) =>
+        literals.GetOrAdd((value, type), _ =>
+        {
+            foreach (var candidate in (string[])[value, SqlText.Literal(value)])
+                try
+                {
+                    using var command = conn.CreateCommand();
+                    command.CommandText = $"SELECT typeof({candidate})";
+                    if (command.ExecuteScalar() is string actual && Same(actual, type)) return candidate;
+                }
+                catch (DuckDBException)
+                {
+                    // Not an expression at all -- an unquoted string, say. The cast covers it.
+                }
 
-        return $"CAST({SqlText.Literal(value)} AS {type})";
-    }
+            return $"CAST({SqlText.Literal(value)} AS {type})";
+        });
 
     // ---- the published shape ---------------------------------------------------------------------
 
