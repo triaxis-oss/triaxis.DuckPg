@@ -140,6 +140,13 @@ lake. Use it when a lake is larger than the RAM you want to give it and the laye
 source of truth; use the default `keep` when the file is. The two must not share a path — nothing in a
 DuckDB file says which mode wrote it, so a `spill` start would rebuild a kept store from the layers.
 
+**`--threads`** is how many threads DuckDB serves with, and it is one per core unless told otherwise.
+A process running many lakes at once is running that many DuckDBs, each with a pool sized for the
+whole machine, and a fleet is where telling them to share is worth trying. The catalog is built on
+one thread whatever the setting: a start is hundreds of small statements and no scan, and DuckDB's
+floor per statement halves on one thread — 693 ms to 552 for the whole build of a lake of a few hundred tables.
+A materialized lake is the exception, since its build is the collapse and a collapse wants the cores.
+
 ## Baking the layers once
 
 Everything above buys the merge back inside a run that is starting anyway. **`duckpg bake`** takes it

@@ -82,6 +82,12 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
             await installer.InstallAsync(cancellation);
 
         duck.Open();
+
+        // The build is hundreds of small statements and no scan, and DuckDB's floor per statement
+        // halves on one thread -- unless the build is the collapse, which wants the cores it will
+        // serve with.
+        Threads(config.Collapsed ? config.Threads : 1);
+
         using (var command = duck.CreateCommand())
         {
             command.CommandText = Shims.Macros;
@@ -94,11 +100,22 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
 
         catalog.Build(duck);
 
+        Threads(config.Threads);
+
         server.Start();
         tds.Start();
 
         stopping = new CancellationTokenSource();
         serving = Task.WhenAll(server.ListenAsync(stopping.Token), tds.ListenAsync(stopping.Token));
+    }
+
+    /// The database's, not this connection's: `threads` is a global setting, so every session
+    /// borrowing a connection onto this database serves with what is set here.
+    void Threads(int? count)
+    {
+        using var command = duck.CreateCommand();
+        command.CommandText = count is { } threads ? $"SET threads = {threads}" : "RESET threads";
+        command.ExecuteNonQuery();
     }
 
     public async Task StopAsync(CancellationToken cancellation)
