@@ -58,6 +58,7 @@ are the whole list: nothing beside the executable is read, and nothing in the wo
 | `checkKeys` | `--no-check-keys` | Refuse a write that would put two rows under one declared key. On by default; the flag turns off the scan behind it, though a materialized table carries the key as a real `PRIMARY KEY` and refuses it anyway. |
 | `serializeTransactions` | `--serialize-transactions` | One transaction at a time; the next waits for it. |
 | `deriveIds` | `--derive-ids` | Give every row its own value for a `NEWID()` default, derived from its key, rather than one value for the whole run. Off by default. |
+| `ignore` | `--ignore` | Files in a layer that are not tables, as globs over the path relative to the layer: `_*.yaml`, `reports/**`. A pattern without a `/` matches a name in any directory; one that is a path (`/data/a/*.yaml`, or `./a/*.yaml` from the file) is held against the whole path, so it names one layer's files and not another's. |
 | `defaultKey` | `--key`, `-k` | Key for tables that name none, applied only where the columns exist. |
 | `dacpac` | `--dacpac` | The declared schema. Autodetected from the layers when absent. |
 | `cache` | `--cache` | Directory for merged copies of multi-layer tables, as ZSTD parquet. |

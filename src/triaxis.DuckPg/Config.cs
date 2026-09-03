@@ -44,6 +44,16 @@ public sealed class Config
     /// Directory holding the topmost layer, which accepts writes. Created when missing.
     public string? Write { get; set; }
 
+    /// Files in a layer that are not tables, as globs over the path relative to the layer:
+    /// `_*.yaml`, `reports/**`, `**/README.md`. A pattern without a `/` matches a name in any
+    /// directory. What matches is not scanned, in a read layer and in the write layer alike -- a
+    /// report an export drops beside its tables is a file of the export, not a table of the lake.
+    ///
+    /// A rooted pattern -- `/data/exports/a/*.yaml`, or `./a/*.yaml` relative to wherever the
+    /// configuration came from -- is held against the file's whole path instead, which is how one
+    /// layer is told to drop its YAML while another keeps it.
+    public string[] Ignore { get; set; } = [];
+
     /// Format the write layer persists a table it has no file for yet in.
     public LayerFormat WriteFormat { get; set; } = LayerFormat.Parquet;
 
@@ -233,6 +243,7 @@ public sealed class Config
     public void ResolvePaths(string baseDirectory)
     {
         Layers = [.. Layers.Select(l => Path.GetFullPath(l, baseDirectory))];
+        Ignore = [.. Ignore.Select(pattern => ResolvePattern(pattern, baseDirectory))];
         if (Write is not null) Write = Path.GetFullPath(Write, baseDirectory);
         if (Base is not null) Base = Path.GetFullPath(Base, baseDirectory);
         if (Store is not null) Store = Path.GetFullPath(Store, baseDirectory);
@@ -240,6 +251,14 @@ public sealed class Config
     }
 
     public TableConfig Table(string name) => Tables.GetValueOrDefault(name) ?? new TableConfig();
+
+    /// An ignore pattern that is a path -- rooted, or written `./` or `../` from where the
+    /// configuration sits -- resolved as every other path is. Anything else is relative to each
+    /// layer, and `sub/*.yaml` stays exactly that.
+    internal static string ResolvePattern(string pattern, string baseDirectory) =>
+        pattern.StartsWith("./") || pattern.StartsWith("../") || pattern.StartsWith(".\\") || pattern.StartsWith("..\\")
+            ? Path.GetFullPath(pattern, baseDirectory)
+            : pattern;
 
     /// What a lake cannot start without, checked before anything is built so the answer names the
     /// path that is wrong rather than surfacing later as an empty catalog or a binder error out of

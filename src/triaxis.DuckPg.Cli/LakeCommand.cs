@@ -19,6 +19,9 @@ public abstract class LakeCommand : LoggingCommand
     [Option("--key", "-k", Description = "Column identifying a row, for tables that name no key of their own. Repeatable.")]
     public string[] Key { get; set; } = [];
 
+    [Option("--ignore", Description = "A file in a layer that is not a table, as a glob over its path relative to the layer. Repeatable.")]
+    public string[] Ignore { get; set; } = [];
+
     [Option("--dacpac", Description = "A .dacpac to take column names, order, types and keys from.")]
     public string? Dacpac { get; set; }
 
@@ -48,6 +51,8 @@ public abstract class LakeCommand : LoggingCommand
         if (Layers.Length > 0) config.Layers = [.. Layers.Select(Path.GetFullPath)];
         if (Write is not null) config.Write = Path.GetFullPath(Write);
         if (Key.Length > 0) config.DefaultKey = Key;
+        if (Ignore.Length > 0)
+            config.Ignore = [.. Ignore.Select(pattern => Config.ResolvePattern(pattern, Directory.GetCurrentDirectory()))];
         if (Dacpac is not null) config.Dacpac = Path.GetFullPath(Dacpac);
         if (InstallDuckDb) config.InstallDuckDb = true;
         return config;

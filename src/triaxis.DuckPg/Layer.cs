@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DuckDB.NET.Data;
 using Microsoft.Extensions.Logging;
 using YamlDotNet.Core;
@@ -54,12 +55,16 @@ static class Layer
     /// parquet below it. A `k=v` directory is neither -- it is a partition *above* the tables, so
     /// `db=one/orders.parquet` and `db=two/orders.parquet` are one `orders` with a `db` column,
     /// which is how one view spans many databases.
-    public static IEnumerable<(string Table, LayerSource Source)> Scan(string directory, int seq, ILogger logger)
+    ///
+    /// `ignore` names what is not a table at all, by glob over the path relative to the layer.
+    public static IEnumerable<(string Table, LayerSource Source)> Scan(string directory, int seq, ILogger logger,
+                                                                       string[]? ignore = null)
     {
         var found = new Dictionary<string, LayerSource>(StringComparer.OrdinalIgnoreCase);
+        var ignored = Ignored(directory, ignore ?? []);
 
         foreach (var partition in Partitions(directory))
-            foreach (var (name, source) in Entries(directory, partition, seq))
+            foreach (var (name, source, _) in Entries(directory, partition, seq).Where(e => !ignored(e.Path)))
             {
                 if (!found.TryGetValue(name, out var kept)) found[name] = source;
                 // Every partition holding the table produces the same glob; anything else is two
@@ -85,9 +90,39 @@ static class Layer
                 yield return Path.Combine(Path.GetFileName(dir), nested);
     }
 
+    /// Whether a path under the layer is one the configuration said to leave alone. A pattern is
+    /// matched against the path relative to the layer, with `/` between the parts whatever the
+    /// platform writes; one naming no directory is matched against the name alone, so `_*.yaml`
+    /// finds the file in every partition; and a rooted one is matched against the whole path,
+    /// which is what lets it name one layer's files and not another's. Case-insensitively, as
+    /// table names are.
+    static Func<string, bool> Ignored(string directory, string[] patterns)
+    {
+        if (patterns.Length == 0) return _ => false;
+
+        var globs = patterns.Select(pattern =>
+        {
+            var normalized = pattern.Replace('\\', '/');
+            var scope = Path.IsPathRooted(pattern) ? Scope.Full : normalized.Contains('/') ? Scope.Relative : Scope.Name;
+            var regex = "^" + Regex.Escape(normalized)
+                .Replace(@"\*\*/", "(?:.*/)?").Replace(@"\*\*", ".*").Replace(@"\*", "[^/]*").Replace(@"\?", "[^/]") + "$";
+            return (Scope: scope, Regex: new Regex(regex, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant));
+        }).ToList();
+
+        return path => globs.Any(g => g.Regex.IsMatch(g.Scope switch
+        {
+            Scope.Full => Path.GetFullPath(path).Replace('\\', '/'),
+            Scope.Relative => Path.GetRelativePath(directory, path).Replace('\\', '/'),
+            _ => Path.GetFileName(path),
+        }));
+    }
+
+    enum Scope { Name, Relative, Full }
+
     /// The tables one partition of a layer holds. The glob keeps the partition's *shape* rather
-    /// than its value, so every partition contributes to the same source.
-    static IEnumerable<(string Table, LayerSource Source)> Entries(string directory, string partition, int seq)
+    /// than its value, so every partition contributes to the same source. `Path` is the file or
+    /// directory itself, which is what an ignore pattern is held against.
+    static IEnumerable<(string Table, LayerSource Source, string Path)> Entries(string directory, string partition, int seq)
     {
         var here = Path.Combine(directory, partition);
         if (!Directory.Exists(here)) yield break;
@@ -100,7 +135,8 @@ static class Layer
         foreach (var (pattern, format) in Formats)
             foreach (var file in Directory.EnumerateFiles(here, pattern).OrderBy(f => f))
                 yield return (Path.GetFileNameWithoutExtension(file),
-                              new LayerSource(seq, format, Path.Combine(directory, shape, Path.GetFileName(file)), keys));
+                              new LayerSource(seq, format, Path.Combine(directory, shape, Path.GetFileName(file)), keys),
+                              file);
 
         // Dot-directories are ours -- the write layer keeps its tombstones in one.
         foreach (var dir in Directory.EnumerateDirectories(here).OrderBy(d => d)
@@ -117,7 +153,8 @@ static class Layer
             yield return (Path.GetFileName(dir),
                           new LayerSource(seq, LayerFormat.Parquet,
                               Path.Combine(directory, shape, Path.GetFileName(dir), "**", "*.parquet"),
-                              [.. keys.Concat(below).Distinct(StringComparer.OrdinalIgnoreCase)]));
+                              [.. keys.Concat(below).Distinct(StringComparer.OrdinalIgnoreCase)]),
+                          dir);
         }
     }
 

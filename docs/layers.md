@@ -16,6 +16,7 @@ kept out of each other's way.
 | `orders/dt=…/*.parquet` | the same, with the partition keys as columns |
 | `db=…/orders.parquet` | table `orders` across every `db=`, with `db` as a column |
 | `.anything/` | ignored — dot-directories are the tool's own |
+| anything `ignore` names | ignored — a report dropped beside the tables is not one of them |
 
 Layers stack in the order given. Where a key is declared the topmost layer holding a row wins
 (`QUALIFY row_number() OVER (PARTITION BY key ORDER BY _seq DESC) = 1`); without a key there is no
@@ -23,6 +24,13 @@ way to tell rows apart, so the layers simply concatenate. Columns are the union 
 topmost layer's order, and each layer is cast to the published type — where a parquet layer has the
 column its type wins, since a parquet file carries a real schema while YAML and JSON types are
 inferred from the values.
+
+`ignore` is a list of globs over a file's path relative to its layer — `_*.yaml`, `reports/**`,
+`**/README.md` — and a pattern naming no directory matches the name wherever it sits, partitions
+included. It applies to the write layer as it does to a read layer: what is not a table in one is
+not a table in the other. A pattern that is a path — `/data/exports/a/*.yaml`, or `./a/*.yaml`
+relative to the configuration file — is held against the whole path instead, which is how one layer
+is told to drop its YAML while the layer above it keeps its own.
 
 Table names are matched case-insensitively, so an export that disagrees with itself about
 capitalization still lands on one table. Two files of different formats claiming one table is a
