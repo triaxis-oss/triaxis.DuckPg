@@ -1007,23 +1007,30 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     ///
     /// Keys and references only. A declared unique is a rule this lake does not keep unless DuckDB
     /// is keeping it -- publishing one would promise what a layered lake does not do.
+    ///
+    /// Appended rather than inserted: a real schema is several hundred rows, and as one `VALUES`
+    /// list they are a statement DuckDB has to parse and bind a literal at a time -- 41 ms for several
+    /// hundred rows against 6 through the appender, on every start.
     void Constraints(DuckDBConnection conn)
     {
         Exec(conn, $"DELETE FROM {Shims.Constraints}");
 
-        var values = new List<string>();
-        var ordinal = 0;
+        using var appender = conn.CreateAppender(Shims.Constraints);
+        var ordinal = 0L;
 
         void Add(string name, string type, Table table, string[] columns,
                  string? parent, string[]? parentColumns, string? onDelete)
         {
             ordinal++;
             for (var i = 0; i < columns.Length; i++)
-                values.Add($"({SqlText.Literal(name)}, {SqlText.Literal(type)}, " +
-                           $"{SqlText.Literal(table.Schema)}, {SqlText.Literal(table.Name)}, " +
-                           $"{SqlText.Literal(columns[i])}, {i}, {Text(parent)}, " +
-                           $"{Text(parentColumns?[i])}, {Text(onDelete is null ? null : "a")}, " +
-                           $"{Text(onDelete is null ? null : Performs(onDelete))}, {ordinal})");
+                appender.CreateRow()
+                    .AppendValue(name).AppendValue(type).AppendValue(table.Schema).AppendValue(table.Name)
+                    .AppendValue(columns[i]).AppendValue(i)
+                    .AppendValue(parent).AppendValue(parentColumns?[i])
+                    .AppendValue(onDelete is null ? null : "a")
+                    .AppendValue(onDelete is null ? null : Performs(onDelete))
+                    .AppendValue(ordinal)
+                    .EndRow();
         }
 
         foreach (var table in Tables.Values.Where(table => table.Key.Length > 0))
@@ -1032,12 +1039,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         foreach (var reference in References)
             Add(reference.Name, "f", Tables[reference.Table], reference.Columns,
                 Tables[reference.Parent].Name, reference.ParentColumns, reference.OnDelete);
-
-        if (values.Count > 0)
-            Exec(conn, $"INSERT INTO {Shims.Constraints} VALUES {string.Join(", ", values)}");
     }
-
-    static string Text(string? value) => value is null ? "NULL" : SqlText.Literal(value);
 
     /// What PostgreSQL calls the action, as the resolved one this lake actually performs. Nothing at
     /// all happens on an update, which is `a`.

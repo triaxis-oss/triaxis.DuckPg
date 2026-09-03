@@ -344,6 +344,11 @@ Every number here was measured on this code. The user-facing summary is [perform
   `TSqlContext.Reaches`
   is what the writer resolved onto the lake, collected off the tree as the query is rendered, so the
   order is known before anything is asked of DuckDB and a view naming a refused one is never sent.
+- **The constraint rows go in through the appender, not as one `VALUES` list.** `Catalog.Constraints`
+  fills the `pg_constraint` shim's table with a row per column of every key and reference, which on
+  a real schema is several hundred rows and over 100 KB of SQL -- a statement DuckDB
+  parses and binds a literal at a time, 41 ms on every start. The same rows through
+  `DuckDBConnection.CreateAppender` cost 6 ms, and there is no statement to bind at all.
 
 ## What a pooled checkout costs
 
