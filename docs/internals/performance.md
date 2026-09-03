@@ -302,6 +302,9 @@ Every number here was measured on this code. The user-facing summary is [perform
   used to. `LayerTests.ReadingAFooterSaysWhatDescribingWouldHave` holds every shape up against what
   describing it says, and counts the ones answered, since an equality that quietly stopped covering
   the ordinary shape would still pass.
+- **The dacpac is parsed once a process, not once a lake.** 35 to 85 ms of a start on a real model,
+  and the ~35 MB of `XDocument` behind it was most of a fleet's GC pause besides. The reading is in
+  [schema.md](schema.md#reading-the-dacpac); what a start pays for it now is a hash of the file.
 - **The declared defaults are one question too.** A real schema declares a default on most columns
   of a few hundred tables, which collapse to a few dozen distinct expressions, and each of those
   used to be a statement to evaluate it and one or two more to ask `typeof` of what it came to:
