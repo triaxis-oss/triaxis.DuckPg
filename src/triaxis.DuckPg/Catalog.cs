@@ -386,7 +386,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         if (write.Directory is not { Length: > 0 } directory) return written;
 
         System.IO.Directory.CreateDirectory(directory);
-        foreach (var (name, source) in Layer.Scan(directory, write.Seq, logger)) written[name] = source;
+        foreach (var (name, source) in Layer.Scan(directory, write.Seq, logger, config.Ignore)) written[name] = source;
         return written;
     }
 
@@ -612,7 +612,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             sources.TryGetValue(name, out var found) ? found : ([], null);
 
         foreach (var (index, directory) in config.Layers.Index())
-            foreach (var (name, source) in Layer.Scan(directory, index, logger))
+            foreach (var (name, source) in Layer.Scan(directory, index, logger, config.Ignore))
             {
                 var entry = Entry(name);
                 entry.Layers.Add(source);
@@ -625,7 +625,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             // made here rather than demanded of whoever configured it.
             Directory.CreateDirectory(writeDirectory);
 
-            foreach (var (name, source) in Layer.Scan(writeDirectory, write.Seq, logger))
+            foreach (var (name, source) in Layer.Scan(writeDirectory, write.Seq, logger, config.Ignore))
                 sources[name] = Entry(name) with { Write = source };
         }
 

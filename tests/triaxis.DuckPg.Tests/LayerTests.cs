@@ -39,6 +39,56 @@ public class LayerTests
             scanned.Select(s => s.Table).Order(StringComparer.Ordinal));
     }
 
+    /// An export drops a report beside its tables; `ignore` is how it is told that the report is
+    /// not one. A name alone reaches into every partition, and a path is held to the layer.
+    [Fact]
+    public void AnIgnoredFileIsNotATable()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1}]""")
+            .Yaml("base", "_report", "run: 1\nrows: [1, 2]\n")
+            .Yaml("base", "_report", "run: 2\n", "db=one")
+            .Json("base", "notes", """[{"note_id": 1}]""", "extras")
+            .Stack("base");
+        lake.Config.Ignore = ["_*.yaml", "extras/**"];
+        lake.Start();
+
+        Assert.Equal(["orders"], lake.Catalog.Tables.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(["1"], lake.Query("SELECT order_id FROM lake.orders"));
+    }
+
+    /// A rooted pattern reaches one layer and not another: the same file name is a table where the
+    /// pattern does not point and nothing where it does.
+    [Fact]
+    public void ARootedPatternNamesOneLayersFiles()
+    {
+        using var lake = new TestLake()
+            .Yaml("lower", "notes", "- note_id: 1\n")
+            .Yaml("upper", "notes", "- note_id: 2\n")
+            .Stack("lower", "upper");
+        lake.Config.Ignore = ["./lower/*.yaml"];
+        lake.Config.ResolvePaths(lake.Root);
+        lake.Start();
+
+        Assert.Equal(["2"], lake.Query("SELECT note_id FROM lake.notes"));
+        Assert.Equal([1], lake.Catalog.Tables["notes"].Layers.Select(l => l.Source.Seq));
+    }
+
+    /// A table that is a directory of parquet is ignored by its directory, and a pattern is not a
+    /// prefix: `orders` does not take `orders_archive` with it.
+    [Fact]
+    public void AnIgnoredDirectoryIsNotATableEither()
+    {
+        using var lake = new TestLake()
+            .Parquet("base", "orders", "SELECT 1 AS id", "orders/one")
+            .Parquet("base", "orders_archive", "SELECT 2 AS id", "orders_archive/one")
+            .Stack("base");
+        lake.Config.Ignore = ["orders"];
+        lake.Start();
+
+        Assert.Equal(["orders_archive"], lake.Catalog.Tables.Keys.Order(StringComparer.Ordinal));
+    }
+
     [Fact]
     public void FormatsStackInOneList()
     {
