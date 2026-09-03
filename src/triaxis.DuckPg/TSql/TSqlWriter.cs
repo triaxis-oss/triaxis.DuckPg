@@ -32,7 +32,10 @@ sealed record TSqlContext(
     Func<string, decimal?>? Identities = null,
     /// The merge to read in place of a table's name, for a lake that publishes no views. Null for
     /// every other lake, and for every name that is not one of its tables.
-    Func<string, string?>? Inlined = null);
+    Func<string, string?>? Inlined = null,
+    /// Filled, when given, with the name of every table and declared function the statement
+    /// resolves onto the lake -- what it would reach if it ran, read off the tree as it is rendered.
+    ISet<string>? Reaches = null);
 
 /// Renders the parsed statement as DuckDB SQL. Every difference between the dialects is decided
 /// here, on the tree, where the shape of the statement is known -- not on its text, where it is not.
@@ -614,6 +617,7 @@ sealed class TSqlWriter(TSqlContext context)
             ? context.Schema
             : schema.Text;
 
+        if (resolved.Equals(context.Schema, StringComparison.OrdinalIgnoreCase)) context.Reaches?.Add(name.Table.Text);
         Put(SqlText.Quote(resolved)).Put(".").Put(Quote(name.Table));
     }
 
@@ -878,6 +882,7 @@ sealed class TSqlWriter(TSqlContext context)
         var resolved = schema.Text.Equals("dbo", StringComparison.OrdinalIgnoreCase)
             ? context.Schema
             : schema.Text;
+        context.Reaches?.Add(function.Text);
         return SqlText.Quote(resolved) + "." + SqlText.Quote(function.Text);
     }
 

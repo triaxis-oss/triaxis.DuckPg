@@ -827,13 +827,6 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         return false;
     }
 
-    /// The dacpac's own views, published beside the tables they read: the query is T-SQL, so it is
-    /// translated on the tree like any statement a client sends, and `dbo` lands on the lake.
-    ///
-    /// A view may select from another view the model happens to list later, and the model says
-    /// nothing about which. Rather than order them, each round creates what it can and the next
-    /// round tries the rest -- a round that adds nothing is one where what is left is broken rather
-    /// than merely early, and those are named and skipped instead of stopping the lake.
     /// A declared scalar function, published as a macro beside the tables it reads. A macro is an
     /// expression, so only a body that answers with one can become one: anything with a variable, a
     /// branch or a second statement is a procedure, and is left undeclared and said so at startup
@@ -921,46 +914,87 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         return rest.Trim().TrimEnd(';').Trim() is { Length: > 0 } answer ? answer : null;
     }
 
+    /// The dacpac's own views, published beside the tables they read: the query is T-SQL, so it is
+    /// translated on the tree like any statement a client sends, and `dbo` lands on the lake.
+    ///
+    /// A view may select from another view the model happens to list later, and the model says
+    /// nothing about which -- but the tree does: every table and declared function a view resolves
+    /// onto the lake is collected as its query is rendered. So a view is made once the views it
+    /// reads are, and one reading a view that could not be made, or calling a function that was
+    /// not published, is refused here by that name rather than by DuckDB after binding everything
+    /// in front of it. That is the whole cost on a schema of many views: a bind fails no cheaper
+    /// than it succeeds, and retrying every refused view each round paid it again per round.
     void Declared(DuckDBConnection conn)
     {
-        // A declared view is still a view, and its body names the tables under it -- which have
-        // no names of their own on an inlined lake, so the merge goes into the body instead.
-        var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
-                                      new HashSet<string>(), Environment.UserName, Types, macros,
-                                      Inlined: Inlined);
-        var pending = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var declared = new HashSet<string>(schema.Functions.Select(f => f.Name), StringComparer.OrdinalIgnoreCase);
         var refused = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var translated = new Dictionary<string, (string Sql, HashSet<string> Reaches)>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var (name, query) in schema.Views)
-            if (Tables.ContainsKey(name)) logger.LogWarning("{View} is declared as a view and carried as a table", name);
-            else pending[name] = query;
-
-        while (pending.Count > 0)
         {
-            var published = 0;
-            foreach (var (name, query) in pending.ToList())
-                try
-                {
-                    var translated = TSqlTranslator.Translate(query, context);
-                    if (translated.Count != 1)
-                        throw new InvalidOperationException($"a view is one query, not {translated.Count}");
+            if (Tables.ContainsKey(name))
+            {
+                logger.LogWarning("{View} is declared as a view and carried as a table", name);
+                continue;
+            }
 
-                    Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} " +
-                                  $"AS {translated[0].Sql}");
-                    if (config.Lazy) Reads(name, translated[0].Sql);
-                    pending.Remove(name);
-                    published++;
-                }
-                catch (Exception e)
-                {
-                    refused[name] = e.Message.ReplaceLineEndings(" ");
-                }
-
-            if (published == 0) break;
+            // A declared view is still a view, and its body names the tables under it -- which
+            // have no names of their own on an inlined lake, so the merge goes into the body
+            // instead. Every declared function resolves, published or not, so that a call to one
+            // that is not is known here rather than left for DuckDB to fail to find.
+            var reaches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                          new HashSet<string>(), Environment.UserName, Types, declared,
+                                          Inlined: Inlined, Reaches: reaches);
+            try
+            {
+                var statements = TSqlTranslator.Translate(query, context);
+                if (statements.Count != 1)
+                    throw new InvalidOperationException($"a view is one query, not {statements.Count}");
+                translated[name] = (statements[0].Sql, reaches);
+            }
+            catch (Exception e)
+            {
+                refused[name] = e.Message.ReplaceLineEndings(" ");
+            }
         }
 
-        foreach (var name in pending.Keys)
-            logger.LogWarning("view {View} skipped: {Reason}", name, refused.GetValueOrDefault(name, "unknown"));
+        // In the model's order, so two views neither of which reads the other come out as declared.
+        var pending = translated.Keys.ToList();
+        while (pending.Count > 0)
+        {
+            var settled = 0;
+            foreach (var name in pending.ToList())
+            {
+                var (sql, reaches) = translated[name];
+
+                if (reaches.FirstOrDefault(refused.ContainsKey) is { } skipped)
+                    refused[name] = $"it reads {skipped}, which was skipped";
+                else if (reaches.FirstOrDefault(r => declared.Contains(r) && !macros.Contains(r)) is { } unpublished)
+                    refused[name] = $"it calls {unpublished}, which is not published";
+                else if (reaches.Any(pending.Contains))
+                    continue;
+                else
+                    try
+                    {
+                        Exec(conn, $"CREATE OR REPLACE VIEW {SqlText.Quote(config.Schema)}.{SqlText.Quote(name)} AS {sql}");
+                        if (config.Lazy) Reads(name, sql);
+                    }
+                    catch (Exception e)
+                    {
+                        refused[name] = e.Message.ReplaceLineEndings(" ");
+                    }
+
+                pending.Remove(name);
+                settled++;
+            }
+
+            // What is left reads only views that are left, which is a cycle none of them can start.
+            if (settled == 0) break;
+        }
+
+        foreach (var name in pending) refused[name] = "it reads a view that reads it back";
+        foreach (var (name, why) in refused) logger.LogWarning("view {View} skipped: {Reason}", name, why);
     }
 
     // ---- declared constraints --------------------------------------------------------------------

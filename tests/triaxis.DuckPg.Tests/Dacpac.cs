@@ -16,6 +16,10 @@ static class Dacpac
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
 
+    /// A scalar function: its parameters in order, what it returns, and the body DacFx keeps --
+    /// the `BEGIN … END` alone, since the header never reaches model.xml either.
+    public record FunctionModel(string Name, string[] Parameters, string ReturnType, string Body);
+
     /// What one table's columns say about another's, as DacFx writes a foreign key.
     public record ReferenceModel(string Name, string Table, string[] Columns, string Parent, string[] ParentColumns,
                                  string OnDelete = "NoAction");
@@ -25,7 +29,8 @@ static class Dacpac
     public static void Write(string path, TableModel[] tables, params ViewModel[] views) =>
         Write(path, tables, views, []);
 
-    public static void Write(string path, TableModel[] tables, ViewModel[] views, ReferenceModel[] references)
+    public static void Write(string path, TableModel[] tables, ViewModel[] views, ReferenceModel[] references,
+                             FunctionModel[]? functions = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
@@ -36,7 +41,8 @@ static class Dacpac
                       .Concat(tables.SelectMany(Uniques))
                       .Concat(tables.SelectMany(Defaults))
                       .Concat(views.Select(View))
-                      .Concat(references.Select(Reference))));
+                      .Concat(references.Select(Reference))
+                      .Concat((functions ?? []).Select(Function))));
 
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         using var entry = archive.CreateEntry("model.xml").Open();
@@ -58,6 +64,15 @@ static class Dacpac
 
     static XElement View(ViewModel view) =>
         El("SqlView", $"[dbo].[{view.Name}]", Script("QueryScript", view.Query));
+
+    /// The return type sits under the function's own `Type`, each parameter under `Parameters`
+    /// with its name qualified by the function's, and the body is a script one relationship down.
+    static XElement Function(FunctionModel function) =>
+        El("SqlScalarFunction", $"[dbo].[{function.Name}]",
+            Rel("Type", El("SqlTypeSpecifier", null, Rel("Type", Ref($"[{function.ReturnType}]")))),
+            Rel("Parameters", [.. function.Parameters.Select(p =>
+                El("SqlSubroutineParameter", $"[dbo].[{function.Name}].[@{p}]"))]),
+            Rel("FunctionBody", El("SqlScriptFunctionImplementation", null, Script("BodyScript", function.Body))));
 
     /// A default is its own element, pointing back at the column it belongs to.
     static IEnumerable<XElement> Defaults(TableModel table) =>

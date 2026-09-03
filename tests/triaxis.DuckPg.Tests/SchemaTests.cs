@@ -221,6 +221,44 @@ public class SchemaTests
         Assert.Equal(["1"], lake.Query("SELECT * FROM lake.fine"));
     }
 
+    /// The view it reads was refused, so this one is refused by that name -- and not by DuckDB,
+    /// which would have to bind everything in front of the missing name to say so.
+    [Fact]
+    public void AViewReadingASkippedViewIsSkippedByThatName()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1, "amount": 5, "status": "sent"}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), [Stamped],
+            new Dacpac.ViewModel("dependent", "SELECT [order_id] FROM [dbo].[broken]"),
+            new Dacpac.ViewModel("broken", "SELECT * FROM [dbo].[orders] FOR XML PATH('o')"),
+            new Dacpac.ViewModel("fine", "SELECT [order_id] FROM [dbo].[orders]"));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Equal(["1"], lake.Query("SELECT * FROM lake.fine"));
+        Assert.Contains(lake.Logged, m => m.Contains("view dependent skipped: it reads broken, which was skipped"));
+    }
+
+    /// A declared function that is not an expression is not a macro, and a view calling it is
+    /// refused for that reason rather than for a name DuckDB could not find.
+    [Fact]
+    public void AViewCallingAnUnpublishedFunctionIsSkippedByThatName()
+    {
+        using var lake = new TestLake()
+            .Json("base", "orders", """[{"order_id": 1, "amount": 5, "status": "sent"}]""")
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), [Stamped],
+            [new Dacpac.ViewModel("calls", "SELECT [dbo].[Bucketed]([order_id]) AS [bucket] FROM [dbo].[orders]")],
+            [],
+            [new Dacpac.FunctionModel("Bucketed", ["value"], "int",
+                "BEGIN DECLARE @out INT = 0; IF @value > 10 SET @out = 1; RETURN @out END")]);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Contains(lake.Logged, m => m.Contains("view calls skipped: it calls Bucketed, which is not published"));
+    }
+
     [Fact]
     public void ASingleDacpacInALayerIsFoundOnItsOwn()
     {
