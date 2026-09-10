@@ -143,6 +143,20 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   deferred for the same reason there is nothing to skip: a write names its table, so a table nothing
   named was never written to, and its write layer still holds -- in the files, untouched -- whatever
   the run before this one left there. Measuring a delta for it would measure those writes away.
+- **A collapse while the lake serves is one transaction, which a collapse at build does not have to
+  be.** Taking the view out from under a name and putting a table there is several statements, and
+  everything else on this database is reading that name meanwhile -- a statement whose own name for
+  the table was missed reads the view, which is the price a miss is meant to cost, and a snapshot
+  taken between the `DROP VIEW` and the `CREATE TABLE` is that statement answered with *no such
+  table* instead. `Catalog.Collapse` wraps `Materialize`, so the name never stands for nothing. What
+  the transaction buys twice over is the refusal: a key the layers break is refused by DuckDB as the
+  transaction closes, since that is when the index is built, so the collapse comes apart *after* its
+  last statement has run -- and the rollback leaves the view standing, which is what makes the next
+  statement naming the table fail the way the first one did rather than on the half-made table the
+  first one left. So what the catalog remembers is `Catalog.Recorded`, said by whoever collapsed the
+  table once the commit has gone through and never in the middle of doing so: a promotion recorded
+  for a collapse that rolled back is a table published as the merge whose merge names a write branch
+  nothing made.
 - **A collapse is a catalog change every other connection sees, and a transaction that started
   first cannot.** DuckDB hands a transaction the catalog as it stood when it began, and
   `Catalog.Materialize` runs on the lake's own connection -- so a table collapsed under an open
