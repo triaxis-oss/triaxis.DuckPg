@@ -188,6 +188,33 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   warning, and why the layered side is not made to answer for a declared unique. A scan per rule per
   write would tax the mode that has no writes to tax, to enforce a rule against nobody.
 
+## Checks
+
+- **A declared `CHECK` is a rule about one row, so it is held over the rows a statement writes and
+  never by the table.** `DacpacSchema.ReadCheck` reads `CheckExpressionScript`, `Catalog.Checks`
+  translates it once per table on the tree like a default or a view body, and `Gateway.Breaks` turns
+  it into a `Plan.Checks` question -- `SELECT 1 FROM (<the rows>) WHERE NOT (<predicate>) LIMIT 1`,
+  refused in SQL Server's 547 wording naming the constraint. It runs before any step for the reason a
+  reference does: a statement outside a transaction commits each step as it goes.
+  Declaring it on the DuckDB table instead does not do the job. `ALTER TABLE … ADD CONSTRAINT …
+  CHECK` is refused by DuckDB 1.5.5 (*"No support for that ALTER TABLE option yet!"*), so it would
+  have to go into `CREATE TABLE` -- which costs `Materialize` its CTAS, covers a materialized lake
+  and no other, and refuses in words naming the expression rather than the constraint, which is
+  exactly what a client reads. Because it is row-local it costs a pass over the rows being written
+  rather than a scan of the table, which is what makes asking it on every write affordable where
+  asking about a declared unique is not.
+- **What the rule is about is the row as the table will hold it.** `Gateway.Filled` puts the declared
+  default under a column an insert left out, and a typed NULL under one with no default -- a
+  store-generated key among them. `NOT (…)` over an unknown is unknown, and an unknown row is not one
+  the question returns, so such a row passes: that is what SQL Server does, and refusing a row for a
+  value nobody can see yet would be inventing an answer. The materialized UPDATE that DuckDB is
+  handed as the client wrote it is asked the same question over what the assignments make of each
+  row, since the rule is about the rows the statement leaves behind and not about how they got there.
+- **A rule that cannot be rendered is not held, and says so.** A predicate the translator refuses, or
+  one naming a column the lake does not publish, is dropped with a warning -- a lake showing a subset
+  of a declared table loses the rule rather than failing every write to it, the same bargain
+  `KeyFor` and `Catalog.Uniques` strike.
+
 ## References and cascades
 
 - **A declared reference is a rule over the merged view, not a constraint on a table.** DuckDB

@@ -26,6 +26,10 @@ sealed record Rule(string Name, string[] Columns, RuleKind Kind, string? Filter 
 
 enum RuleKind { Key, Unique, Index }
 
+/// A declared `CHECK` a lake actually holds: the name a row breaking it is refused under, and the
+/// predicate in DuckDB's dialect.
+sealed record DeclaredCheck(string Name, string Sql);
+
 /// One layer's rows for one table, as something the view can select from. `Rows` is what it turned
 /// out to hold, where that was free to find out -- a materialized layer, which is everything but
 /// parquet.
@@ -701,6 +705,50 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// are known, since a reference this cannot enforce is worth saying so about at startup rather
     /// than at the first delete -- and a lake made of some of a database's tables has plenty.
     readonly Dictionary<string, List<Reference>> pointing = new(StringComparer.OrdinalIgnoreCase);
+
+    /// The declared checks each table's rows have to satisfy, as DuckDB spells them. Translated once
+    /// and kept: a check is asked of every write to the table, and the predicate does not change.
+    readonly ConcurrentDictionary<string, DeclaredCheck[]> checks = new(StringComparer.OrdinalIgnoreCase);
+
+    /// What the declared `CHECK`s come to for one table: the name each refuses under, and the
+    /// predicate its rows have to satisfy.
+    public IReadOnlyList<DeclaredCheck> Checks(Table table) =>
+        checks.GetOrAdd(table.Name, _ => [.. Translated(table)]);
+
+    /// The checks the dacpac declares for a table, in DuckDB's dialect. One the translator cannot
+    /// render, or that names a column the lake does not publish, is dropped with a warning: a lake
+    /// showing a subset of a declared table loses the rule rather than failing every write to it.
+    /// SQL Server's check grammar is an expression over the row's own columns, so every bracketed
+    /// name in it is one of them.
+    IEnumerable<DeclaredCheck> Translated(Table table)
+    {
+        var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                      new HashSet<string>(), Environment.UserName);
+
+        foreach (var check in schema.Checks.Where(c => Same(c.Table, table.Name)))
+        {
+            string? sql = null;
+            try
+            {
+                if (new TSqlLexer(check.Expression).Tokenize()
+                        .Where(token => token.Kind == TokenKind.QuotedName)
+                        .Select(token => token.Text)
+                        .FirstOrDefault(name => !table.Has(name)) is { } absent)
+                    logger.LogWarning("{Check} is over {Column}, which {Table} does not publish: " +
+                                      "the rule is not held", check.Name, absent, table.Name);
+                else
+                    sql = TSqlWriter.Write(TSqlParser.ParseExpression(check.Expression), context);
+            }
+            catch (Exception e)
+            {
+                logger.LogWarning("{Check} says {Expression}, which duckpg cannot render ({Reason}): " +
+                                  "the rule is not held",
+                                  check.Name, check.Expression, e.Message.ReplaceLineEndings(" "));
+            }
+
+            if (sql is not null) yield return new DeclaredCheck(check.Name, sql);
+        }
+    }
 
     /// The declared scalar functions that were actually published as macros. A call to one of these
     /// is resolved onto the lake; a call to anything else is left as it was written.

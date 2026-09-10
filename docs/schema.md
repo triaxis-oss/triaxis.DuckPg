@@ -65,6 +65,15 @@ that reports which rule refused it reads that name. A layered lake keeps none of
 Where the layers already break a declared rule, the lake says so at startup rather than serving rows
 it would go on to refuse.
 
+**Checks.** A `CHECK` constraint is enforced over the rows a statement is about to write, on a
+layered lake and a materialized one alike, and a row breaking one is refused the way SQL Server
+refuses it — error 547, naming the constraint. The predicate is T-SQL and goes through the same
+[translator](tsql.md) as everything else the dacpac declares; one that cannot be translated, or that
+names a column the lake does not publish, is dropped with a warning rather than failing every write
+to the table. A predicate that comes out unknown passes, as on SQL Server, and a column the statement
+left out is checked as the value it defaults to. Unlike a key this is a rule about one row, so it
+costs a pass over the rows being written rather than a scan of the table.
+
 **References.** A `DELETE` of a row something still points at fails the way SQL Server fails it —
 error 547, naming the constraint — rather than quietly leaving an orphan. The check is over the
 *merged view*, since a row pointing at this one may live in any layer, and it runs before anything is
