@@ -19,6 +19,13 @@ sealed record Column(string Name, string Type, ColumnDefault? Default = null, bo
 
 sealed record VirtualColumn(string Name, string Expr);
 
+/// One rule about the rows of a table that DuckDB holds and a client can break: what it is called,
+/// what it is over, which of the three things SQL Server calls it -- which is what decides the words
+/// a refusal reaches the client in -- and, for a filtered index, the rows it is a rule about at all.
+sealed record Rule(string Name, string[] Columns, RuleKind Kind, string? Filter = null);
+
+enum RuleKind { Key, Unique, Index }
+
 /// One layer's rows for one table, as something the view can select from. `Rows` is what it turned
 /// out to hold, where that was free to find out -- a materialized layer, which is everything but
 /// parquet.
@@ -1604,9 +1611,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             Exec(conn, $"ALTER TABLE {table.QualifiedName} ADD PRIMARY KEY " +
                        $"({string.Join(", ", table.Key.Select(SqlText.Quote))})");
 
-        foreach (var (name, columns, filter) in Uniques(table))
-            Exec(conn, $"CREATE UNIQUE INDEX IF NOT EXISTS {SqlText.Quote($"{table.Name}_{name}")} " +
-                       $"ON {table.QualifiedName} ({string.Join(", ", columns.Select(c => Indexed(c, filter)))})");
+        foreach (var rule in Uniques(table))
+            Exec(conn, $"CREATE UNIQUE INDEX IF NOT EXISTS {SqlText.Quote($"{table.Name}_{rule.Name}")} " +
+                       $"ON {table.QualifiedName} " +
+                       $"({string.Join(", ", rule.Columns.Select(c => Indexed(c, rule.Filter)))})");
     }
 
     /// What one column of a unique index is indexed by. Unfiltered, it is the column. Filtered, it
@@ -1619,6 +1627,18 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         filter is null
             ? SqlText.Quote(column)
             : $"(CASE WHEN {filter} THEN {SqlText.Quote(column)} END)";
+
+    /// Every rule the rows of this table are held to by name: the declared key, and -- materialized,
+    /// where DuckDB holds them as indexes -- the uniqueness declared past it. A layered lake holds
+    /// none of the latter, so it has none to name.
+    ///
+    /// Worked out per statement rather than kept: it is a `Where` over the schema's rules against a
+    /// plan's worth of string building, and a table that has just collapsed holds rules the same
+    /// table deferred did not.
+    public IEnumerable<Rule> Rules(Table table) =>
+        table.Key.Length == 0 ? Uniques(table)
+            : [new Rule(schema.KeyName(table.Name) ?? $"PK_{table.Name}", table.Key, RuleKind.Key),
+               .. Uniques(table)];
 
     /// The uniqueness the dacpac declares past the key -- a `UNIQUE` constraint or a unique index,
     /// which say the same thing about the rows and are held the same way. Unlike the key this is an
@@ -1635,8 +1655,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// A filtered index is a rule about the rows the filter matches and says nothing about the rest,
     /// so the filter is carried through to the index rather than dropped: held unfiltered it refuses
     /// rows the schema allows, which is the wrong answer and not a narrower one.
-    IEnumerable<(string Name, string[] Columns, string? Filter)> Uniques(Table table)
+    IEnumerable<Rule> Uniques(Table table)
     {
+        if (!table.Materialized) yield break;
+
         var partitions = table.Layers.SelectMany(l => l.Source.Partitions)
                               .Distinct(StringComparer.OrdinalIgnoreCase);
 
@@ -1649,7 +1671,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
             string[] columns = [.. unique.Columns,
                                 .. partitions.Where(p => table.Has(p) && !unique.Columns.Any(c => Same(c, p)))];
-            if (!Covers(table.Key, columns)) yield return (unique.Name, columns, filter);
+            if (!Covers(table.Key, columns))
+                yield return new Rule(unique.Name, columns,
+                                      unique.Index ? RuleKind.Index : RuleKind.Unique, filter);
         }
     }
 

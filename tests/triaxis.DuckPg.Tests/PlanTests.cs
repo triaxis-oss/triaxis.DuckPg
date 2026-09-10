@@ -159,7 +159,7 @@ public class PlanTests
         var refused = Assert.Throws<PostgresException>(() =>
             lake.Execute("INSERT INTO lake.orders (order_id, amount) VALUES (1, 5)"));
         Assert.Equal("23505", refused.SqlState);
-        Assert.Contains("Violation of PRIMARY KEY constraint on \"orders\"", refused.MessageText);
+        Assert.Contains("Violation of PRIMARY KEY constraint 'PK_orders'", refused.MessageText);
     }
 
     /// A layered lake has to ask, since the write branch's own key sees only what this process

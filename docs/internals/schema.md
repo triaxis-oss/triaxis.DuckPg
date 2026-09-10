@@ -117,6 +117,23 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   `Gateway.Duplicates` asks about the key alone. Asking about a declared unique too would be another
   scan of the merge per rule per write, and the key's scan is already most of what a write costs.
   That divergence is a decision and not a gap left open -- see below.
+- **A refusal names the rule that refused, because that is what an application reads.** DuckDB says
+  which *kind* of rule a write broke and never which one -- and a table may hold several -- so
+  `Gateway.Refused` carries every rule `Catalog.Rules` lists beside the plan, each with SQL Server's
+  own words for it: 2627 for a key or a `UNIQUE` constraint, 2601 for a unique index, which is a
+  different sentence rather than the same one with another noun. `DacpacSchema.KeyName` keeps the
+  key's constraint name for the same reason a reference's is kept. Two DuckDB messages arrive here
+  and both are answered: the row-wise `Duplicate key "label: a" violates unique constraint`, which
+  names the columns, so `Violation.Collided` matches those against the declared rules and answers
+  without asking anything; and the append path's `PRIMARY KEY or UNIQUE constraint violation:
+  duplicate key "26, 24"`, which names only values, so each rule is asked in turn. That question --
+  `Gateway.Broken`, one query a rule, `LIMIT 1` -- runs *only* on the error path, so a write that
+  succeeds still costs what DuckDB's own enforcement costs. It asks the statement's own rows again
+  rather than the table, since what was refused was rolled back with the statement and is not there
+  to look at; and it compares with `=` over rows carrying no NULL, and under the rule's own filter
+  where it has one, because that is what a DuckDB index counts as a collision -- naming a rule
+  DuckDB would not have refused is worse than naming none. A rule that cannot be asked at all -- a transaction DuckDB has already aborted answers
+  nothing more -- is one that did not answer.
 - **The foreign keys DuckDB offers are not the ones a lake needs, materialized or not.**
   `ALTER TABLE ... ADD FOREIGN KEY` is unimplemented, so a constraint has to be declared in
   `CREATE TABLE` -- which costs `Materialize` its CTAS and demands the tables be built in dependency
