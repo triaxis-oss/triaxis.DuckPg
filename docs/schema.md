@@ -83,8 +83,12 @@ references that do *not* cascade, and the count answered for is the target's own
 `ON DELETE SET NULL` and `SET DEFAULT` are performed as what they mean — the rows that pointed stay
 where they are with the pointing columns emptied, which is an update, so nothing is hidden and nothing
 recurses. Where either cannot be performed, the reference is kept as one that refuses instead and the
-reason is logged at startup, since orphaning the rows is wrong either way. The insert side is
-unchecked, and a reference to columns that are not the table's key is skipped.
+reason is logged at startup, since orphaning the rows is wrong either way. A reference pointing at the
+parent's key *and* columns beside it — what a schema writes to keep a written column agreeing with
+the parent's — is kept and cascades like any other, since everything past the key is decided by the
+key and a delete collects it alongside. The insert side is unchecked, and a reference pointing past
+the key without the key among its columns is skipped, since a delete has no way to collect the rows
+it names.
 
 **Views** declared in the dacpac are published beside the tables they read, so a report a client
 already knows by name is there without being rewritten as a layer. The query goes through the same

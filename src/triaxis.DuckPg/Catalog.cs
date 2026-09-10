@@ -776,6 +776,16 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     List<Reference> Pointing(Table table) => pointing.GetValueOrDefault(table.Name) ?? [];
 
+    /// What a delete from this table has to collect before the rows go: the key, and whatever else
+    /// the references pointing at it are matched on. Each of those is determined by the key -- a
+    /// reference is only kept where it points at the key and more -- so collecting them alongside it
+    /// neither adds rows nor changes what one row is.
+    public string[] Collected(Table table) =>
+        [.. table.Key,
+         .. Pointing(table).SelectMany(reference => reference.ParentColumns)
+             .Where(column => !table.Key.Contains(column, StringComparer.OrdinalIgnoreCase))
+             .Distinct(StringComparer.OrdinalIgnoreCase)];
+
     /// The references a delete from this table has to answer for.
     public IEnumerable<Reference> Referencing(Table table) => Pointing(table).Where(r => Does(r, NoAction));
 
@@ -805,14 +815,15 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                 continue;
             }
 
-            // What a delete collects before the rows go is the table's key, so that is the only
-            // thing a reference can be checked against here.
-            if (!parent.Key.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).SequenceEqual(
-                    declared.ParentColumns.OrderBy(k => k, StringComparer.OrdinalIgnoreCase),
-                    StringComparer.OrdinalIgnoreCase))
+            // A delete collects what the references pointing at the table need, and everything a row
+            // is named by past its key is determined by that key -- so a reference pointing at the
+            // key and more is one the collected set can carry. One pointing past it without the key
+            // in hand names rows a delete cannot collect, and stays unenforced.
+            if (parent.Key.Length == 0 || declared.ParentColumns.Any(c => !parent.Has(c)) ||
+                parent.Key.Any(k => !declared.ParentColumns.Contains(k, StringComparer.OrdinalIgnoreCase)))
             {
-                logger.LogWarning("{Reference} points at {Columns} of {Parent}, which is not its key: " +
-                                  "duckpg checks a reference against the key a delete collects",
+                logger.LogWarning("{Reference} points at {Columns} of {Parent}, which does not include its " +
+                                  "key: duckpg checks a reference against what a delete collects",
                                   declared.Name, string.Join(", ", declared.ParentColumns), declared.Parent);
                 continue;
             }
