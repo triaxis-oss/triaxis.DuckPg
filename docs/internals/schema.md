@@ -226,6 +226,17 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   on a row already gone. The keys are selected twice for that -- once by the check, once by the plan
   -- and only for a table something points at. The insert side is not checked at all: it would be
   more promise than a stack of files can keep, since what a read layer holds can change between runs.
+- **What a delete collects is what the references need, and that is more than the key.** A reference
+  pointing at the parent's key *and* a column beside it is what a schema writes whenever it wants a
+  written column to agree with the parent's -- a room's type kept from disagreeing with the room's
+  own -- and dropping it drops its cascade with it, leaving rows SQL Server would have taken.
+  Everything past the key is determined by the key, so `Catalog.Collected` puts those columns into
+  the key set the plan writes down: the `SELECT DISTINCT` returns the same rows it did, since nothing
+  is added that the key does not already decide, and `Matching` then has both sides of the join to
+  compare. `Catalog.Declared` keeps a reference where the parent columns are a *superset* of the
+  parent's key; one pointing past the key without the key in hand names rows a delete cannot collect
+  and stays dropped with its warning. `Tombstone` names the key columns rather than taking the
+  temp table whole, since the temp table is no longer only the key.
 - **A cascade is that same delete, one table down.** `Gateway.Cascading` walks the declared
   references from the table being deleted from, and each level collects its own keys into a
   `duckpg_cascade_n` temp table before hiding them -- read off the level above's temp table, since

@@ -893,10 +893,13 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var predicate = where < 0 ? "TRUE" : sql[(where + 5)..];
 
         // Which rows a `TOP (n)` settled on is the key set the plan writes down, and the checks read
-        // the query behind it rather than the table -- they run before any step does.
-        var counted = Keyed(table, scan, qualifier, predicate);
+        // the query behind it rather than the table -- they run before any step does. It carries
+        // what the references pointing at this table are matched on as well as the key, which for a
+        // reference pointing at the key and more is what a refusal and a cascade both read.
+        var collect = Catalog.Collected(table);
+        var counted = Keyed(table, scan, qualifier, predicate, collect: collect);
         var keyed = rows is null ? counted
-            : Keyed(table, scan, qualifier, predicate, Limit(rows, percent, counted));
+            : Keyed(table, scan, qualifier, predicate, Limit(rows, percent, counted), collect);
 
         // A cascade goes before the rows it depends on are hidden, and every level answers for the
         // references that do not cascade -- a row two tables down may be held by one of those.
@@ -996,10 +999,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// any n rows would answer it: this query is evaluated more than once -- the plan writes it down
     /// and every check re-asks it, since a check runs before the first step -- and an arbitrary n
     /// taken twice is two different sets, which would have the checks answering for rows that stayed.
-    static string Keyed(Table table, string scan, string qualifier, string predicate, string? limit = null)
+    static string Keyed(Table table, string scan, string qualifier, string predicate, string? limit = null,
+                        string[]? collect = null)
     {
         var keys = string.Join(", ", table.Key.Select(k => qualifier + SqlText.Quote(k)));
-        return $"SELECT DISTINCT {keys} FROM {scan} WHERE {predicate}" +
+        var collected = string.Join(", ", (collect ?? table.Key).Select(k => qualifier + SqlText.Quote(k)));
+        return $"SELECT DISTINCT {collected} FROM {scan} WHERE {predicate}" +
                (limit is null ? "" : $" ORDER BY {keys} LIMIT {limit}");
     }
 
@@ -1160,7 +1165,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// order, and the tombstone table holds them in the table's -- positionally, a key of one type
     /// throughout would land swapped, burying another row.
     static string Tombstone(Table table, string keys = "duckpg_keys") =>
-        $"INSERT OR IGNORE INTO {table.TombstoneName} ({KeyList(table)}) SELECT * FROM {keys}";
+        $"INSERT OR IGNORE INTO {table.TombstoneName} ({KeyList(table)}) " +
+        $"SELECT {KeyList(table)} FROM {keys}";
 
     /// The write layer's own copy of a row is deleted outright -- nothing below it to hide.
     static string Evict(Table table, string keys = "duckpg_keys") =>
@@ -1184,7 +1190,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         {
             var child = Catalog.Tables[reference.Table];
             var matched = Matching(reference);
-            var collected = string.Join(", ", child.Key.Select(k => "c." + SqlText.Quote(k)));
+            var collected = string.Join(", ", Catalog.Collected(child).Select(k => "c." + SqlText.Quote(k)));
 
             // One per level, and a level adds exactly one table to promote -- a cascade that reaches
             // the same table twice collects for each parent separately, which is what it means.
