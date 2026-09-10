@@ -99,7 +99,21 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   genuinely in the lake, and it stays a startup failure. A partition column joins it for the reason
   it joins the key: rows are
   only unique *within* a partition, and a rule that forgot that would refuse a lake for holding the
-  row it was partitioned to hold. **A layered lake keeps none of this**: it publishes views, and
+  row it was partitioned to hold.
+  **A filtered index is a rule over the rows its filter matches, and holding it unfiltered is the
+  wrong rule rather than a stricter one.** `DacpacSchema.ReadIndex` reads `FilterPredicate` beside
+  `IsUnique` and `Catalog.Filtered` renders it, so `Catalog.Keyed` indexes each column as
+  `(CASE WHEN <filter> THEN "c" END)` rather than as itself. Measured against DuckDB 1.5.5:
+  `CREATE UNIQUE INDEX … WHERE …` is refused outright -- *"Creating partial indexes is not supported
+  currently"* -- so the predicate cannot be handed over as written; an index over expressions works
+  with each of them parenthesised, a bare `CASE` being a parse error; and a row outside the filter
+  indexes as all-NULL, which collides with nothing since DuckDB counts two NULLs as different --
+  confirmed by insert and by an `UPDATE` that moves a row *into* the filter, which is refused as it
+  should be. The filter is T-SQL and goes through the translation a declared default and a view body
+  already go through. What cannot be rendered -- or names a column `Carried` says the lake does not
+  hold -- drops the rule with a warning: refusing rows on a rule read wrong is the one answer worse
+  than not holding the rule at all. The caveat is the one uniqueness already carries here: a row
+  *inside* the filter whose indexed column is NULL is not caught. **A layered lake keeps none of this**: it publishes views, and
   `Gateway.Duplicates` asks about the key alone. Asking about a declared unique too would be another
   scan of the merge per rule per write, and the key's scan is already most of what a write costs.
   That divergence is a decision and not a gap left open -- see below.
