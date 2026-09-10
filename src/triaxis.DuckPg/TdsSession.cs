@@ -35,6 +35,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     long rowCount;
     int transactions;
     bool turn;
+    bool inside;
     long descriptor;
     int handles;
 
@@ -391,6 +392,9 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                  Translated? translated = null)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        // Before the transaction opens, not after: a collapse the lake makes in between is one this
+        // session's transaction would be too late to see.
+        if (!inside && plan.Tag == "BEGIN") gateway.Transacting(inside = true);
         try
         {
             Perform(msg, plan, parameters, doneToken, last, translated);
@@ -407,8 +411,11 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     /// A serialized lake's turn to write, given up when the transaction that took it ends -- and
     /// with the session, so a client that vanishes mid-transaction cannot keep the lake to itself.
+    /// What the lake is told about the transaction goes the same way and for the same reason: a
+    /// session that never reaches its COMMIT must not hold a lazy lake to the layers forever.
     void Release()
     {
+        if (inside) gateway.Transacting(inside = false);
         if (!turn) return;
         turn = false;
         gateway.ExitTurn();

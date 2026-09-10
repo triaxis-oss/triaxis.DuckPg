@@ -97,7 +97,9 @@ Each of these is the short form; the note behind it is where the argument is.
 - **A deferred table is published as the merge, never as an empty one.** `Config.Lazy` finds the
   tables a statement is about by reading its text for names the catalog knows, and a scan of text can
   miss: what a miss costs has to be the layered price rather than the wrong answer. A failed collapse
-  leaves the table deferred, and `Flush` skips what was never collapsed.
+  leaves the table deferred, and `Flush` skips what was never collapsed. A collapse happens *between*
+  transactions and never during one -- a transaction reads the catalog as it stood when it began --
+  and it carries the write branch the run has earned rather than only the one a file names.
   [lake](docs/internals/lake.md#materializing-and-the-store)
 - **A baked database is a materialized lake somebody else already collapsed**, served from a copy
   and never written to, with the shutdown delta measured against it -- and it freezes the defaults a

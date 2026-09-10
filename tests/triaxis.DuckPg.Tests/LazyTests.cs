@@ -261,3 +261,142 @@ public class LazyTests : IDisposable
         Assert.Contains("materialize", refused.Message);
     }
 }
+
+/// A collapse is a catalog change the lake makes on its own connection, and DuckDB hands a
+/// transaction the catalog as it stood when that transaction began -- so a table collapsed under an
+/// open transaction is one that transaction cannot see. These pin the answer: a lake collapses
+/// between transactions and never during one, and a statement inside one is answered by the merge.
+public class LazyTransactionTests : IDisposable
+{
+    readonly TestLake lake = new TestLake("lazy-transactions")
+        .Json("base", "orders", """[{"order_id": 1, "note": "base"}]""")
+        .Json("base", "customers", """[{"customer_id": 1, "name": "acme"}]""")
+        .Stack("base", "top")
+        .WriteTo("local")
+        .Materialized()
+        .Lazily()
+        .WithTds();
+
+    public LazyTransactionTests()
+    {
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            [new Dacpac.TableModel("orders", [("order_id", "int"), ("note", "nvarchar")], ["order_id"],
+                                   Identity: ["order_id"]),
+             new Dacpac.TableModel("customers", [("customer_id", "int"), ("name", "nvarchar")], ["customer_id"])]);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+    }
+
+    public void Dispose() => lake.Dispose();
+
+    SqlConnection Open()
+    {
+        var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+        return connection;
+    }
+
+    bool Collapsed(string table) => lake.Catalog.Tables[table].Materialized;
+
+    /// The write a declared identity draws from is the reported shape: a table first named by the
+    /// second statement of a transaction, whose key comes from a sequence the collapse would have
+    /// created -- and which the transaction would not have been able to see.
+    [Fact]
+    public void AWriteInsideATransactionIsAnsweredByTheLayers()
+    {
+        using var connection = Open();
+        using var transaction = connection.BeginTransaction();
+        new SqlCommand("SELECT [customer_id] FROM [customers]", connection, transaction).ExecuteScalar();
+
+        Assert.Equal(2, new SqlCommand("INSERT INTO [orders] ([note]) OUTPUT INSERTED.[order_id] " +
+                                       "VALUES ('written')", connection, transaction).ExecuteScalar());
+        Assert.False(Collapsed("orders"));
+        transaction.Commit();
+
+        Assert.Equal(["1=base", "2=written"],
+                     lake.Query("SELECT order_id || '=' || note FROM lake.orders ORDER BY order_id"));
+    }
+
+    /// The same for what a write takes away: a tombstone a transaction wrote is in DuckDB before it
+    /// is in a file, and the collapse after it has to hide the row rather than bring it back.
+    [Fact]
+    public void ADeleteInsideATransactionSurvivesTheCollapse()
+    {
+        using (var connection = Open())
+        {
+            using var transaction = connection.BeginTransaction();
+            new SqlCommand("SELECT [customer_id] FROM [customers]", connection, transaction).ExecuteScalar();
+            new SqlCommand("DELETE FROM [orders] WHERE [order_id] = 1", connection, transaction).ExecuteNonQuery();
+            transaction.Commit();
+        }
+
+        Assert.Empty(lake.Query("SELECT order_id FROM lake.orders"));
+        Assert.True(Collapsed("orders"));
+
+        lake.Restart();
+        Assert.Empty(lake.Query("SELECT order_id FROM lake.orders"));
+    }
+
+    /// And what it was held off from is done as soon as the transaction is over, so a lake that has
+    /// been written to in one still ends up serving the table rather than the merge.
+    [Fact]
+    public void TheCollapseHappensOnceTheTransactionIsOver()
+    {
+        using var connection = Open();
+        using (var transaction = connection.BeginTransaction())
+        {
+            new SqlCommand("SELECT [customer_id] FROM [customers]", connection, transaction).ExecuteScalar();
+            Assert.Equal(["1=base"], Notes(connection, transaction));
+            Assert.False(Collapsed("orders"));
+            transaction.Commit();
+        }
+
+        Assert.Equal(["1=base"], Notes(connection, null));
+        Assert.True(Collapsed("orders"));
+    }
+
+    /// The transaction need not be the one asking: a collapse another session made is one this
+    /// session's open transaction is equally unable to see, so nothing is collapsed while any
+    /// transaction is open.
+    [Fact]
+    public void AnotherSessionsTransactionHoldsTheCollapseOff()
+    {
+        using var holder = Open();
+        using var transaction = holder.BeginTransaction();
+        new SqlCommand("SELECT [customer_id] FROM [customers]", holder, transaction).ExecuteScalar();
+
+        using var other = Open();
+        Assert.Equal(["1=base"], Notes(other, null));
+        Assert.False(Collapsed("orders"));
+
+        transaction.Commit();
+        Assert.Equal(["1=base"], Notes(other, null));
+        Assert.True(Collapsed("orders"));
+    }
+
+    /// A transaction whose BEGIN never arrived at a COMMIT is one the client abandoned, and the lake
+    /// is not held to the layers for the rest of its life by it.
+    [Fact]
+    public void AnAbandonedTransactionDoesNotHoldTheCollapseOff()
+    {
+        using (var connection = Open())
+        {
+            var transaction = connection.BeginTransaction();
+            new SqlCommand("SELECT [customer_id] FROM [customers]", connection, transaction).ExecuteScalar();
+        }
+
+        using var other = Open();
+        Assert.Equal(["1=base"], Notes(other, null));
+        Assert.True(Collapsed("orders"));
+    }
+
+    static List<string> Notes(SqlConnection connection, SqlTransaction? transaction)
+    {
+        using var reader = new SqlCommand(
+            "SELECT CONVERT(nvarchar, [order_id]) + '=' + [note] FROM [orders] ORDER BY [order_id]",
+            connection, transaction).ExecuteReader();
+        var notes = new List<string>();
+        while (reader.Read()) notes.Add(reader.GetString(0));
+        return notes;
+    }
+}

@@ -41,6 +41,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     char transactionStatus = 'I';
     bool skipUntilSync;
     bool turn;
+    bool inside;
 
     public int ProcessId { get; } = Random.Shared.Next(1, int.MaxValue);
     public int Secret { get; } = Random.Shared.Next(1, int.MaxValue);
@@ -336,7 +337,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     /// them down first, and the last step is what answers.
     void Written(Plan plan, object?[] arguments)
     {
-        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        Taken(plan);
         try
         {
             Checked(plan, arguments);
@@ -374,10 +375,22 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         return affected;
     }
 
+    /// What a plan has to hold before it runs: a serialized lake's turn to write, and -- before the
+    /// transaction opens rather than after -- the lake's own count of the transactions open, since a
+    /// collapse made in between is one this session's transaction would be too late to see.
+    void Taken(Plan plan)
+    {
+        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        if (!inside && plan.Tag == "BEGIN") gateway.Transacting(inside = true);
+    }
+
     /// A serialized lake's turn to write, given up when the transaction that took it ends -- and
     /// with the session, so a client that vanishes mid-transaction cannot keep the lake to itself.
+    /// What the lake is told about the transaction goes the same way and for the same reason: a
+    /// session that never reaches its COMMIT must not hold a lazy lake to the layers forever.
     void Release()
     {
+        if (inside) gateway.Transacting(inside = false);
         if (!turn) return;
         turn = false;
         gateway.ExitTurn();
@@ -414,7 +427,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
 
     void RunPlan(Plan plan, object?[] arguments, short[] resultFormats)
     {
-        if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
+        Taken(plan);
         try
         {
             Perform(plan, arguments, resultFormats);
