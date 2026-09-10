@@ -143,6 +143,25 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   deferred for the same reason there is nothing to skip: a write names its table, so a table nothing
   named was never written to, and its write layer still holds -- in the files, untouched -- whatever
   the run before this one left there. Measuring a delta for it would measure those writes away.
+- **A collapse is a catalog change every other connection sees, and a transaction that started
+  first cannot.** DuckDB hands a transaction the catalog as it stood when it began, and
+  `Catalog.Materialize` runs on the lake's own connection -- so a table collapsed under an open
+  transaction leaves that transaction with neither the table under the name nor, where a declared
+  identity is involved, the sequence the write draws from: `nextval` refused on a name that is there
+  for everybody else, which is what a client sees first because the key is generated before the row
+  is written. So a lake collapses *between* transactions and never during one. `Gateway.transacting`
+  counts them, told by each session before its `BEGIN` runs and again once it is over -- before,
+  because a collapse made in between is one the transaction would be too late to see, and both under
+  `gate`, which is the lock a collapse is under and so the only thing ordering the two. A statement
+  inside a transaction is answered by the merge, exactly as one whose name was missed is; and a
+  session that vanishes mid-transaction gives the count back through `Release`, beside the write
+  turn it gives up for the same reason.
+- **A write branch earned since the build is in DuckDB before it is in a file.**
+  `WriteLayer.Carries` answers from the write directory, which is all a start has to go on -- but a
+  table written to while it was still deferred carries its rows in a branch no file mentions yet, so
+  `Catalog.Materialize` asks `Promoted` and `Tombstoned` beside it. Without that the collapse merges
+  the read layers alone and writes the run's own rows away, which is a lost write rather than a slow
+  one.
 - **A store is the one thing that carries a deferred table's view into the next run**, which is why
   `Catalog.Standing` asks once what each name is already holding -- the shape it has and whether
   DuckDB is keeping its key with it, which is what a stored start would otherwise ask table by table

@@ -153,7 +153,7 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // Before anything is translated, since what stands under a name decides how a write to it is
         // rewritten. Read without the lock and settled under it: the answer only ever goes from true
         // to false, and a lake with nothing left to collapse never looks at a statement again.
-        if (Catalog.Deferring) lock (gate) Catalog.Touch(admin, sql);
+        if (Catalog.Deferring) lock (gate) { if (transacting == 0) Catalog.Touch(admin, sql); }
 
         var verb = SqlText.FirstWord(sql);
         return Logged(sql, verb switch
@@ -245,6 +245,23 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     }
 
     // ---- serialized transactions ------------------------------------------------------------------
+
+    /// Sessions with a transaction open. A collapse is a catalog change made on the lake's own
+    /// connection, and DuckDB hands a transaction the catalog as it stood when it began -- so
+    /// neither the table that replaces the view nor the sequence a declared identity draws from is
+    /// there for a transaction that started first. A lake therefore collapses between transactions
+    /// and never during one: a statement inside one is answered by the merge, exactly as one whose
+    /// table name was missed is.
+    int transacting;
+
+    /// Told before the transaction begins and after it ends, under `gate` -- the lock a collapse is
+    /// under, which is what orders the two rather than leaving them to race. A transaction whose
+    /// `BEGIN` failed says so through the same path a committed one does, so nothing is held for a
+    /// transaction that never opened.
+    public void Transacting(bool inside)
+    {
+        lock (gate) transacting += inside ? 1 : -1;
+    }
 
     /// Waits for the lake's turn, indefinitely -- which is what SQL Server does with the default
     /// LOCK_TIMEOUT. False when the option is off, and then nothing is held.

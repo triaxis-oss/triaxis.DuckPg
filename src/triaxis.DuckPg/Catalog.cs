@@ -1450,7 +1450,10 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // Merged against the stacked form of the table: a materialized one writes where it reads,
         // so asking it for its write branch by name would point the merge at itself.
         var stacked = table with { Materialized = false };
-        var carries = table.Writable && write.Carries(stacked);
+        // What the write layer knows is what its directory holds, and a branch earned since the
+        // build is in DuckDB before it is in a file -- so a deferred table written to before
+        // anything named it would be collapsed back to the layers it was written over.
+        var carries = table.Writable && (Promoted(table) || write.Carries(stacked));
         // A deferred table was published as the merge and has had its branch loaded since the build;
         // preparing it again would only read the same files back over the same rows.
         if (carries && !Promoted(table)) write.Prepare(conn, stacked);
@@ -1493,7 +1496,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // What it serves is that baseline with the previous run's delta on top of it: the whole
         // stack, evaluated once.
         Exec(conn, $"CREATE OR REPLACE TABLE {table.QualifiedName} AS " +
-                   Merged(stacked, carries, carries && write.HasTombstones(stacked)));
+                   Merged(stacked, carries, carries && (Tombstoned(table) || write.HasTombstones(stacked))));
 
         // Nothing is earned here: the branch a write would have to make is the table itself. The
         // key is never already there: whatever stood under the name, what holds it now is a table
