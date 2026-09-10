@@ -372,10 +372,51 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         }
     }
 
-    /// The plan's write steps, in order, and how many rows the last of them touched. A step that
-    /// generates a key hands it back instead of a count, so it is read rather than counted -- what
-    /// the table last generated is a process's memory, and both front doors write to it.
+    /// The plan's write steps, in order and as one write. A plan with more than one step evicts rows
+    /// before it re-inserts them, so run as separate auto-committed statements it is a window in
+    /// which another connection sees neither -- and a step that fails leaves what came before it
+    /// committed, which is the rows simply gone. Each session has its own DuckDB connection, so a
+    /// transaction here is the session's own and no reader waits on it.
+    ///
+    /// Only where the client is not already in one of its own: that transaction is what the steps
+    /// belong to then, and it ends when the client says so.
     int Steps(Plan plan, object?[] arguments, int count)
+    {
+        if (count < 2 || transactionStatus != 'I') return InOrder(plan, arguments, count);
+
+        Exec("BEGIN TRANSACTION");
+        try
+        {
+            var affected = InOrder(plan, arguments, count);
+            Exec("COMMIT");
+            return affected;
+        }
+        catch
+        {
+            Undo();
+            throw;
+        }
+    }
+
+    /// Whatever the plan managed to write, taken back. A transaction DuckDB has already given up on
+    /// answers nothing to a ROLLBACK either, and the error being thrown is the one worth reporting.
+    void Undo()
+    {
+        try { Exec("ROLLBACK"); }
+        catch (Exception e) { logger.LogDebug("rollback: {Reason}", e.Message.ReplaceLineEndings(" ")); }
+    }
+
+    void Exec(string sql)
+    {
+        using var command = duck.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    /// The steps themselves. A step that generates a key hands it back instead of a count, so it is
+    /// read rather than counted -- what the table last generated is a process's memory, and both
+    /// front doors write to it.
+    int InOrder(Plan plan, object?[] arguments, int count)
     {
         var affected = 0;
         for (var i = 0; i < count; i++)
@@ -663,6 +704,10 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
     public void Dispose()
     {
         server.Unregister(this);
+
+        // A client that vanished mid-transaction leaves one open in DuckDB too, and the connection
+        // goes back as it is: what it was in the middle of is nobody's to finish.
+        if (transactionStatus != 'I') Undo();
         Release();
         foreach (var portal in portals.Values) portal.Reset();
         duck.Dispose();
