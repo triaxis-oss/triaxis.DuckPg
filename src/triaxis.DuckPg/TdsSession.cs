@@ -524,10 +524,51 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
     }
 
-    /// The plan's write steps, in order, and how many rows the last of them touched. One of them may
-    /// be the step that generates a key, and that one is read rather than counted: what it hands
-    /// back is what `SCOPE_IDENTITY()` and `IDENT_CURRENT` are later asked about.
+    /// The plan's write steps, in order and as one write. A plan with more than one step evicts rows
+    /// before it re-inserts them, so run as separate auto-committed statements it is a window in
+    /// which another connection sees neither -- and a step that fails leaves what came before it
+    /// committed, which is the rows simply gone. Each session has its own DuckDB connection, so a
+    /// transaction here is the session's own and no reader waits on it.
+    ///
+    /// Only where the client is not already in one of its own: that transaction is what the steps
+    /// belong to then, and it ends when the client says so.
     int Steps(Plan plan, IReadOnlyDictionary<string, Parameter> parameters, int count)
+    {
+        if (count < 2 || transactions > 0) return InOrder(plan, parameters, count);
+
+        Exec("BEGIN TRANSACTION");
+        try
+        {
+            var affected = InOrder(plan, parameters, count);
+            Exec("COMMIT");
+            return affected;
+        }
+        catch
+        {
+            Undo();
+            throw;
+        }
+    }
+
+    /// Whatever the plan managed to write, taken back. A transaction DuckDB has already given up on
+    /// answers nothing to a ROLLBACK either, and the error being thrown is the one worth reporting.
+    void Undo()
+    {
+        try { Exec("ROLLBACK"); }
+        catch (Exception e) { logger.LogDebug("rollback: {Reason}", e.Message.ReplaceLineEndings(" ")); }
+    }
+
+    void Exec(string sql)
+    {
+        using var command = duck.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
+    }
+
+    /// The steps themselves. One of them may be the step that generates a key, and that one is read
+    /// rather than counted: what it hands back is what `SCOPE_IDENTITY()` and `IDENT_CURRENT` are
+    /// later asked about.
+    int InOrder(Plan plan, IReadOnlyDictionary<string, Parameter> parameters, int count)
     {
         var affected = 0;
         for (var i = 0; i < count; i++)
@@ -895,6 +936,11 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     void Reset()
     {
         prepared.Clear();
+
+        // A transaction the session was in is DuckDB's as well as duckpg's, and this connection is
+        // about to be somebody else's: left open it would swallow whatever the next session writes,
+        // and refuse it a transaction of its own.
+        if (transactions > 0) Undo();
         transactions = 0;
         bulk = null;
 
@@ -1300,6 +1346,9 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     public void Dispose()
     {
+        // A client that vanished mid-transaction leaves one open, and the connection goes back to
+        // the pool as it is: what it was in the middle of is nobody's to finish.
+        if (transactions > 0) Undo();
         Release();
         duck.Dispose();
         client.Dispose();

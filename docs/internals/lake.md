@@ -337,6 +337,24 @@ Working notes for changing the code. What a lake *does* is [layers.md](../layers
   says in advance that it will stay read-only. Off by default, so a lake serving readers pays
   nothing for it.
 
+- **A plan with more than one step is one write, and DuckDB has to be told so.** A plan that
+  rewrites rows evicts them before it re-inserts them, so run as separate auto-committed statements
+  there is a moment in which another connection sees neither -- and a reader never waits for a
+  writer, which is exactly why it must never see that. `TdsSession.Steps` and its PostgreSQL twin
+  wrap the steps in `BEGIN`/`COMMIT` on the session's own DuckDB connection and roll back on error;
+  each session has one of its own, so this is local and no other session waits on it. Only where the
+  client is not already in a transaction of its own: that one is what the steps belong to then, and
+  it ends when the client says so. It also closes the hole `Gateway.Duplicates` names -- a key
+  DuckDB refuses at the insert used to be refused after the delete had committed, and the rows were
+  simply gone -- which makes the pre-write checks a second answer rather than the only one.
+  `UPDATE … FROM`, which is what EF Core's `ExecuteUpdate` sends, is the shape that shows it: a
+  join around the target takes the plan path even against a materialized table.
+- **A transaction a client walked away from is rolled back rather than left open.** The DuckDB
+  connection goes back to the pool as it is, so a session that vanished mid-transaction -- or a
+  pooled connection reset -- would otherwise hand the next session a connection already inside one:
+  its writes would join a transaction nobody commits, and it could not begin one of its own.
+  `Reset` and `Dispose` on both sessions undo it, beside giving the write turn back.
+
 ## Starting, stopping, and what a lake owns
 
 - **A shutdown that is not reached writes nothing.** A materialized lake's delta goes out at

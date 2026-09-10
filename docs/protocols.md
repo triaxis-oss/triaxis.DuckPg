@@ -34,6 +34,12 @@ either. A transaction that begins, reads, and only then writes to a table someon
 therefore fails with `Table with name … does not exist` against a table that is plainly there.
 Ordering the writes cannot close that; ordering the transactions can.
 
+A statement outside a transaction is still one write, whatever duckpg has to send to perform it: a
+statement rewritten into several — an `UPDATE` that takes rows away before it puts them back, a
+`DELETE` that cascades — runs those as one transaction on the session's own connection, so no other
+connection sees half of it and a step DuckDB refuses takes back what the steps before it wrote. That
+is what a client already assumes about a single statement, and no reader waits for it.
+
 So a session takes the lake's turn at `BEGIN` — or at its first write, outside one — and gives it up
 when that transaction ends; the next waits indefinitely, the way a real database does with the default
 `LOCK_TIMEOUT`. A read outside a transaction never waits; a read-only transaction does take the turn,

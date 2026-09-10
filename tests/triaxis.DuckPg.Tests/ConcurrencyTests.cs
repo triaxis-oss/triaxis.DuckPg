@@ -73,7 +73,8 @@ public class ConcurrencyTests
         Assert.Equal([$"{1 + Writers * Each}"], lake.Query("SELECT COUNT(*) FROM lake.t0"));
     }
 
-    static TestLake Rows(bool serialize, bool promoted = true, [CallerMemberName] string name = "")
+    static TestLake Rows(bool serialize, bool promoted = true, bool materialize = false,
+                         [CallerMemberName] string name = "")
     {
         var lake = new TestLake(name)
             .Json("base", "t", """[{"id": 1, "amount": 0}, {"id": 2, "amount": 0}]""")
@@ -82,6 +83,7 @@ public class ConcurrencyTests
             .WithTds();
         lake.Config.DefaultKey = ["id"];
         lake.Config.SerializeTransactions = serialize;
+        if (materialize) lake.Materialized();
         lake.Start();
 
         // A first write earns the table its write branch, and that is DDL two transactions conflict
@@ -322,5 +324,89 @@ public class ConcurrencyTests
         using var first = Writer(lake, "UPDATE [t] SET [amount] = 1 WHERE [id] = 1");
         Assert.Equal(["0"], lake.Query("SELECT amount FROM lake.t WHERE id = 1"));
         new SqlCommand("COMMIT", first).ExecuteNonQuery();
+    }
+
+    /// A plan that evicts rows before it re-inserts them is one write and has to look like one: run
+    /// as separate auto-committed statements there is a moment in which the rows are gone as far as
+    /// every other connection is concerned. `UPDATE … FROM` -- what EF Core's `ExecuteUpdate` sends
+    /// -- takes that path even against a materialized table, so it is the shape that shows it. A
+    /// reader never waits for a writer, which is exactly why it must never see half a write.
+    [Fact]
+    public async Task AReaderNeverSeesHalfAWrite()
+    {
+        const int Seeded = 2000;
+
+        using var lake = new TestLake(nameof(AReaderNeverSeesHalfAWrite))
+            .Json("base", "t", "[" + string.Join(",",
+                Enumerable.Range(1, Seeded).Select(i => $$"""{"id": {{i}}, "amount": 0}""")) + "]")
+            .Json("base", "u", "[" + string.Join(",",
+                Enumerable.Range(1, Seeded).Select(i => $$"""{"id": {{i}}, "bump": 1}""")) + "]")
+            .Stack("base")
+            .WriteTo("local")
+            .WithTds();
+        lake.Config.DefaultKey = ["id"];
+        lake.Materialized();
+        lake.Start();
+
+        var cancellation = TestContext.Current.CancellationToken;
+        using var writing = new CancellationTokenSource();
+
+        var writer = Task.Run(() =>
+        {
+            using var connection = new SqlConnection(lake.SqlConnectionString());
+            connection.Open();
+            var update = new SqlCommand(
+                "UPDATE [s] SET [amount] = [s].[amount] + [u].[bump] " +
+                "FROM [t] AS [s] INNER JOIN [u] ON [u].[id] = [s].[id]", connection);
+            while (!writing.IsCancellationRequested) update.ExecuteNonQuery();
+        }, cancellation);
+
+        // One connection held open, since what is being watched for lasts as long as two statements
+        // and opening one per read would step over it.
+        var counts = new HashSet<string>();
+        using (var reader = lake.Connect())
+        {
+            var until = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < until && !writer.IsCompleted)
+            {
+                using var command = new Npgsql.NpgsqlCommand("SELECT count(*) FROM lake.t", reader);
+                counts.Add(command.ExecuteScalar()!.ToString()!);
+            }
+        }
+
+        writing.Cancel();
+        await writer;
+
+        Assert.Equal([Seeded.ToString()], counts);
+    }
+
+    /// The other half of the same thing: a plan takes the rows away before it puts them back, so a
+    /// step DuckDB refuses used to leave them simply gone. A declared unique is held by DuckDB and
+    /// asked nothing beforehand, which is what makes it the rule that refuses at the insert.
+    [Fact]
+    public void ARefusedStepTakesBackWhatTheStepsBeforeItWrote()
+    {
+        using var lake = new TestLake(nameof(ARefusedStepTakesBackWhatTheStepsBeforeItWrote))
+            .Json("base", "t", """[{"id": 1, "label": "a"}, {"id": 2, "label": "b"}]""")
+            .Json("base", "u", """[{"id": 1, "to": "b"}, {"id": 2, "to": "b"}]""")
+            .Stack("base")
+            .WriteTo("local")
+            .WithTds();
+
+        Dacpac.Write(lake.At("schema", "test.dacpac"),
+            new Dacpac.TableModel("t", [("id", "int"), ("label", "nvarchar")], ["id"],
+                                  Uniques: [("UQ_t_label", ["label"], false)]),
+            new Dacpac.TableModel("u", [("id", "int"), ("to", "nvarchar")], ["id"]));
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Materialized().Start();
+
+        using var connection = new SqlConnection(lake.SqlConnectionString());
+        connection.Open();
+
+        Assert.ThrowsAny<Exception>(() => new SqlCommand(
+            "UPDATE [s] SET [label] = [u].[to] FROM [t] AS [s] INNER JOIN [u] ON [u].[id] = [s].[id]",
+            connection).ExecuteNonQuery());
+
+        Assert.Equal(["1|a", "2|b"], lake.Query("SELECT id, label FROM lake.t ORDER BY id"));
     }
 }
