@@ -13,9 +13,11 @@ sealed record Reference(string Name, string Table, string[] Columns,
                         string Parent, string[] ParentColumns, string OnDelete);
 
 /// Declared uniqueness that is not the key: which columns of which table, under the name the
-/// constraint or the index was given. `Filter` is the T-SQL a filtered unique index is only a rule
-/// over -- a `UNIQUE` constraint carries none, and neither does an unfiltered index.
-sealed record Unique(string Name, string Table, string[] Columns, string? Filter = null);
+/// constraint or the index was given. `Index` is which of the two it was written as -- they say the
+/// same thing about the rows and SQL Server refuses them in different words. `Filter` is the T-SQL a
+/// filtered unique index is only a rule over -- a `UNIQUE` constraint carries none, and neither does
+/// an unfiltered index.
+sealed record Unique(string Name, string Table, string[] Columns, bool Index, string? Filter = null);
 
 /// A declared scalar function: what it is called, what it takes in order, what it returns, and the
 /// body it was written with. The `CREATE FUNCTION` header is not in the model at all -- `BodyScript`
@@ -61,6 +63,10 @@ sealed class DacpacSchema
 
     public string[] Key(string table) => model.Keys.GetValueOrDefault(table) ?? [];
 
+    /// What the key's constraint is called. An application reporting which rule refused a write
+    /// reads that name, so it is carried rather than made up -- the same reason a reference's is.
+    public string? KeyName(string table) => model.KeyNames.GetValueOrDefault(table);
+
     /// The T-SQL a column defaults to, as the dacpac spells it -- `(getdate())`, `((0))`.
     public string? Default(string table, string column) =>
         model.Defaults.GetValueOrDefault((table, column));
@@ -103,6 +109,7 @@ sealed class DacpacModel
 
     public readonly Dictionary<string, List<Column>> Columns = new(StringComparer.OrdinalIgnoreCase);
     public readonly Dictionary<string, string[]> Keys = new(StringComparer.OrdinalIgnoreCase);
+    public readonly Dictionary<string, string> KeyNames = new(StringComparer.OrdinalIgnoreCase);
     public readonly Dictionary<(string Table, string Column), string> Defaults = new();
     public readonly Dictionary<string, string> Views = new(StringComparer.OrdinalIgnoreCase);
     public readonly List<Reference> References = [];
@@ -184,12 +191,13 @@ sealed class DacpacModel
         if (key.Length == 0) return false;
 
         Keys[name] = key;
+        if (Unqualify(constraint.Attribute("Name")?.Value) is { } declared) KeyNames[name] = declared;
         return true;
     }
 
     /// A `UNIQUE` constraint, which the model writes exactly as it writes the key -- the same column
     /// specifications under the same relationship, differing only in the element's type.
-    bool ReadUnique(XElement constraint) => ReadUnique(constraint, "DefiningTable");
+    bool ReadUnique(XElement constraint) => ReadUnique(constraint, "DefiningTable", index: false);
 
     /// A unique index says the same thing about the rows as a `UNIQUE` constraint, so it is read as
     /// one. A plain index says nothing about them, and DacFx leaves the property out rather than
@@ -199,17 +207,17 @@ sealed class DacpacModel
     /// read as unfiltered it is a rule the schema never declared, refusing rows SQL Server accepts.
     bool ReadIndex(XElement index) =>
         Property(index, "IsUnique") != "True" ||
-        ReadUnique(index, "IndexedObject", Property(index, "FilterPredicate"));
+        ReadUnique(index, "IndexedObject", index: true, Property(index, "FilterPredicate"));
 
     /// An index carries the table in its own name and a constraint does not, so which relationship
     /// names the table is the only thing the two differ by.
-    bool ReadUnique(XElement element, string relationship, string? filter = null)
+    bool ReadUnique(XElement element, string relationship, bool index, string? filter = null)
     {
         var table = Unqualify(Reference(element, relationship));
         var columns = Indexed(element);
         if (table is null || columns.Length == 0) return false;
 
-        Uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns,
+        Uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns, index,
                                string.IsNullOrWhiteSpace(filter) ? null : filter));
         return true;
     }

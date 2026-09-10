@@ -38,16 +38,66 @@ sealed record Identity(string Table, string Column)
     }
 }
 
+/// One rule a write can break, in the words SQL Server refuses it with. The name is the point: an
+/// application reporting which rule refused it reads that, and DuckDB's own message carries none.
+/// `Sql` says whether the rows the statement was about to write break this rule -- asked only on the
+/// error path, so a write that succeeds costs what DuckDB's own enforcement costs and nothing more.
+/// Null where the statement's rows cannot be asked about again, and then the rule is named only
+/// where DuckDB's own message says which columns collided.
+sealed record Refusal(string Name, string[] Columns, string Message, string? Sql);
+
 /// What a rule DuckDB holds means to a client, carried beside the plan that can break it. A layered
 /// lake asks first, since DuckDB sees only the rows this process wrote; a materialized table is
 /// asked by DuckDB itself, and answers in its own words -- so the plan brings the words the client
 /// would have been given either way.
-sealed record Violation(string Message, string SqlState)
+///
+/// `Message` is what a refusal none of the rules answers for is reported as. `Rules` are every one
+/// the table holds, the declared key first.
+sealed record Violation(string Message, string SqlState, Refusal[] Rules)
 {
-    /// Only a key. A unique index the dacpac declared is a rule the gateway never had words for,
-    /// and dressing one of those as a PRIMARY KEY violation would name the wrong constraint.
+    /// Both of the ways DuckDB refuses a duplicate: a row at a time -- `Duplicate key "label: a"
+    /// violates unique constraint` -- and the append path, which says only that one of the two kinds
+    /// of rule was broken.
     public bool Caused(Exception error) =>
-        error.Message.Contains("Constraint Error") && error.Message.Contains("primary key constraint");
+        error.Message.Contains("Constraint Error") &&
+        (error.Message.Contains("primary key constraint") ||
+         error.Message.Contains("unique constraint") ||
+         error.Message.Contains("PRIMARY KEY or UNIQUE constraint violation"));
+
+    /// Which rule it was, in SQL Server's words. The row-wise message names the columns that
+    /// collided, and matching those against the declared rules answers without asking DuckDB
+    /// anything. The append path names only the values, so each rule is asked in turn -- one query,
+    /// `LIMIT 1`, and only ever here. A rule none of that settles is reported as itself where the
+    /// table holds only the one, and otherwise as the refusal it plainly was.
+    public string Wording(Exception error, Func<string, bool> broken)
+    {
+        if (Collided(error.Message) is { Length: > 0 } columns &&
+            Rules.FirstOrDefault(rule => rule.Columns.Length == columns.Length &&
+                                         rule.Columns.All(c => columns.Contains(c, StringComparer.OrdinalIgnoreCase)))
+                is { } named)
+            return named.Message;
+
+        foreach (var rule in Rules)
+            if (rule.Sql is not null && broken(rule.Sql)) return rule.Message;
+
+        return Rules is [var only] ? only.Message : Message;
+    }
+
+    /// The columns DuckDB named, out of `Duplicate key "a: 1, b: 2" violates …`. A value carrying
+    /// the separators itself comes back as names no rule is over, which is the same answer as not
+    /// having been told.
+    static string[] Collided(string message)
+    {
+        var at = message.IndexOf("Duplicate key \"", StringComparison.Ordinal);
+        if (at < 0) return [];
+
+        var end = message.IndexOf("\" violates", at, StringComparison.Ordinal);
+        if (end < 0) return [];
+
+        return [.. message[(at + 15)..end].Split(", ")
+            .Select(pair => pair.IndexOf(": ", StringComparison.Ordinal) is var colon and >= 0
+                ? pair[..colon] : pair)];
+    }
 }
 
 /// The two ways one statement can be refused for a key: the question asked before it runs, and the
@@ -356,12 +406,16 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         List<string> columns = columnList ?? [.. table.Columns.Select(c => c.Name)];
         var returning = SqlText.FindKeyword(rest, "RETURNING");
 
-        // Only where the statement carries every key column: a key the store generates cannot
-        // collide with one it generated before, and one the statement leaves out is not there to
-        // compare.
-        var duplicates = table.Key.All(k => columns.Contains(k, StringComparer.OrdinalIgnoreCase))
-            ? Duplicates(table, $"SELECT {KeyList(table)} FROM {Source(columns, returning > 0 ? rest[..returning] : rest)}")
-            : KeyRule.None;
+        // Only where the statement carries every key column is the key asked about first: one the
+        // store generates cannot collide with one it generated before, and one the statement leaves
+        // out is not there to compare. The rules are still named either way -- a unique past the key
+        // is a rule an insert without the key breaks as readily as one with it.
+        var written = Source(columns, returning > 0 ? rest[..returning] : rest);
+        var duplicates = Duplicates(table,
+            table.Key.All(k => columns.Contains(k, StringComparer.OrdinalIgnoreCase))
+                ? $"SELECT {KeyList(table)} FROM {written}"
+                : null,
+            written: $"SELECT * FROM {written}");
 
         if (returning > 0)
             return RewriteReturning(table, columns, rest, returning, duplicates);
@@ -414,15 +468,16 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// merge and is the floor. Measured on a two-layer 25k-row lake: 6.95 ms for the insert form
     /// against 6.45 for a bare `count(*)` over the same view, where a correlated EXISTS cost 7.62;
     /// and 10.87 for the update form against 15.89 for the same question asked with three scans.
-    KeyRule Duplicates(Table table, string keys, bool replacing = false)
+    KeyRule Duplicates(Table table, string? keys, bool replacing = false, string? written = null)
     {
-        if (table.Key.Length == 0 || !Config.CheckKeys) return KeyRule.None;
+        if (!Config.CheckKeys) return KeyRule.None;
 
-        var refused = new Violation(
-            $"Violation of PRIMARY KEY constraint on \"{table.Name}\". Cannot insert duplicate key in object " +
-            $"\"{Config.Schema}.{table.Name}\".", "23505");
+        var refused = Refused(table, written, replacing);
+        if (refused.Rules.Length == 0) return KeyRule.None;
 
-        if (table.Materialized && !replacing) return new KeyRule([], refused);
+        // Nothing to ask first: the statement does not carry the key to compare, or DuckDB holds it.
+        if (keys is null || table.Key.Length == 0 || (table.Materialized && !replacing))
+            return new KeyRule([], refused);
 
         var matched = string.Join(" AND ", table.Key.Select(k =>
             $"t.{SqlText.Quote(k)} IS NOT DISTINCT FROM r.{SqlText.Quote(k)}"));
@@ -439,7 +494,66 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $"GROUP BY {KeyList(table)}) AS r WHERE r.\"_count\" > 1 " +
             $"UNION ALL SELECT 1 FROM \"_keys\" AS r " +
             $"SEMI JOIN {Catalog.Scan(table, "t")} ON {matched}{kept} LIMIT 1",
-            refused.Message, refused.SqlState)], refused);
+            refused.Rules[0].Message, refused.SqlState)], refused);
+    }
+
+    /// Every rule this table's rows are held to, in the words SQL Server refuses each in. DuckDB
+    /// says which *kind* of rule a write broke and never which one, so a client that reports the
+    /// constraint that refused it -- which is what an application built against SQL Server does --
+    /// would otherwise be told the wrong thing or nothing at all.
+    ///
+    /// `written` produces every column of the rows the statement is about to write, and is what a
+    /// rule is asked about when DuckDB's message names no columns. Null where the statement's rows
+    /// cannot be produced a second time; the row-wise message still names the rule.
+    Violation Refused(Table table, string? written, bool replacing) =>
+        new($"Violation of a PRIMARY KEY or UNIQUE constraint on '{table.Name}'. Cannot insert duplicate " +
+            $"key in object '{Config.Schema}.{table.Name}'.", "23505",
+            [.. Catalog.Rules(table).Select(rule => new Refusal(rule.Name, rule.Columns, Wording(table, rule),
+                written is null ? null : Broken(table, written, rule, replacing)))]);
+
+    /// SQL Server's own words for each kind of rule: 2627 for a key or a `UNIQUE` constraint, 2601
+    /// for a unique index, which is a different sentence rather than the same one with another noun.
+    string Wording(Table table, Rule rule) => rule.Kind switch
+    {
+        RuleKind.Index => $"Cannot insert duplicate key row in object '{Config.Schema}.{table.Name}' " +
+                          $"with unique index '{rule.Name}'.",
+        var kind => $"Violation of {(kind == RuleKind.Key ? "PRIMARY KEY" : "UNIQUE KEY")} constraint " +
+                    $"'{rule.Name}'. Cannot insert duplicate key in object '{Config.Schema}.{table.Name}'.",
+    };
+
+    /// Whether the rows a statement was about to write break one rule: two of them under one value,
+    /// or one landing on a value the table already publishes. Asked after DuckDB has already refused
+    /// the write and rolled it back, so it asks the statement's own rows again rather than the table
+    /// -- what was refused is not there to look at.
+    ///
+    /// The table is anti-joined against the keys the statement takes away as it writes, where it
+    /// takes any: a row replacing itself does not collide with itself. Rows carrying a NULL are left
+    /// out and the comparison is `=` rather than `IS NOT DISTINCT FROM`, because that is what a
+    /// DuckDB index counts as a collision -- naming a rule it would not have refused is worse than
+    /// naming none.
+    string Broken(Table table, string written, Rule rule, bool replacing)
+    {
+        var list = string.Join(", ", rule.Columns.Select(SqlText.Quote));
+
+        // A filtered index is a rule about the rows its filter matches and nothing else, so rows
+        // outside it are no part of the question -- naming that rule for a collision it does not
+        // hold over would be naming the wrong one.
+        var held = string.Join(" AND ", rule.Columns.Select(c => $"{SqlText.Quote(c)} IS NOT NULL")
+                                            .Concat(rule.Filter is null ? [] : (string[])[$"({rule.Filter})"]));
+        var matched = string.Join(" AND ", rule.Columns.Select(c => $"t.{SqlText.Quote(c)} = r.{SqlText.Quote(c)}"));
+        var kept = replacing
+            ? " ANTI JOIN " +
+              $"(SELECT {string.Join(", ", table.Key.Select(k => SqlText.Quote(Was(k))))} FROM \"_rows\") AS o ON " +
+              string.Join(" AND ", table.Key.Select(k =>
+                  $"o.{SqlText.Quote(Was(k))} IS NOT DISTINCT FROM t.{SqlText.Quote(k)}"))
+            : "";
+
+        return $"WITH \"_rows\" AS MATERIALIZED ({written}) " +
+               $"SELECT 1 FROM (SELECT {list}, count(*) AS \"_count\" FROM \"_rows\" WHERE {held} " +
+               $"GROUP BY {list}) AS r WHERE r.\"_count\" > 1 " +
+               $"UNION ALL SELECT 1 FROM (SELECT * FROM \"_rows\" WHERE {held}) AS r " +
+               $"SEMI JOIN (SELECT * FROM {Catalog.Scan(table, "t")}{kept} WHERE {held}) AS t " +
+               $"ON {matched} LIMIT 1";
     }
 
     static string KeyList(Table table) => string.Join(", ", table.Key.Select(SqlText.Quote));
@@ -586,18 +700,6 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // table in scope and may match a row twice, a TOP has to settle on which rows before
         // anything is written, and a moved key has to be checked against what the table already
         // publishes. Where none of them holds, the statement a client sent is the statement to run.
-        if (table.Materialized && from < 0 && rows is null && !moves)
-        {
-            var passed = sql[..update] + "UPDATE " + table.QualifiedName + sql[reference.End..];
-
-            // `OUTPUT` is answered off the rows as written, which is what DuckDB's own `RETURNING`
-            // hands back -- `DELETED` is refused everywhere here, so there is no older row to want.
-            return answered is null
-                ? Plan.Count("UPDATE", passed) with { Dirty = [table.Name] }
-                : new Plan(PlanKind.Rows, [$"{passed} RETURNING {answered}"], "UPDATE")
-                    with { Dirty = [table.Name] };
-        }
-
         // The rewritten row lands in the write layer under the key it already had, where it shadows
         // whatever is below it -- no tombstone needed. Only a statement that *moves* the key leaves
         // the old one behind with nothing above it, and that is what has to be hidden.
@@ -625,6 +727,28 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 : qualifier + SqlText.Quote(c.Name)));
         var columns = string.Join(", ", table.Columns.Select(c => SqlText.Quote(c.Name)));
 
+        // What a key was before the statement moved it, which is what says a row is not colliding
+        // with the one it replaces.
+        var was = string.Join(", ", table.Key.Select(k =>
+            $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}"));
+
+        if (table.Materialized && from < 0 && rows is null && !moves)
+        {
+            var passed = sql[..update] + "UPDATE " + table.QualifiedName + sql[reference.End..];
+
+            // DuckDB holds every rule this table has, so nothing is asked before the write -- but
+            // what it refuses on it refuses in its own words, and those name no constraint.
+            var named = Refused(table,
+                $"SELECT {projection}, {was} FROM {target} WHERE {predicate}", replacing: true);
+
+            // `OUTPUT` is answered off the rows as written, which is what DuckDB's own `RETURNING`
+            // hands back -- `DELETED` is refused everywhere here, so there is no older row to want.
+            return answered is null
+                ? Plan.Count("UPDATE", passed) with { Dirty = [table.Name], Violation = named }
+                : new Plan(PlanKind.Rows, [$"{passed} RETURNING {answered}"], "UPDATE")
+                    with { Dirty = [table.Name], Violation = named };
+        }
+
         // Which rows a `TOP (n)` settled on is decided once, on the keys, and everything after it
         // reads that choice back rather than making it again: the steps off the key set written
         // down, a check off the query that produced it, since a check runs before any step does.
@@ -644,15 +768,17 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // key are a collision, which the write branch's own PRIMARY KEY catches and a materialized
         // table does not. The check reads the whole row for the same reason; an update without a
         // join reads the merged view, already keyed, so its key columns alone answer more cheaply.
-        var was = string.Join(", ", table.Key.Select(k =>
-            $"{qualifier}{SqlText.Quote(k)} AS {SqlText.Quote(Was(k))}"));
-        var duplicates = moves || from >= 0
-            ? Duplicates(table,
-                         from >= 0
-                             ? $"SELECT DISTINCT {projection}, {was} FROM {scan} WHERE {checking}"
-                             : $"SELECT {Moved(table, assignments, qualifier)}, {was} FROM {scan} WHERE {checking}",
-                         replacing: true)
-            : KeyRule.None;
+        // The rules are named whatever the statement does, which the rows as written say and the
+        // keys alone cannot.
+        var duplicates = Duplicates(table,
+            (moves, from >= 0) switch
+            {
+                (_, true) => $"SELECT DISTINCT {projection}, {was} FROM {scan} WHERE {checking}",
+                (true, false) => $"SELECT {Moved(table, assignments, qualifier)}, {was} FROM {scan} WHERE {checking}",
+                _ => null,
+            },
+            replacing: true,
+            written: $"SELECT {(from < 0 ? "" : "DISTINCT ")}{projection}, {was} FROM {scan} WHERE {checking}");
 
         // Both the keys being replaced and the rows replacing them have to be computed before
         // anything is tombstoned -- afterwards the view no longer returns them.

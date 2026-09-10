@@ -48,6 +48,72 @@ public class UniqueTests
             lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'c', 1)"));
     }
 
+    /// An application reports which rule refused its write, so a refusal has to name one. DuckDB's
+    /// own message names the kind of rule and never the rule, and there may be several.
+    [Fact]
+    public void AUniqueRefusalNamesTheConstraint()
+    {
+        using var lake = Started(Lake(), Codes(("UQ_codes_label", ["label"], false)));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 3)"));
+
+        Assert.Equal("23505", refused.SqlState);
+        Assert.Contains("Violation of UNIQUE KEY constraint 'UQ_codes_label'", refused.MessageText);
+    }
+
+    /// SQL Server refuses a unique index in different words from a constraint -- 2601 rather than
+    /// 2627 -- so which of the two the schema declared is carried through to the message.
+    [Fact]
+    public void AUniqueIndexRefusalNamesTheIndex()
+    {
+        using var lake = Started(Lake(), Codes(("IX_codes_slot", ["slot"], true)));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'c', 1)"));
+
+        Assert.Contains("with unique index 'IX_codes_slot'", refused.MessageText);
+    }
+
+    /// DuckDB refuses a batch in words that name only the values, so the rule is worked out by
+    /// asking each of them about the rows the statement was about to write.
+    [Fact]
+    public void ABatchedRefusalNamesTheConstraintToo()
+    {
+        using var lake = Started(Lake(), Codes(("UQ_codes_label", ["label"], false)));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'c', 3), (4, 'c', 4)"));
+
+        Assert.Contains("Violation of UNIQUE KEY constraint 'UQ_codes_label'", refused.MessageText);
+    }
+
+    /// An update breaks the same rules a write does, and reaches the table without anything being
+    /// asked first -- so the words it is refused in are DuckDB's to give and duckpg's to name.
+    [Fact]
+    public void AnUpdateRefusalNamesTheConstraint()
+    {
+        using var lake = Started(Lake(), Codes(("UQ_codes_label", ["label"], false)));
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("UPDATE lake.codes SET label = 'a' WHERE code_id = 2"));
+
+        Assert.Contains("Violation of UNIQUE KEY constraint 'UQ_codes_label'", refused.MessageText);
+    }
+
+    /// The key is a declared constraint like any other and is named the same way -- the dacpac says
+    /// what it is called, and a made-up name is one an application matching on it would not find.
+    [Fact]
+    public void AKeyRefusalNamesTheKeysConstraint()
+    {
+        using var lake = Started(Lake(), Codes());
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (1, 'z', 3)"));
+
+        Assert.Contains("Violation of PRIMARY KEY constraint 'PK_codes'", refused.MessageText);
+    }
+
     /// Nothing the dacpac declares is a rule until it says unique: a plain index is an instruction
     /// about lookups, and reading one as a constraint would refuse rows the schema allows.
     [Fact]
@@ -132,6 +198,26 @@ public class UniqueTests
         Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 2)"));
         Assert.Throws<PostgresException>(() =>
             lake.Execute("UPDATE lake.codes SET slot = 1 WHERE code_id = 3"));
+    }
+
+    /// And a refusal under it names the index, like any other -- including on the append path, where
+    /// the rule is worked out by asking each of them about the rows the statement was about to
+    /// write, and where a rule the filter puts those rows outside of must not be the one named.
+    [Fact]
+    public void AFilteredRefusalNamesTheIndex()
+    {
+        using var lake = Started(Lake(), Codes() with
+        {
+            Filtered = [("UIX_codes_label", ["label"], "[slot] = 1")],
+        });
+
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'q', 1), (4, 'q', 1)"));
+
+        Assert.Contains("with unique index 'UIX_codes_label'", refused.MessageText);
+
+        // And two of the same outside it break nothing, so no rule is named because none was broken.
+        Assert.Equal(2, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'q', 2), (4, 'q', 3)"));
     }
 
     /// A filter this cannot render leaves the rule unheld rather than held over every row: refusing

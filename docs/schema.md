@@ -58,7 +58,10 @@ like any other. A filter naming a column the lake does not carry, or one duckpg 
 drops the rule with a warning rather than holding it over every row — refusing rows on a rule read
 wrong is worse than not holding it. Two NULLs count as
 different here, as they do in PostgreSQL and unlike SQL Server, which allows one such row rather than
-many. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.
+many. A refusal **names the rule that refused it**, in SQL Server's own words — `Violation of
+PRIMARY KEY constraint 'PK_orders'`, `Violation of UNIQUE KEY constraint 'UQ_x'`, or
+`Cannot insert duplicate key row in object 'dbo.t' with unique index 'UIX_x'` — since an application
+that reports which rule refused it reads that name. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.
 Where the layers already break a declared rule, the lake says so at startup rather than serving rows
 it would go on to refuse.
 

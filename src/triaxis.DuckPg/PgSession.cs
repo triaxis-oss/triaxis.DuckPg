@@ -321,6 +321,25 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         RunPlan(plan, portal.Arguments, portal.ResultFormats);
     }
 
+    /// Whether the rows a refused statement was about to write break one particular rule, which is
+    /// how a refusal DuckDB gave no name to gets one. Asked only after a write has already failed.
+    /// A rule that cannot be asked -- a transaction DuckDB has aborted answers nothing more -- is a
+    /// rule that did not answer, and the refusal keeps the words it would have had anyway.
+    bool Broken(string sql, object?[] arguments)
+    {
+        try
+        {
+            using var command = Command(sql, arguments);
+            using var reader = command.ExecuteReader();
+            return reader.Read();
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug("a refusal could not be named: {Reason}", e.Message.ReplaceLineEndings(" "));
+            return false;
+        }
+    }
+
     /// What has to be true before a plan runs at all -- a reference nothing else may still be
     /// pointing at. Before, because a statement outside a transaction commits each step as it goes.
     void Checked(Plan plan, object?[] arguments)
@@ -421,7 +440,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         }
         catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
         {
-            throw new PgError(refused.SqlState, refused.Message);
+            throw new PgError(refused.SqlState, refused.Wording(e, sql => Broken(sql, portal.Arguments)));
         }
     }
 
@@ -434,7 +453,7 @@ sealed class PgSession(TcpClient client, Gateway gateway, DuckDBConnection duck,
         }
         catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
         {
-            throw new PgError(refused.SqlState, refused.Message);
+            throw new PgError(refused.SqlState, refused.Wording(e, sql => Broken(sql, arguments)));
         }
         finally
         {

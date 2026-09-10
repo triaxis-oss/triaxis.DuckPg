@@ -401,7 +401,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
         catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
         {
-            throw new PgError(refused.SqlState, refused.Message);
+            throw new PgError(refused.SqlState, refused.Wording(e, sql => Broken(sql, parameters)));
         }
         finally
         {
@@ -548,6 +548,25 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             affected = rows;
         }
         return affected;
+    }
+
+    /// Whether the rows a refused statement was about to write break one particular rule, which is
+    /// how a refusal DuckDB gave no name to gets one. Asked only after a write has already failed.
+    /// A rule that cannot be asked -- a transaction DuckDB has aborted answers nothing more -- is a
+    /// rule that did not answer, and the refusal keeps the words it would have had anyway.
+    bool Broken(string sql, IReadOnlyDictionary<string, Parameter> parameters)
+    {
+        try
+        {
+            using var command = Command(sql, parameters);
+            using var reader = command.ExecuteReader();
+            return reader.Read();
+        }
+        catch (Exception e)
+        {
+            logger.LogDebug("a refusal could not be named: {Reason}", e.Message.ReplaceLineEndings(" "));
+            return false;
+        }
     }
 
     /// What has to be true before a plan runs at all -- a reference nothing else may still be
