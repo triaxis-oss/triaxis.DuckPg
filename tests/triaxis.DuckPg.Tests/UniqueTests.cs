@@ -101,6 +101,52 @@ public class UniqueTests
         Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 3)"));
     }
 
+    /// A filtered index is a rule about the rows its filter matches, and says nothing about the
+    /// others: two rows outside it under one label is what the schema allows, and refusing that is
+    /// refusing rows SQL Server writes.
+    [Fact]
+    public void AFilteredUniqueIndexHoldsOnlyOverTheRowsItFilters()
+    {
+        using var lake = Started(Lake(), Codes() with
+        {
+            Filtered = [("UIX_codes_label", ["label"], "[slot] = 1")],
+        });
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 2)"));
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (4, 'a', 3)"));
+    }
+
+    /// And it does hold over the rows it does match -- including a row an update moves into them,
+    /// which is where an index over the filtered columns differs from no index at all.
+    [Fact]
+    public void AFilteredUniqueIndexStillRefusesWithinItsFilter()
+    {
+        using var lake = Started(Lake(), Codes() with
+        {
+            Filtered = [("UIX_codes_label", ["label"], "[slot] = 1")],
+        });
+
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 1)"));
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 2)"));
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("UPDATE lake.codes SET slot = 1 WHERE code_id = 3"));
+    }
+
+    /// A filter this cannot render leaves the rule unheld rather than held over every row: refusing
+    /// rows on a rule read wrong is worse than not holding it.
+    [Fact]
+    public void AFilterDuckPgCannotRenderDropsTheRule()
+    {
+        using var lake = Started(Lake(), Codes() with
+        {
+            Filtered = [("UIX_codes_label", ["label"], "[missing] = 1")],
+        });
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 1)"));
+    }
+
     /// A column no read layer carries is the same value in every row those layers produce -- a
     /// declared default is frozen at build, so `(newid())` is one id for the whole run. There is
     /// nothing there to be unique, and refusing the lake for it would be refusing it for data it was

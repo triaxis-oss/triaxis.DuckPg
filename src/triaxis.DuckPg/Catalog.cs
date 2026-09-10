@@ -1604,10 +1604,21 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             Exec(conn, $"ALTER TABLE {table.QualifiedName} ADD PRIMARY KEY " +
                        $"({string.Join(", ", table.Key.Select(SqlText.Quote))})");
 
-        foreach (var (name, columns) in Uniques(table))
+        foreach (var (name, columns, filter) in Uniques(table))
             Exec(conn, $"CREATE UNIQUE INDEX IF NOT EXISTS {SqlText.Quote($"{table.Name}_{name}")} " +
-                       $"ON {table.QualifiedName} ({string.Join(", ", columns.Select(SqlText.Quote))})");
+                       $"ON {table.QualifiedName} ({string.Join(", ", columns.Select(c => Indexed(c, filter)))})");
     }
+
+    /// What one column of a unique index is indexed by. Unfiltered, it is the column. Filtered, it
+    /// is the column where the filter holds and NULL where it does not -- DuckDB refuses a partial
+    /// index outright (*"Creating partial indexes is not supported currently"*) and counts two NULLs
+    /// as different, so a row outside the filter indexes as all-NULL and collides with nothing,
+    /// which is exactly what the filter says about it. An index over an expression needs each of
+    /// them parenthesised; a bare `CASE` is a parse error.
+    static string Indexed(string column, string? filter) =>
+        filter is null
+            ? SqlText.Quote(column)
+            : $"(CASE WHEN {filter} THEN {SqlText.Quote(column)} END)";
 
     /// The uniqueness the dacpac declares past the key -- a `UNIQUE` constraint or a unique index,
     /// which say the same thing about the rows and are held the same way. Unlike the key this is an
@@ -1620,7 +1631,11 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
     /// another name. A partition column joins these for the same reason it joins the key: rows are
     /// only unique *within* a partition, and a rule that forgot that would refuse a lake for holding
     /// the row it was partitioned to hold.
-    IEnumerable<(string Name, string[] Columns)> Uniques(Table table)
+    ///
+    /// A filtered index is a rule about the rows the filter matches and says nothing about the rest,
+    /// so the filter is carried through to the index rather than dropped: held unfiltered it refuses
+    /// rows the schema allows, which is the wrong answer and not a narrower one.
+    IEnumerable<(string Name, string[] Columns, string? Filter)> Uniques(Table table)
     {
         var partitions = table.Layers.SelectMany(l => l.Source.Partitions)
                               .Distinct(StringComparer.OrdinalIgnoreCase);
@@ -1629,9 +1644,49 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         {
             if (!unique.Columns.All(c => table.Has(c) && Carried(table, c))) continue;
 
+            string? filter = null;
+            if (unique.Filter is not null && (filter = Filtered(unique, table)) is null) continue;
+
             string[] columns = [.. unique.Columns,
                                 .. partitions.Where(p => table.Has(p) && !unique.Columns.Any(c => Same(c, p)))];
-            if (!Covers(table.Key, columns)) yield return (unique.Name, columns);
+            if (!Covers(table.Key, columns)) yield return (unique.Name, columns, filter);
+        }
+    }
+
+    /// A filtered index's predicate as DuckDB spells it, or null where this lake cannot hold the
+    /// rule at all. The filter is T-SQL and goes through the same translation a declared default and
+    /// a view body do.
+    ///
+    /// Dropped with a warning rather than approximated: an unfiltered rule refuses rows the schema
+    /// accepts, and refusing rows on a rule read wrong is the one answer worse than not holding it.
+    /// The columns the filter names are asked of the table for the same reason the indexed ones are
+    /// -- a lake publishing a subset of a declared table loses the rule rather than failing on it,
+    /// and one whose layers do not carry the column would filter on a value frozen at build, which
+    /// is every row or none. SQL Server's filter grammar is comparisons of a column against
+    /// literals, so every bracketed name in the predicate is one of its columns.
+    string? Filtered(Unique unique, Table table)
+    {
+        try
+        {
+            foreach (var token in new TSqlLexer(unique.Filter!).Tokenize())
+                if (token.Kind == TokenKind.QuotedName && (!table.Has(token.Text) || !Carried(table, token.Text)))
+                {
+                    logger.LogWarning("{Unique} filters on {Column}, which {Table} does not carry: " +
+                                      "the rule is dropped rather than held over every row",
+                                      unique.Name, token.Text, table.Name);
+                    return null;
+                }
+
+            var context = new TSqlContext(config.Schema, new Dictionary<string, string>(),
+                                          new HashSet<string>(), Environment.UserName);
+            return TSqlWriter.Write(TSqlParser.ParseExpression(unique.Filter!), context);
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning("{Unique} filters on {Filter}, which duckpg cannot render ({Reason}): " +
+                              "the rule is dropped rather than held over every row",
+                              unique.Name, unique.Filter, e.Message.ReplaceLineEndings(" "));
+            return null;
         }
     }
 

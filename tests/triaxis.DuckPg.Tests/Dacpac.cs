@@ -11,7 +11,8 @@ static class Dacpac
     public record TableModel(string Name, (string Column, string Type)[] Columns, string[] Key,
                             (string Column, string Expression)[]? Defaults = null,
                             string[]? Identity = null,
-                            (string Name, string[] Columns, bool AsIndex)[]? Uniques = null);
+                            (string Name, string[] Columns, bool AsIndex)[]? Uniques = null,
+                            (string Name, string[] Columns, string Filter)[]? Filtered = null);
 
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
@@ -39,6 +40,7 @@ static class Dacpac
                 tables.Select(Element)
                       .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
                       .Concat(tables.SelectMany(Uniques))
+                      .Concat(tables.SelectMany(Filtered))
                       .Concat(tables.SelectMany(Defaults))
                       .Concat(views.Select(View))
                       .Concat(references.Select(Reference))
@@ -120,6 +122,16 @@ static class Dacpac
             : El("SqlUniqueConstraint", $"[dbo].[{u.Name}]",
                 Over(table, u.Columns),
                 Rel("DefiningTable", Ref($"[dbo].[{table.Name}]"))));
+
+    /// A filtered unique index, which is a unique index carrying the predicate it is a rule over --
+    /// written as a script the way every other T-SQL in the model is.
+    static IEnumerable<XElement> Filtered(TableModel table) =>
+        (table.Filtered ?? []).Select(f =>
+            El("SqlIndex", $"[dbo].[{table.Name}].[{f.Name}]",
+                new XElement(Dac + "Property", new XAttribute("Name", "IsUnique"), new XAttribute("Value", "True")),
+                Script("FilterPredicate", f.Filter),
+                Over(table, f.Columns),
+                Rel("IndexedObject", Ref($"[dbo].[{table.Name}]"))));
 
     /// The columns a key, a constraint or an index is over, as the specifications all three share.
     static XElement Over(TableModel table, string[] columns) =>

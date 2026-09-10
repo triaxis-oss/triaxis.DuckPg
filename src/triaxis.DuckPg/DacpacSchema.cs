@@ -13,8 +13,9 @@ sealed record Reference(string Name, string Table, string[] Columns,
                         string Parent, string[] ParentColumns, string OnDelete);
 
 /// Declared uniqueness that is not the key: which columns of which table, under the name the
-/// constraint or the index was given.
-sealed record Unique(string Name, string Table, string[] Columns);
+/// constraint or the index was given. `Filter` is the T-SQL a filtered unique index is only a rule
+/// over -- a `UNIQUE` constraint carries none, and neither does an unfiltered index.
+sealed record Unique(string Name, string Table, string[] Columns, string? Filter = null);
 
 /// A declared scalar function: what it is called, what it takes in order, what it returns, and the
 /// body it was written with. The `CREATE FUNCTION` header is not in the model at all -- `BodyScript`
@@ -193,18 +194,23 @@ sealed class DacpacModel
     /// A unique index says the same thing about the rows as a `UNIQUE` constraint, so it is read as
     /// one. A plain index says nothing about them, and DacFx leaves the property out rather than
     /// writing it false -- so an absent one is not unique, and is understood rather than unread.
+    ///
+    /// An index may also carry a filter, and then it says that thing about *those* rows alone --
+    /// read as unfiltered it is a rule the schema never declared, refusing rows SQL Server accepts.
     bool ReadIndex(XElement index) =>
-        Property(index, "IsUnique") != "True" || ReadUnique(index, "IndexedObject");
+        Property(index, "IsUnique") != "True" ||
+        ReadUnique(index, "IndexedObject", Property(index, "FilterPredicate"));
 
     /// An index carries the table in its own name and a constraint does not, so which relationship
     /// names the table is the only thing the two differ by.
-    bool ReadUnique(XElement element, string relationship)
+    bool ReadUnique(XElement element, string relationship, string? filter = null)
     {
         var table = Unqualify(Reference(element, relationship));
         var columns = Indexed(element);
         if (table is null || columns.Length == 0) return false;
 
-        Uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns));
+        Uniques.Add(new Unique(Unqualify(element.Attribute("Name")?.Value) ?? $"UQ_{table}", table, columns,
+                               string.IsNullOrWhiteSpace(filter) ? null : filter));
         return true;
     }
 
