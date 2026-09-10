@@ -417,8 +417,12 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
                 : null,
             written: $"SELECT * FROM {written}");
 
+        // What the rows will hold once the store has filled in what the statement left out, which is
+        // what a declared check is a rule about.
+        var checks = Breaks(table, $"SELECT {Filled(table, columns)} FROM {written}", "INSERT");
+
         if (returning > 0)
-            return RewriteReturning(table, columns, rest, returning, duplicates);
+            return RewriteReturning(table, columns, rest, returning, duplicates, checks);
 
         // A declared identity the statement leaves out is filled where every other value comes
         // from -- in the rows being written, so the same statement decides it and writes it.
@@ -436,8 +440,41 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         var identity = Identifying(table, generated);
 
         return Promoting(table, Plan.Count("INSERT", $"INSERT INTO {table.WriteName} {rest}{Returns(identity)}")
-            with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation, Identity = identity });
+            with
+            {
+                Dirty = [table.Name], Checks = [.. duplicates.Checks, .. checks],
+                Violation = duplicates.Violation, Identity = identity,
+            });
     }
+
+    /// Every declared `CHECK` the table has, as a question about the rows a statement is about to
+    /// write. A check is row-local, so unlike a key it costs a pass over those rows rather than a
+    /// scan of the table -- and it is asked here, before any step runs, for the reason a reference
+    /// is: a statement outside a transaction commits each step as it goes.
+    ///
+    /// Held over the rows rather than declared on the DuckDB table. `ALTER TABLE … ADD CONSTRAINT …
+    /// CHECK` is refused by DuckDB 1.5.5 outright, so it would have to go into `CREATE TABLE` --
+    /// which would cover a materialized lake and no other, and DuckDB's own refusal names the
+    /// expression rather than the constraint, which is what a client reads.
+    ///
+    /// A predicate that comes out NULL passes, as it does on SQL Server: `NOT (…)` over an unknown
+    /// is unknown, and an unknown row is not one the question returns.
+    Check[] Breaks(Table table, string written, string operation) =>
+        [.. Catalog.Checks(table).Select(check => new Check(
+            $"SELECT 1 FROM ({written}) AS \"_checked\" WHERE NOT ({check.Sql}) LIMIT 1",
+            $"The {operation} statement conflicted with the CHECK constraint \"{check.Name}\". " +
+            $"The conflict occurred in database \"{Config.DatabaseName}\", table \"{table.Name}\".",
+            "23514"))];
+
+    /// The rows a statement writes as the table will hold them: what it gave, and the declared
+    /// default for what it left out. A column with no default -- a store-generated key among them --
+    /// stands as the typed NULL it would be if nothing filled it, which leaves a check over it
+    /// unknown and so passing, rather than refusing a row for a value nobody can see yet.
+    static string Filled(Table table, List<string> columns) =>
+        string.Join(", ", table.Columns.Select(c =>
+            columns.Contains(c.Name, StringComparer.OrdinalIgnoreCase) ? SqlText.Quote(c.Name)
+            : c.Default is { } declared ? $"({declared.Expr}) AS {SqlText.Quote(c.Name)}"
+            : $"CAST(NULL AS {c.Type}) AS {SqlText.Quote(c.Name)}"));
 
     /// A declared key is a rule about rows that may live in any layer, so for a layered lake it is
     /// kept here rather than by DuckDB. The write branch's own PRIMARY KEY sees only what this
@@ -570,7 +607,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// store-generated key back. The rows are materialized first, so what the store generates is
     /// decided once and can be both written down and answered from; the answer is the last step,
     /// which is what makes this a plan that returns rows with a write in front of it.
-    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning, KeyRule duplicates)
+    Plan RewriteReturning(Table table, List<string> columns, string rest, int returning, KeyRule duplicates,
+                          Check[] checks)
     {
         var select = rest[(MatchingParen(rest) + 1)..returning];
         var from = SqlText.FindKeyword(select, "FROM");
@@ -618,7 +656,11 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
             $" {source}",
             $"INSERT INTO {table.WriteName} ({written}) SELECT {written} FROM duckpg_written{Returns(identity)}",
             $"SELECT {answered} FROM duckpg_written"],
-            "INSERT") with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation, Identity = identity });
+            "INSERT") with
+            {
+                Dirty = [table.Name], Checks = [.. duplicates.Checks, .. checks],
+                Violation = duplicates.Violation, Identity = identity,
+            });
     }
 
     /// The declared identities a statement does not name, and so leaves to the store.
@@ -736,17 +778,21 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         {
             var passed = sql[..update] + "UPDATE " + table.QualifiedName + sql[reference.End..];
 
-            // DuckDB holds every rule this table has, so nothing is asked before the write -- but
-            // what it refuses on it refuses in its own words, and those name no constraint.
-            var named = Refused(table,
-                $"SELECT {projection}, {was} FROM {target} WHERE {predicate}", replacing: true);
+            // DuckDB holds every uniqueness rule this table has, so nothing is asked about those
+            // before the write -- but what it refuses on it refuses in its own words, and those name
+            // no constraint. A declared check is nobody's but duckpg's, and is a rule about the rows
+            // the statement leaves behind whichever way they are written, so it is asked here too.
+            var rewritten = $"SELECT {projection} FROM {target} WHERE {predicate}";
+            var named = Refused(table, $"SELECT {projection}, {was} FROM {target} WHERE {predicate}",
+                                replacing: true);
 
             // `OUTPUT` is answered off the rows as written, which is what DuckDB's own `RETURNING`
             // hands back -- `DELETED` is refused everywhere here, so there is no older row to want.
             return answered is null
-                ? Plan.Count("UPDATE", passed) with { Dirty = [table.Name], Violation = named }
-                : new Plan(PlanKind.Rows, [$"{passed} RETURNING {answered}"], "UPDATE")
-                    with { Dirty = [table.Name], Violation = named };
+                ? Plan.Count("UPDATE", passed) with
+                    { Dirty = [table.Name], Checks = Breaks(table, rewritten, "UPDATE"), Violation = named }
+                : new Plan(PlanKind.Rows, [$"{passed} RETURNING {answered}"], "UPDATE") with
+                    { Dirty = [table.Name], Checks = Breaks(table, rewritten, "UPDATE"), Violation = named };
         }
 
         // Which rows a `TOP (n)` settled on is decided once, on the keys, and everything after it
@@ -792,16 +838,20 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
 
         // Every row the update touched, as the update left it -- which is what `duckpg_updated`
         // already holds, so answering costs one more read of a table the plan had to build anyway.
+        Check[] checks = [.. duplicates.Checks,
+                          .. Breaks(table, $"SELECT {(from < 0 ? "" : "DISTINCT ")}{projection} " +
+                                           $"FROM {scan} WHERE {checking}", "UPDATE")];
+
         if (answered is not null)
             return Promoting(table, new Plan(PlanKind.Rows,
                 [.. steps, $"SELECT {answered} FROM duckpg_updated"], "UPDATE")
-                with { Dirty = [table.Name], Checks = duplicates.Checks, Violation = duplicates.Violation }, tombstones);
+                with { Dirty = [table.Name], Checks = checks, Violation = duplicates.Violation }, tombstones);
 
         return Promoting(table, Plan.Count("UPDATE", steps)
             with
             {
                 Affected = "SELECT count(*) FROM duckpg_updated", Dirty = [table.Name],
-                Checks = duplicates.Checks, Violation = duplicates.Violation,
+                Checks = checks, Violation = duplicates.Violation,
             },
             tombstones);
     }

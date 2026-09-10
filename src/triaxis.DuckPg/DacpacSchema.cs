@@ -19,6 +19,10 @@ sealed record Reference(string Name, string Table, string[] Columns,
 /// an unfiltered index.
 sealed record Unique(string Name, string Table, string[] Columns, bool Index, string? Filter = null);
 
+/// A declared `CHECK`: which table's rows it is about, under the name the constraint was given, and
+/// the predicate they have to satisfy -- as the T-SQL it was written in.
+sealed record CheckConstraint(string Name, string Table, string Expression);
+
 /// A declared scalar function: what it is called, what it takes in order, what it returns, and the
 /// body it was written with. The `CREATE FUNCTION` header is not in the model at all -- `BodyScript`
 /// holds the `BEGIN … END` alone -- so the parameters and the return type come from the model's own
@@ -77,6 +81,9 @@ sealed class DacpacSchema
     /// Every uniqueness rule it declares that is not a table's key.
     public IReadOnlyList<Unique> Uniques => model.Uniques;
 
+    /// Every `CHECK` it declares, in the order the model lists them.
+    public IReadOnlyList<CheckConstraint> Checks => model.Checks;
+
     /// The scalar functions it declares, in the order the model lists them.
     public IReadOnlyList<ScalarFunction> Functions => model.Functions;
 
@@ -114,6 +121,7 @@ sealed class DacpacModel
     public readonly Dictionary<string, string> Views = new(StringComparer.OrdinalIgnoreCase);
     public readonly List<Reference> References = [];
     public readonly List<Unique> Uniques = [];
+    public readonly List<CheckConstraint> Checks = [];
     public readonly List<ScalarFunction> Functions = [];
 
     public static DacpacModel Read(byte[] bytes, string path, ILogger logger)
@@ -143,6 +151,7 @@ sealed class DacpacModel
                 "SqlDefaultConstraint" => ReadDefault(element),
                 "SqlView" => ReadView(element),
                 "SqlForeignKeyConstraint" => ReadReference(element),
+                "SqlCheckConstraint" => ReadCheck(element),
                 "SqlScalarFunction" => ReadFunction(element),
                 // Every other element is something this tool does not claim to read.
                 _ => true,
@@ -271,6 +280,19 @@ sealed class DacpacModel
                 .Descendants(Dac + "References"))
             .Select(element => Unqualify(element.Attribute("Name")?.Value))
             .OfType<string>()];
+
+    /// A declared `CHECK`. The model carries the predicate as a script under its own name, and the
+    /// table it is about through the same relationship a `UNIQUE` constraint names its table by.
+    bool ReadCheck(XElement constraint)
+    {
+        var table = Unqualify(Reference(constraint, "DefiningTable"));
+        if (table is null) return false;
+        if (Property(constraint, "CheckExpressionScript") is not { Length: > 0 } expression) return false;
+
+        Checks.Add(new CheckConstraint(
+            Unqualify(constraint.Attribute("Name")?.Value) ?? $"CK_{table}", table, expression));
+        return true;
+    }
 
     /// A view is its query; the header it was declared with is not in the model to begin with.
     bool ReadView(XElement view)

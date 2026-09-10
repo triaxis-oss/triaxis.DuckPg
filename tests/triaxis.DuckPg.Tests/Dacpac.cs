@@ -12,7 +12,8 @@ static class Dacpac
                             (string Column, string Expression)[]? Defaults = null,
                             string[]? Identity = null,
                             (string Name, string[] Columns, bool AsIndex)[]? Uniques = null,
-                            (string Name, string[] Columns, string Filter)[]? Filtered = null);
+                            (string Name, string[] Columns, string Filter)[]? Filtered = null,
+                            (string Name, string Expression)[]? Checks = null);
 
     /// A view is modelled as its query alone -- the `CREATE VIEW` header never reaches model.xml.
     public record ViewModel(string Name, string Query);
@@ -41,6 +42,7 @@ static class Dacpac
                       .Concat(tables.Where(t => t.Key.Length > 0).Select(Key))
                       .Concat(tables.SelectMany(Uniques))
                       .Concat(tables.SelectMany(Filtered))
+                      .Concat(tables.SelectMany(Checks))
                       .Concat(tables.SelectMany(Defaults))
                       .Concat(views.Select(View))
                       .Concat(references.Select(Reference))
@@ -132,6 +134,14 @@ static class Dacpac
                 Script("FilterPredicate", f.Filter),
                 Over(table, f.Columns),
                 Rel("IndexedObject", Ref($"[dbo].[{table.Name}]"))));
+
+    /// A `CHECK` is its own element carrying the predicate as a script, pointing back at the table
+    /// whose rows it is about.
+    static IEnumerable<XElement> Checks(TableModel table) =>
+        (table.Checks ?? []).Select(c =>
+            El("SqlCheckConstraint", $"[dbo].[{c.Name}]",
+                Script("CheckExpressionScript", c.Expression),
+                Rel("DefiningTable", Ref($"[dbo].[{table.Name}]"))));
 
     /// The columns a key, a constraint or an index is over, as the specifications all three share.
     static XElement Over(TableModel table, string[] columns) =>
