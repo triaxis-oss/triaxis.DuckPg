@@ -133,7 +133,9 @@ public class LazyTests : IDisposable
 
     /// Layers that break a declared key are what an eager lake refuses to start over. Deferred, the
     /// refusal is the statement that names the table -- and it is the same refusal every time,
-    /// rather than the key being quietly dropped so the next statement can pass.
+    /// rather than the key being quietly dropped so the next statement can pass. Which is what the
+    /// collapse being one transaction buys: refused, it leaves the view it was replacing standing,
+    /// and the next statement is refused by the key rather than by the half-made table.
     [Fact]
     public void LayersBreakingTheKeyAreRefusedWhenTheTableIsNamed()
     {
@@ -145,8 +147,12 @@ public class LazyTests : IDisposable
         broken.Config.DefaultKey = ["order_id"];
         broken.Start();
 
-        Assert.ThrowsAny<Exception>(() => broken.Query("SELECT order_id FROM lake.orders"));
-        Assert.ThrowsAny<Exception>(() => broken.Query("SELECT order_id FROM lake.orders"));
+        var refused = Assert.ThrowsAny<Exception>(() => broken.Query("SELECT order_id FROM lake.orders"));
+        Assert.Equal(refused.Message,
+                     Assert.ThrowsAny<Exception>(() => broken.Query("SELECT order_id FROM lake.orders")).Message);
+        Assert.Equal(["VIEW"],
+                     broken.Query("SELECT table_type FROM information_schema.tables " +
+                                  "WHERE table_schema = 'lake' AND table_name = 'orders'"));
     }
 
     /// A statement through a declared view names the view and not the tables under it, so what the

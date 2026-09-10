@@ -288,6 +288,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
             if (table.Materialized)
             {
                 Materialize(conn, table);
+                Recorded(conn, table);
                 Tables[name] = table;
                 continue;
             }
@@ -1537,8 +1538,6 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
                     $"publishes it as ({string.Join(", ", declared)}) -- the store is of another " +
                     "schema, and rebuilding it here would discard what has been written to it");
 
-            promoted.Add(table.Name);
-            rows[table.Name] = Count(conn, table);
             Keyed(conn, table, stored.Keyed);
             Stamps(conn, table);
             foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
@@ -1564,14 +1563,22 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         Exec(conn, $"CREATE OR REPLACE TABLE {table.QualifiedName} AS " +
                    Merged(stacked, carries, carries && (Tombstoned(table) || write.HasTombstones(stacked))));
 
-        // Nothing is earned here: the branch a write would have to make is the table itself. The
-        // key is never already there: whatever stood under the name, what holds it now is a table
-        // this statement made, and CTAS carries no constraint over.
-        promoted.Add(table.Name);
-        rows[table.Name] = Count(conn, table);
+        // The key is never already there: whatever stood under the name, what holds it now is a
+        // table this statement made, and CTAS carries no constraint over.
         Keyed(conn, table, held: false);
         Stamps(conn, table);
         foreach (var sequence in Sequences(conn, table)) Exec(conn, sequence);
+    }
+
+    /// What the catalog then remembers about a collapsed table, said by whoever collapsed it rather
+    /// than in the middle of doing so: a collapse can still be refused after its last statement has
+    /// run, and one the catalog recorded anyway is a table published as the merge that the merge no
+    /// longer describes. Nothing is earned by it -- the branch a write would have to make is the
+    /// table itself.
+    void Recorded(DuckDBConnection conn, Table table)
+    {
+        promoted.Add(table.Name);
+        rows[table.Name] = Count(conn, table);
     }
 
     /// Whether anything is still published as the merge, which is the only reason to read a
@@ -1603,7 +1610,7 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         {
             var table = Tables[name] with { Materialized = true };
             logger.LogDebug("collapsing {Table}, named by a statement", name);
-            Materialize(conn, table);
+            Collapse(conn, table);
             // Replacing what is under a key another session may be reading, never adding one: the
             // entry is there and what changes is which `Table` it holds.
             Tables[name] = table;
@@ -1614,6 +1621,30 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // rather than tracked, there being nothing at the bottom of it worth a set per statement.
         else if (depth < 8 && reads.TryGetValue(name, out var named))
             foreach (var reach in named) Reached(conn, reach, depth + 1);
+    }
+
+    /// Collapsing a table while the lake serves, which a build does not have to do: taking the view
+    /// out from under a name and putting a table there is several statements, and everything else on
+    /// this database is reading that name meanwhile. Committed as one, the name never stands for
+    /// nothing -- and refused as one, the view is still there, which is what lets the next statement
+    /// naming the table be refused the way this one was rather than by the wreckage of it.
+    void Collapse(DuckDBConnection conn, Table table)
+    {
+        Exec(conn, "BEGIN TRANSACTION");
+        try
+        {
+            Materialize(conn, table);
+        }
+        catch
+        {
+            Exec(conn, "ROLLBACK");
+            throw;
+        }
+        // Outside the rollback above because a commit DuckDB refuses has already taken the
+        // transaction down with it -- and this is where the layers are refused, the index a broken
+        // key breaks being built as the transaction closes rather than as it is asked for.
+        Exec(conn, "COMMIT");
+        Recorded(conn, table);
     }
 
     /// What a declared view or macro would reach if something named it: the tables its definition
