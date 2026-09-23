@@ -636,6 +636,20 @@ public class TdsTests : IDisposable
         Assert.Equal([1, 3], rows);
     }
 
+    /// EF Core names a captured local after the closure field it was hoisted into, which starts
+    /// with a digit.
+    [Fact]
+    public void BindsParameterStartingWithDigit()
+    {
+        using var connection = Open();
+        using var command = new SqlCommand(
+            "SELECT [order_id] FROM [orders] WHERE [order_id] = @8__locals1_id AND @_8__locals1_id = 0", connection);
+        command.Parameters.AddWithValue("@8__locals1_id", 3);
+        command.Parameters.AddWithValue("@_8__locals1_id", 0);
+
+        Assert.Equal(3, command.ExecuteScalar());
+    }
+
     /// The login name, since that is the only user a lake of files has.
     [Fact]
     public void SaysWhoIsAsking()

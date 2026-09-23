@@ -6,6 +6,11 @@ namespace triaxis.DuckPg;
 /// DuckDB's json_serialize_sql() only handles SELECT, so DML rewriting has to do its own scanning.
 static class SqlText
 {
+    /// A T-SQL variable's name as a DuckDB parameter. T-SQL lets one start with a digit, which DuckDB
+    /// would read as a numbered parameter; prefixing every name that does not start with a letter
+    /// keeps two names from ever becoming one.
+    public static string Parameter(string name) => char.IsAsciiLetter(name[0]) ? name : "_" + name;
+
     /// PostgreSQL's `$1` written as DuckDB's named `$p1`. A numbered parameter must be bound by the
     /// number it was written with, and DuckDB counts only the ones a statement actually mentions --
     /// so `$3` on its own is "parameter number 3" in a statement that "only has 1", and no value can

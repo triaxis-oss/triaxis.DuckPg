@@ -766,7 +766,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         var command = duck.CreateCommand();
         command.CommandText = sql;
         foreach (var (name, parameter) in parameters)
-            command.Parameters.Add(new DuckDBParameter(name, parameter.Value ?? DBNull.Value));
+            command.Parameters.Add(new DuckDBParameter(SqlText.Parameter(name), parameter.Value ?? DBNull.Value));
         return command;
     }
 

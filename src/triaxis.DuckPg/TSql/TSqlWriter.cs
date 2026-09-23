@@ -929,7 +929,7 @@ sealed class TSqlWriter(TSqlContext context)
     {
         if (!variable.System)
             return context.Parameters.Contains(variable.Name)
-                ? context.Macro ? SqlText.Quote(variable.Name) : "$" + variable.Name
+                ? context.Macro ? SqlText.Quote(variable.Name) : "$" + SqlText.Parameter(variable.Name)
                 : throw new TSqlException($"undeclared variable @{variable.Name}", 0);
 
         // `@@IDENTITY` is `SCOPE_IDENTITY()` without the scope, and without triggers there is no
