@@ -83,15 +83,22 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   so an absent one is a plain index and reading it the other way would turn every index in a real
   dacpac into a constraint. `Catalog.Uniques` then creates one unique index per rule on a
   materialized table. Unlike the key this is an index and not a constraint, because that is what it
-  is: the columns may be NULL, and DuckDB counts two NULLs as different where SQL Server counts them
-  as one, so a lake refuses a shade less here than SQL Server would. It is skipped where the table
+  is: the columns may be NULL, and SQL Server counts two NULLs as one value where DuckDB counts them
+  as two. DuckDB 1.5.5 has no `NULLS NOT DISTINCT` -- on an index, a constraint or a table, each is a
+  parse error -- and skips any row with a NULL anywhere in its key, so `Catalog.Keyed` indexes each
+  column as two expressions that are never NULL: `("c" IS NULL)`, and `COALESCE("c", <zero>)` with a
+  zero of the column's type standing in. The flag is what keeps the stand-in from colliding with a
+  real zero; a list or a struct would carry both in one key, and DuckDB refuses either as one
+  (*"Invalid type for index key"*). It is skipped where the table
   does not publish every column the rule is over -- a lake showing a subset of a declared table loses
   the rule rather than failing on it, the same bargain `KeyFor` strikes -- and where the rule is the
-  key again under another name, or where a column it is over is one no read layer carries. That last
-  is `Catalog.Carried`, and it exists because a declared default is *frozen at build*: a column no
-  file produces is the same value in every row the read layers produce, so `(newid())` is one id for
-  the whole run, and a rule over it would refuse the entire lake at startup for data it was never
-  given. A lake with no read layers has nothing frozen -- every row arrives as a write, stamped as it
+  key again under another name, or where a column it is over is one no read layer carries and the
+  schema gives a default. That last is `Catalog.Carried`, and it exists because a declared default is
+  *frozen at build*: a column no file produces is the same value in every row the read layers
+  produce, so `(newid())` is one id for the whole run, and a rule over it would refuse the entire lake
+  at startup for data it was never given. A column with no default is NULL in those rows, which is
+  what SQL Server would hold there too, so a rule over it is kept: a seed writing each row's one
+  resource into one of eight columns leaves some of them in no row at all. A lake with no read layers has nothing frozen -- every row arrives as a write, stamped as it
   is written -- so it keeps its rules. The whole rule goes rather than the column, since uniqueness
   over two columns is not uniqueness over whichever one the layers happen to carry. What this does
   *not* cover is a column some layer carries and another does not: those gaps are filled by the same
@@ -102,18 +109,17 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   row it was partitioned to hold.
   **A filtered index is a rule over the rows its filter matches, and holding it unfiltered is the
   wrong rule rather than a stricter one.** `DacpacSchema.ReadIndex` reads `FilterPredicate` beside
-  `IsUnique` and `Catalog.Filtered` renders it, so `Catalog.Keyed` indexes each column as
-  `(CASE WHEN <filter> THEN "c" END)` rather than as itself. Measured against DuckDB 1.5.5:
+  `IsUnique` and `Catalog.Filtered` renders it, so `Catalog.Keyed` wraps each of a column's two
+  expressions as `(CASE WHEN <filter> THEN … END)`. Measured against DuckDB 1.5.5:
   `CREATE UNIQUE INDEX … WHERE …` is refused outright -- *"Creating partial indexes is not supported
   currently"* -- so the predicate cannot be handed over as written; an index over expressions works
   with each of them parenthesised, a bare `CASE` being a parse error; and a row outside the filter
-  indexes as all-NULL, which collides with nothing since DuckDB counts two NULLs as different --
-  confirmed by insert and by an `UPDATE` that moves a row *into* the filter, which is refused as it
+  indexes as all-NULL, which collides with nothing since DuckDB skips such a row -- confirmed by insert and by an `UPDATE` that moves a row *into* the filter, which is refused as it
   should be. The filter is T-SQL and goes through the translation a declared default and a view body
   already go through. What cannot be rendered -- or names a column `Carried` says the lake does not
   hold -- drops the rule with a warning: refusing rows on a rule read wrong is the one answer worse
-  than not holding the rule at all. The caveat is the one uniqueness already carries here: a row
-  *inside* the filter whose indexed column is NULL is not caught. **A layered lake keeps none of this**: it publishes views, and
+  than not holding the rule at all. A row *inside* the filter never indexes a NULL, so two of them
+  whose indexed column is NULL collide, as they do in SQL Server. **A layered lake keeps none of this**: it publishes views, and
   `Gateway.Duplicates` asks about the key alone. Asking about a declared unique too would be another
   scan of the merge per rule per write, and the key's scan is already most of what a write costs.
   That divergence is a decision and not a gap left open -- see below.
@@ -124,14 +130,15 @@ What a dacpac buys a lake is [schema.md](../schema.md); this is how it is read a
   different sentence rather than the same one with another noun. `DacpacSchema.KeyName` keeps the
   key's constraint name for the same reason a reference's is kept. Two DuckDB messages arrive here
   and both are answered: the row-wise `Duplicate key "label: a" violates unique constraint`, which
-  names the columns, so `Violation.Collided` matches those against the declared rules and answers
-  without asking anything; and the append path's `PRIMARY KEY or UNIQUE constraint violation:
+  names the columns, so `Violation.Collided` matches those against the key and answers without
+  asking anything -- a unique index names the expressions it is over instead, so it is asked like
+  the next case; and the append path's `PRIMARY KEY or UNIQUE constraint violation:
   duplicate key "26, 24"`, which names only values, so each rule is asked in turn. That question --
   `Gateway.Broken`, one query a rule, `LIMIT 1` -- runs *only* on the error path, so a write that
   succeeds still costs what DuckDB's own enforcement costs. It asks the statement's own rows again
   rather than the table, since what was refused was rolled back with the statement and is not there
-  to look at; and it compares with `=` over rows carrying no NULL, and under the rule's own filter
-  where it has one, because that is what a DuckDB index counts as a collision -- naming a rule
+  to look at; and it compares with `IS NOT DISTINCT FROM`, under the rule's own filter where it
+  has one, because that is what the index counts as a collision -- naming a rule
   DuckDB would not have refused is worse than naming none. A rule that cannot be asked at all -- a transaction DuckDB has already aborted answers
   nothing more -- is one that did not answer.
 - **The foreign keys DuckDB offers are not the ones a lake needs, materialized or not.**

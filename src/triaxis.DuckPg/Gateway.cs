@@ -564,10 +564,8 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
     /// -- what was refused is not there to look at.
     ///
     /// The table is anti-joined against the keys the statement takes away as it writes, where it
-    /// takes any: a row replacing itself does not collide with itself. Rows carrying a NULL are left
-    /// out and the comparison is `=` rather than `IS NOT DISTINCT FROM`, because that is what a
-    /// DuckDB index counts as a collision -- naming a rule it would not have refused is worse than
-    /// naming none.
+    /// takes any: a row replacing itself does not collide with itself. Two NULLs match, as they do
+    /// in the index `Catalog.Keyed` holds the rule with.
     string Broken(Table table, string written, Rule rule, bool replacing)
     {
         var list = string.Join(", ", rule.Columns.Select(SqlText.Quote));
@@ -575,9 +573,9 @@ sealed class Gateway(Config config, Catalog catalog, WriteLayer write, DuckDBCon
         // A filtered index is a rule about the rows its filter matches and nothing else, so rows
         // outside it are no part of the question -- naming that rule for a collision it does not
         // hold over would be naming the wrong one.
-        var held = string.Join(" AND ", rule.Columns.Select(c => $"{SqlText.Quote(c)} IS NOT NULL")
-                                            .Concat(rule.Filter is null ? [] : (string[])[$"({rule.Filter})"]));
-        var matched = string.Join(" AND ", rule.Columns.Select(c => $"t.{SqlText.Quote(c)} = r.{SqlText.Quote(c)}"));
+        var held = rule.Filter is null ? "true" : $"({rule.Filter})";
+        var matched = string.Join(" AND ", rule.Columns.Select(c =>
+            $"t.{SqlText.Quote(c)} IS NOT DISTINCT FROM r.{SqlText.Quote(c)}"));
         var kept = replacing
             ? " ANTI JOIN " +
               $"(SELECT {string.Join(", ", table.Key.Select(k => SqlText.Quote(Was(k))))} FROM \"_rows\") AS o ON " +
