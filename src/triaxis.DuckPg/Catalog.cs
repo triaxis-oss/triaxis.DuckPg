@@ -2060,6 +2060,9 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         // statement and nothing else -- and a view is bound per execution, not per lake.
         var value = source is null ? null
             : Same(source.Type, column.Type) ? SqlText.Quote(column.Name)
+            // A column whose values disagree on a JSON type is read as JSON, and casting that
+            // keeps a string's quotes; the scalar inside is what the value was.
+            : Same(source.Type, "JSON") ? $"CAST(({SqlText.Quote(column.Name)} ->> '$') AS {column.Type})"
             : $"CAST({SqlText.Quote(column.Name)} AS {column.Type})";
         var fill = defaults ? Filled(table, column) : null;
         return (value, fill) switch

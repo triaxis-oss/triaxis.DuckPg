@@ -324,6 +324,26 @@ public class SchemaTests
         Assert.Equal(["7|seeded"], lake.Query("SELECT history_id, what FROM lake.history"));
     }
 
+    /// An unquoted `true` among strings makes the column JSON to inference, whose cast to text
+    /// keeps every string's quotes.
+    [Fact]
+    public void ATextColumnSomeRowsWriteAsABooleanStillReadsAsText()
+    {
+        using var lake = new TestLake()
+            .Yaml("base", "history", """
+                - history_id: 7
+                  what: seeded
+                - history_id: 8
+                  what: true
+                """)
+            .Stack("base");
+        Dacpac.Write(lake.At("schema", "test.dacpac"), History);
+        lake.Config.Dacpac = lake.At("schema", "test.dacpac");
+        lake.Start();
+
+        Assert.Equal(["7|seeded", "8|true"], lake.Query("SELECT history_id, what FROM lake.history ORDER BY history_id"));
+    }
+
     /// A table more than one layer carries is merged once into a parquet the view then scans,
     /// rather than merged again for every statement. The rows have to be the ones the merge would
     /// have produced -- shadowing, declared defaults and all -- or the copy is a different table.
