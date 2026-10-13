@@ -47,18 +47,19 @@ read for a layered one, which is why it is off unless asked for.
 share those columns, and both are kept — on a materialized lake, where the table is a table and
 DuckDB can hold the rule. A plain, non-unique index declares nothing and is read as nothing. The rule
 is dropped for a table the lake publishes without every column it is over — and for one over a column
-no layer carries at all, since a declared default is frozen when the lake is built and `(newid())` is
-then one id for the whole run rather than one per row. If those values were wanted they would be in
-the input, or `--derive-ids` would be on: with it, such a column *is* per row and the rule holds over
-it. A partition column
+no layer carries at all and the schema gives a default, since a declared default is frozen when the
+lake is built and `(newid())` is then one id for the whole run rather than one per row. If those
+values were wanted they would be in the input, or `--derive-ids` would be on: with it, such a column
+*is* per row and the rule holds over it. A column with no default is NULL in every row no layer
+carries it for, as it would be in SQL Server, and the rule holds over it. A partition column
 joins it as it joins the key, since rows are only unique within a partition. A **filtered** unique
 index is a rule about the rows its filter matches and says nothing about the others, and is held that
 way: the rows outside the filter collide with nothing, and a row an update moves into it is refused
 like any other. A filter naming a column the lake does not carry, or one duckpg cannot translate,
 drops the rule with a warning rather than holding it over every row — refusing rows on a rule read
 wrong is worse than not holding it. Two NULLs count as
-different here, as they do in PostgreSQL and unlike SQL Server, which allows one such row rather than
-many. A refusal **names the rule that refused it**, in SQL Server's own words — `Violation of
+the same value, as they do in SQL Server, which allows one such row rather than many -- inside a
+filter too. A refusal **names the rule that refused it**, in SQL Server's own words — `Violation of
 PRIMARY KEY constraint 'PK_orders'`, `Violation of UNIQUE KEY constraint 'UQ_x'`, or
 `Cannot insert duplicate key row in object 'dbo.t' with unique index 'UIX_x'` — since an application
 that reports which rule refused it reads that name. A layered lake keeps none of it: it publishes views, and only the key is held over the merge.

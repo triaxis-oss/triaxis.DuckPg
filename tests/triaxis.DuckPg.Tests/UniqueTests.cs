@@ -220,6 +220,36 @@ public class UniqueTests
         Assert.Equal(2, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'q', 2), (4, 'q', 3)"));
     }
 
+    /// SQL Server counts two NULLs as one value under a unique, so it allows one such row and not
+    /// two -- and a NULL is not the zero standing in for it in the index.
+    [Fact]
+    public void ANullIsOneValueUnderAUnique()
+    {
+        using var lake = Started(Lake(), Codes(("UQ_codes_label_slot", ["label", "slot"], false)));
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, NULL, NULL)"));
+        var refused = Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (4, NULL, NULL)"));
+        Assert.Contains("Violation of UNIQUE KEY constraint 'UQ_codes_label_slot'", refused.MessageText);
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (4, '', 0)"));
+    }
+
+    [Fact]
+    public void ANullIsOneValueWithinAFilterAndNothingOutsideIt()
+    {
+        using var lake = Started(Lake(), Codes() with
+        {
+            Filtered = [("UIX_codes_label", ["label"], "[slot] = 1")],
+        });
+
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, NULL, 1)"));
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (4, NULL, 1)"));
+
+        Assert.Equal(2, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (4, NULL, 2), (5, NULL, 3)"));
+    }
+
     /// A filter this cannot render leaves the rule unheld rather than held over every row: refusing
     /// rows on a rule read wrong is worse than not holding it.
     [Fact]
@@ -251,6 +281,23 @@ public class UniqueTests
 
         Assert.Equal(2, Started(lake, table).Query("SELECT code_id FROM lake.codes").Count);
         lake.Dispose();
+    }
+
+    /// A column with no default that no layer carries is NULL in every row, as it is in SQL Server,
+    /// and nothing about it is frozen.
+    [Fact]
+    public void AUniqueOverAColumnNoLayerCarriesAndNoDefaultFillsIsHeld()
+    {
+        using var lake = new TestLake(nameof(AUniqueOverAColumnNoLayerCarriesAndNoDefaultFillsIsHeld))
+            .Json("base", "codes", """[{"code_id": 1, "label": "a"}, {"code_id": 2, "label": "b"}]""")
+            .Stack("base")
+            .WriteTo("local");
+
+        Started(lake, Codes(("UQ_codes_label_slot", ["label", "slot"], false)));
+
+        Assert.Throws<PostgresException>(() =>
+            lake.Execute("INSERT INTO lake.codes (code_id, label) VALUES (3, 'a')"));
+        Assert.Equal(1, lake.Execute("INSERT INTO lake.codes (code_id, label, slot) VALUES (3, 'a', 1)"));
     }
 
     /// The whole rule goes, not the columns it can still see: uniqueness over two columns is not

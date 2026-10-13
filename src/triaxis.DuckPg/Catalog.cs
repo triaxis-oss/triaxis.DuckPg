@@ -1704,19 +1704,36 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         foreach (var rule in Uniques(table))
             Exec(conn, $"CREATE UNIQUE INDEX IF NOT EXISTS {SqlText.Quote($"{table.Name}_{rule.Name}")} " +
                        $"ON {table.QualifiedName} " +
-                       $"({string.Join(", ", rule.Columns.Select(c => Indexed(c, rule.Filter)))})");
+                       $"({string.Join(", ", rule.Columns.SelectMany(c => Indexed(table, c, rule.Filter)))})");
     }
 
-    /// What one column of a unique index is indexed by. Unfiltered, it is the column. Filtered, it
-    /// is the column where the filter holds and NULL where it does not -- DuckDB refuses a partial
-    /// index outright (*"Creating partial indexes is not supported currently"*) and counts two NULLs
-    /// as different, so a row outside the filter indexes as all-NULL and collides with nothing,
-    /// which is exactly what the filter says about it. An index over an expression needs each of
-    /// them parenthesised; a bare `CASE` is a parse error.
-    static string Indexed(string column, string? filter) =>
-        filter is null
-            ? SqlText.Quote(column)
-            : $"(CASE WHEN {filter} THEN {SqlText.Quote(column)} END)";
+    /// What one column of a unique index is indexed by: whether it is NULL, and its value with a
+    /// NULL standing in as the type's zero. SQL Server counts two NULLs as one value and DuckDB as
+    /// two, and DuckDB has no `NULLS NOT DISTINCT` -- so no part of the key may be NULL, and the flag
+    /// keeps the stand-in from colliding with a real zero.
+    ///
+    /// Filtered, both are NULL where the filter does not hold -- DuckDB refuses a partial index
+    /// outright (*"Creating partial indexes is not supported currently"*), and a row outside the
+    /// filter that indexes as all-NULL collides with nothing, which is exactly what the filter says
+    /// about it. An index over an expression needs each of them parenthesised; a bare `CASE` is a
+    /// parse error.
+    static IEnumerable<string> Indexed(Table table, string column, string? filter)
+    {
+        var quoted = SqlText.Quote(column);
+        var type = table.Columns.First(c => Same(c.Name, column)).Type;
+        string[] parts = [$"{quoted} IS NULL", $"COALESCE({quoted}, CAST({Zero(type)} AS {type}))"];
+        return parts.Select(part => filter is null ? $"({part})" : $"(CASE WHEN {filter} THEN {part} END)");
+    }
+
+    /// A literal that casts to the type, which is all a stand-in has to be.
+    static string Zero(string type) => type switch
+    {
+        "VARCHAR" or "BLOB" => "''",
+        "DATE" or "TIMESTAMP" or "TIMESTAMPTZ" => "'epoch'",
+        "TIME" => "'00:00:00'",
+        "UUID" => "'00000000-0000-0000-0000-000000000000'",
+        _ => "0",
+    };
 
     /// Every rule the rows of this table are held to by name: the declared key, and -- materialized,
     /// where DuckDB holds them as indexes -- the uniqueness declared past it. A layered lake holds
@@ -1732,9 +1749,8 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
 
     /// The uniqueness the dacpac declares past the key -- a `UNIQUE` constraint or a unique index,
     /// which say the same thing about the rows and are held the same way. Unlike the key this is an
-    /// index and not a constraint, because that is what it is: the columns may be NULL, and DuckDB
-    /// counts two NULLs as different where SQL Server counts them as one, so what a lake refuses
-    /// here is a shade narrower than what SQL Server would.
+    /// index and not a constraint, because that is what it is: the columns may be NULL, and SQL
+    /// Server counts two of them as one value, which only an index over expressions can say.
     ///
     /// Only where the table publishes every column the rule is over -- a lake showing a subset of a
     /// declared table should lose the rule rather than fail on it -- and never the key again under
@@ -1804,19 +1820,20 @@ internal sealed class Catalog(Config config, WriteLayer write, DacpacSchema sche
         }
     }
 
-    /// Whether the lake holds values for a column, as against the schema merely declaring it. A
-    /// column no read layer carries is the same in every row those layers produce -- a declared
-    /// default, frozen at build, or a typed NULL -- so it tells one row from another only by
-    /// accident of there being one row. `(newid())` is the case that makes this plain: one id for
-    /// the run, stamped onto every row a file did not carry, which a rule over that column would
-    /// then refuse the whole lake for. If the values were wanted they would be in the input.
+    /// Whether the lake holds the values SQL Server would for a column, as against a declared
+    /// default frozen at build. A column no read layer carries is that default in every row those
+    /// layers produce, so it tells one row from another only by accident of there being one row.
+    /// `(newid())` is the case that makes this plain: one id for the run, stamped onto every row a
+    /// file did not carry, which a rule over that column would then refuse the whole lake for. If
+    /// the values were wanted they would be in the input. A column with no default is NULL in those
+    /// rows, as it would be in SQL Server, and a rule over it means what it says.
     ///
     /// A lake with no read layers has nothing frozen: its rows arrive as writes, and the write
     /// table's own default stamps each as it is written.
     bool Carried(Table table, string column) =>
         table.Layers.Count == 0 || table.Layers.Any(l => l.Columns.Any(c => Same(c.Name, column)))
         || (table.Columns.FirstOrDefault(c => Same(c.Name, column)) is { } declared
-            && Derived(table, declared) is not null);
+            && (declared.Default is null || Derived(table, declared) is not null));
 
     /// Whether two column lists say the same thing about a row, which order does not change.
     static bool Covers(string[] key, string[] columns) =>
