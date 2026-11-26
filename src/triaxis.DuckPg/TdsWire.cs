@@ -1,5 +1,9 @@
 using System.Buffers.Binary;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Microsoft.Extensions.Logging;
 
@@ -218,15 +222,18 @@ struct TdsReader(byte[] body, int length)
 
 /// TDS packet framing: a message is a run of packets, each with an 8-byte header, the last one
 /// carrying the end-of-message bit.
-sealed class TdsWire(Stream stream, ILogger logger)
+sealed class TdsWire(Stream transport, ILogger logger)
 {
+    readonly Stream transport = transport;
+    Stream stream = transport;
+
     /// Written separately, a packet's header and body are two writes, and under TCP_NODELAY two
     /// segments -- the first a naked 8-byte header, handed to the client as a read of its own.
     /// SqlClient replays partial reads, and a stream arriving as header-sized crumbs runs that
     /// replay on every packet; measured on macOS loopback, it sometimes loses. So responses go out
     /// through a buffer and reach the socket whole. Only the write side: a BufferedStream cannot
     /// serve both over a socket.
-    readonly Stream output = new BufferedStream(stream, 64 * 1024);
+    Stream output = new BufferedStream(transport, 64 * 1024);
 
     readonly byte[] header = new byte[8];
 
@@ -239,7 +246,40 @@ sealed class TdsWire(Stream stream, ILogger logger)
 
     /// A client that cancels sends an Attention on the same connection, so a query in flight has
     /// to be able to notice one arriving without blocking on the socket.
-    public bool DataAvailable => stream is NetworkStream { DataAvailable: true };
+    public bool DataAvailable => transport is NetworkStream { DataAvailable: true };
+
+    public void Encrypt()
+    {
+        var tunnel = new PreloginTunnel(transport, Payload);
+        var tls = new SslStream(tunnel);
+        try
+        {
+            tls.AuthenticateAsServer(new SslServerAuthenticationOptions
+            {
+                ServerCertificate = Certificate.Value,
+                // TLS 1.3 sends its session tickets after the client has stopped tunnelling.
+                EnabledSslProtocols = SslProtocols.Tls12,
+            });
+        }
+        catch (AuthenticationException e)
+        {
+            // A client that refused the certificate has gone, and has no plaintext error to read.
+            throw new IOException(e.Message, e);
+        }
+        tunnel.Handshaking = false;
+
+        stream = tls;
+        output = new BufferedStream(tls, 64 * 1024);
+    }
+
+    static readonly Lazy<X509Certificate2> Certificate = new(() =>
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest("CN=duckpg", key, HashAlgorithmName.SHA256);
+        using var made = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(10));
+        // Windows refuses an ephemeral key for a TLS server; one loaded from a PFX is persisted.
+        return X509CertificateLoader.LoadPkcs12(made.Export(X509ContentType.Pfx), null);
+    });
 
     /// `Reset` is how a pooled connection says it is a new session: SqlClient marks the first
     /// message it sends on a connection it took back out of the pool, rather than calling
@@ -281,7 +321,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
         var body = msg.Body;
         var sent = 0;
 
-        lock (stream)
+        lock (transport)
         {
             while (sent < count)
             {
@@ -302,7 +342,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
         var body = msg.Body;
         var sent = 0;
 
-        lock (stream)
+        lock (transport)
         {
             while (true)
             {
@@ -345,4 +385,63 @@ sealed class TdsWire(Stream stream, ILogger logger)
         }
         return true;
     }
+}
+
+/// SslStream keeps the stream it was made with, so once the handshake is done this passes straight through.
+sealed class PreloginTunnel(Stream socket, int payload) : Stream
+{
+    public bool Handshaking { get; set; } = true;
+
+    readonly byte[] incoming = new byte[8];
+    int remaining;
+
+    public override int Read(Span<byte> buffer)
+    {
+        if (!Handshaking) return socket.Read(buffer);
+
+        while (remaining == 0)
+        {
+            socket.ReadExactly(incoming);
+            remaining = BinaryPrimitives.ReadUInt16BigEndian(incoming.AsSpan(2)) - 8;
+        }
+        var read = socket.Read(buffer[..Math.Min(buffer.Length, remaining)]);
+        remaining -= read;
+        return read;
+    }
+
+    /// A packet is one write, for the same reason `TdsWire` buffers its own.
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        if (!Handshaking)
+        {
+            socket.Write(buffer);
+            return;
+        }
+
+        do
+        {
+            var chunk = buffer[..Math.Min(buffer.Length, payload)];
+            buffer = buffer[chunk.Length..];
+
+            var packet = new byte[8 + chunk.Length];
+            packet[0] = TdsMessage.PreLogin;
+            packet[1] = (byte)(buffer.IsEmpty ? 1 : 0);
+            BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(2), (ushort)packet.Length);
+            packet[6] = 1;
+            chunk.CopyTo(packet.AsSpan(8));
+            socket.Write(packet);
+        } while (!buffer.IsEmpty);
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+    public override void Write(byte[] buffer, int offset, int count) => Write(buffer.AsSpan(offset, count));
+    public override void Flush() => socket.Flush();
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
 }

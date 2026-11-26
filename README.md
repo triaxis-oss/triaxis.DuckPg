@@ -149,8 +149,9 @@ the bake ran — as it has always been in a `--store`.
 
 ## Known limitations
 
-- Trust auth only, on both protocols. No TLS, no SCRAM; TDS refuses encryption outright, so SqlClient
-  needs `Encrypt=False`. Bind to localhost. A `filter:` is not a security boundary.
+- Trust auth only, on both protocols. No SCRAM, and no TLS on the PostgreSQL side; TDS encrypts only
+  for a client that insists, with a self-signed certificate it has to be told to trust. Bind to
+  localhost. A `filter:` is not a security boundary.
 - Statement description runs the query `LIMIT 0` to learn its shape, so describing is not free and a
   statement that cannot be wrapped in a subquery falls back to `NoData`.
 - A write is turned into layer operations by scanning the statement for its top-level clauses rather

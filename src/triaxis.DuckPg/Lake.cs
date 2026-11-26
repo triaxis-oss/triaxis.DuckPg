@@ -62,9 +62,7 @@ public sealed class Lake : IHostedService, IDisposable, IAsyncDisposable
             ? $"Host={endpoint.Address};Port={endpoint.Port};Username={user};Database={config.DatabaseName};SSL Mode=Disable"
             : throw new InvalidOperationException("no PostgreSQL front door: set `listen` in the configuration");
 
-    /// Ready to hand to Microsoft.Data.SqlClient. `Encrypt=False` is part of the contract rather
-    /// than a shortcut: TDS encrypts the login packet even in a plaintext session, and duckpg
-    /// answers PRELOGIN with ENCRYPT_NOT_SUP.
+    /// Ready to hand to Microsoft.Data.SqlClient.
     public string SqlConnectionString(string user = "sa") =>
         TdsEndpoint is { } endpoint
             ? $"Server={endpoint.Address},{endpoint.Port};Database={config.DatabaseName};User ID={user};" +
