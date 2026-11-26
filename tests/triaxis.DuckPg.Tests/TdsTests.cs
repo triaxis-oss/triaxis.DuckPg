@@ -367,24 +367,31 @@ public class TdsTests : IDisposable
     /// and where in that body each packet ended.
     static (List<int> Boundaries, byte[] Body) Reassemble(byte[] captured)
     {
-        List<int> boundaries = [], longest = [];
-        List<byte> message = [], result = [];
+        var (_, boundaries, body) = Messages(captured).MaxBy(m => m.Body.Length);
+        return (boundaries, body);
+    }
+
+    static List<(byte Type, List<int> Boundaries, byte[] Body)> Messages(byte[] captured)
+    {
+        var messages = new List<(byte, List<int>, byte[])>();
+        List<int> boundaries = [];
+        List<byte> body = [];
 
         for (var at = 0; at + 8 <= captured.Length;)
         {
             var length = BinaryPrimitives.ReadUInt16BigEndian(captured.AsSpan(at + 2));
-            message.AddRange(captured[(at + 8)..(at + length)]);
-            boundaries.Add(message.Count);
+            body.AddRange(captured[(at + 8)..(at + length)]);
+            boundaries.Add(body.Count);
 
             if ((captured[at + 1] & 1) != 0) // end of message
             {
-                if (message.Count > result.Count) (result, longest) = (message, boundaries);
-                (message, boundaries) = ([], []);
+                messages.Add((captured[at], boundaries, [.. body]));
+                (boundaries, body) = ([], []);
             }
             at += length;
         }
 
-        return (longest, result.ToArray());
+        return messages;
     }
 
     /// Where the longest response's packets ended and where its rows did. Every column of
@@ -523,6 +530,112 @@ public class TdsTests : IDisposable
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
+    /// On the bytes, since a client only trips over a missing DONE_MORE where its buffer ends there.
+    [Fact]
+    public void EveryDoneButTheLastSaysThereIsMore()
+    {
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=False;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
+        connection.Open();
+
+        using (var batch = new SqlCommand("SELECT 1 AS a; SELECT 2 AS b", connection))
+            batch.ExecuteNonQuery();
+
+        using (var call = new SqlCommand("SELECT @p AS a; SELECT @p AS b", connection))
+        {
+            call.Parameters.AddWithValue("@p", 1);
+            call.ExecuteNonQuery();
+        }
+
+        using (var calls = new SqlBatch(connection))
+        {
+            calls.BatchCommands.Add(new SqlBatchCommand("SELECT @p AS a", CommandType.Text, [new SqlParameter("@p", 1)]));
+            calls.BatchCommands.Add(new SqlBatchCommand("SELECT @p AS b", CommandType.Text, [new SqlParameter("@p", 2)]));
+            calls.ExecuteNonQuery();
+        }
+
+        using (var transaction = connection.BeginTransaction())
+            transaction.Commit();
+
+        const int More = TdsSession.Status.More, Count = TdsSession.Status.Count;
+        Assert.Equal(
+        [
+            [(TdsToken.Done, 0)],
+            [(TdsToken.DoneInProc, More | Count), (TdsToken.Done, Count)],
+            [(TdsToken.DoneInProc, More | Count), (TdsToken.DoneInProc, More | Count), (TdsToken.DoneProc, 0)],
+            [(TdsToken.DoneInProc, More | Count), (TdsToken.DoneProc, More),
+             (TdsToken.DoneInProc, More | Count), (TdsToken.DoneProc, 0)],
+            [(TdsToken.Done, More | Count), (TdsToken.Done, 0)],
+            [(TdsToken.Done, More | Count), (TdsToken.Done, 0)],
+        ], Dones(delivery.Captured));
+    }
+
+    static List<List<(byte Token, int Status)>> Dones(byte[] captured) =>
+        [.. Messages(captured).Where(m => m.Type == TdsMessage.Result).Select(m => DonesIn(m.Body))];
+
+    static List<(byte Token, int Status)> DonesIn(byte[] body)
+    {
+        var dones = new List<(byte, int)>();
+        var reader = new TdsReader(body);
+        TdsColumn[] columns = [];
+        while (!reader.AtEnd)
+        {
+            var token = reader.U8();
+            switch (token)
+            {
+                case TdsToken.Done or TdsToken.DoneProc or TdsToken.DoneInProc:
+                    dones.Add((token, reader.U16()));
+                    reader.Skip(2 + 8);
+                    break;
+                case TdsToken.ReturnStatus:
+                    reader.Skip(4);
+                    break;
+                case TdsToken.ColMetadata:
+                    columns = new TdsColumn[reader.U16()];
+                    for (var i = 0; i < columns.Length; i++)
+                    {
+                        reader.Skip(6);
+                        columns[i] = TdsTypes.ReadTypeInfo(ref reader);
+                        reader.BVarchar();
+                    }
+                    break;
+                case TdsToken.Row:
+                    foreach (var column in columns) TdsTypes.ReadValue(ref reader, column);
+                    break;
+                case TdsToken.EnvChange or TdsToken.LoginAck or TdsToken.Info or TdsToken.Error:
+                    reader.Skip(reader.U16());
+                    break;
+                default:
+                    throw new InvalidOperationException($"unexpected token 0x{token:X2}");
+            }
+        }
+        return dones;
+    }
+
+    /// Values that put an RPC's DONEINPROC at a 16000-byte packet's end, the size macOS settles on.
+    [Fact]
+    public void PooledCommandsReadTheirOwnResponses()
+    {
+        lake.Config.TdsPacketSize = 16000;
+
+        for (var size = 15900; size <= 16000; size++)
+        {
+            using var connection = Open();
+            using (var echo = new SqlCommand("SELECT @s AS v", connection))
+            {
+                echo.Parameters.Add("@s", SqlDbType.VarBinary, -1).Value = new byte[size];
+                Assert.Equal(size, Assert.IsType<byte[]>(echo.ExecuteScalar()).Length);
+            }
+
+            using var marker = new SqlCommand("SELECT 1 AS marker", connection);
+            using var reader = marker.ExecuteReader();
+            Assert.True(reader.Read(), $"no row after a {size}-byte value");
+            Assert.Equal("marker", reader.GetName(0));
+        }
     }
 
     [Fact]

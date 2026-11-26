@@ -107,6 +107,13 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
   never on Linux. The TDS side writes through a `BufferedStream` the way the PostgreSQL side always
   has, and `TdsTests.PacketsLeaveTheSocketCoalesced` counts the writes rather than trusting the
   segmentation.
+- **Every DONE token but a response's last carries DONE_MORE**, the DONEINPROC an RPC's statements
+  end with included: a RETURNSTATUS and a DONEPROC follow it. SqlClient stops reading at a DONE
+  without the bit whenever that token ends what it has read, and on a pooled connection the rest of
+  the response -- and from then on each whole one -- is read as the answer to the next command: the
+  wrong result, and no error. At 16000-byte packets, which is what macOS settles on, an RPC returning
+  a value of 15947 to 15960 bytes is enough. `TdsTests.EveryDoneButTheLastSaysThereIsMore` checks the
+  bits and `PooledCommandsReadTheirOwnResponses` sweeps that band.
 - **The legacy LOB parameter types are still in use.** LLBLGen on the old `System.Data.SqlClient`
   types a string parameter as `NTEXT`, so `TdsTypes.ReadValue` has to know `TEXT`/`NTEXT`/`IMAGE`:
   four bytes of declared maximum instead of two, a collation on the text ones, and a four-byte
