@@ -252,7 +252,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         var msg = new TdsMsg();
         try
         {
-            Run(msg, Probe(sql), NoParameters, TdsToken.Done);
+            Run(msg, Probe(sql), NoParameters, TdsToken.Done, Status.Final);
         }
         catch (Exception e) when (e is not (IOException or SocketException))
         {
@@ -288,7 +288,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     /// Runs one client statement, or several: a batch is a list of statements sharing a response,
     /// and every statement but the last says there is more to come.
-    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> bound, byte doneToken)
+    void Run(TdsMsg msg, string sql, IReadOnlyDictionary<string, Parameter> bound, byte doneToken, int closing)
     {
         var statements = TSqlParser.Parse(sql);
 
@@ -300,7 +300,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
         if (statements.Count == 0)
         {
-            Done(msg, doneToken, Status.Final, 0);
+            Done(msg, doneToken, closing, 0);
             return;
         }
 
@@ -314,7 +314,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             var last = i == statements.Count - 1;
             var done = last ? doneToken : TdsToken.DoneInProc;
-            var status = last ? Status.Final : Status.More;
+            var status = last ? closing : Status.More;
 
             switch (statements[i])
             {
@@ -366,7 +366,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 continue;
             }
 
-            Execute(msg, plan, parameters, done, last, translated);
+            Execute(msg, plan, parameters, done, status, translated);
         }
     }
 
@@ -388,7 +388,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         return reader.Read() && !reader.IsDBNull(0) ? reader.GetValue(0) : null;
     }
 
-    void Execute(TdsMsg msg, Plan plan, Dictionary<string, Parameter> parameters, byte doneToken, bool last,
+    void Execute(TdsMsg msg, Plan plan, Dictionary<string, Parameter> parameters, byte doneToken, int status,
                  Translated? translated = null)
     {
         if (!turn && (plan.Dirty is not null || plan.Tag == "BEGIN")) turn = gateway.EnterTurn();
@@ -397,7 +397,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         if (!inside && plan.Tag == "BEGIN") gateway.Transacting(inside = true);
         try
         {
-            Perform(msg, plan, parameters, doneToken, last, translated);
+            Perform(msg, plan, parameters, doneToken, status, translated);
         }
         catch (Exception e) when (plan.Violation is { } refused && refused.Caused(e))
         {
@@ -422,7 +422,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     }
 
     void Perform(TdsMsg msg, Plan plan, Dictionary<string, Parameter> parameters, byte doneToken,
-                 bool last, Translated? translated)
+                 int status, Translated? translated)
     {
         Checked(plan, parameters);
 
@@ -430,7 +430,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         {
             case PlanKind.Empty:
             case PlanKind.NoOp:
-                Done(msg, doneToken, last ? Status.Final : Status.More, 0);
+                Done(msg, doneToken, status, 0);
                 return;
 
             // An assignment select produces its values like any other query and hands none of them
@@ -464,7 +464,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 // `INSERT …; SELECT @id = SCOPE_IDENTITY()` through `ExecuteNonQuery` is told about
                 // the insert alone.
                 rowCount = rows;
-                Done(msg, doneToken, last ? Status.Final : Status.More, 0);
+                Done(msg, doneToken, status, 0);
                 return;
             }
 
@@ -490,7 +490,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 Persist(plan);
 
                 rowCount = rows;
-                Done(msg, doneToken, (last ? Status.Final : Status.More) | Status.Count, rows);
+                Done(msg, doneToken, status | Status.Count, rows);
                 return;
             }
 
@@ -518,7 +518,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 Persist(plan);
 
                 rowCount = affected;
-                Done(msg, doneToken, (last ? Status.Final : Status.More) | Status.Count, affected);
+                Done(msg, doneToken, status | Status.Count, affected);
                 return;
             }
         }
@@ -828,7 +828,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                     arguments.Add(new Argument(parameter.TrimStart('@'), value, column, (status & 0x01) != 0));
                 }
 
-                Call(msg, procedure, name, arguments);
+                Call(msg, procedure, name, arguments, reader.AtEnd ? Status.Final : Status.More);
 
                 if (!reader.AtEnd) reader.Skip(1);
             }
@@ -846,7 +846,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
     /// answer goes back in, and whether it asked for one.
     sealed record Argument(string Name, object? Value, TdsColumn Column, bool Output);
 
-    void Call(TdsMsg msg, ushort procedure, string name, List<Argument> arguments)
+    void Call(TdsMsg msg, ushort procedure, string name, List<Argument> arguments, int closing)
     {
         if (name.Length > 0 && !name.StartsWith("sp_", StringComparison.OrdinalIgnoreCase))
             throw new PgError("42883", $"stored procedure {name} does not exist");
@@ -870,7 +870,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             case Procedure.ExecuteSql:
             {
                 var bound = Bind(Declaration(arguments, 1), arguments.Skip(2));
-                Run(msg, Text(arguments, 0), bound, TdsToken.DoneInProc);
+                Run(msg, Text(arguments, 0), bound, TdsToken.DoneInProc, Status.More);
                 Outputs(msg, bound);
                 break;
             }
@@ -882,7 +882,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 ReturnValue(msg, "handle", new TdsColumn(TdsTypes.IntN, 4), handle);
 
                 var bound = Bind(prepared[handle].Declaration, arguments.Skip(3));
-                Run(msg, prepared[handle].Statement, bound, TdsToken.DoneInProc);
+                Run(msg, prepared[handle].Statement, bound, TdsToken.DoneInProc, Status.More);
                 Outputs(msg, bound);
                 break;
             }
@@ -892,7 +892,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 var handle = ++handles;
                 prepared[handle] = new Prepared(Text(arguments, 2), Declaration(arguments, 1));
                 ReturnValue(msg, "handle", new TdsColumn(TdsTypes.IntN, 4), handle);
-                Done(msg, TdsToken.DoneInProc, Status.Final, 0);
+                Done(msg, TdsToken.DoneInProc, Status.More, 0);
                 break;
             }
 
@@ -903,24 +903,24 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                     throw new PgError("26000", $"prepared handle {handle} is unknown");
 
                 var bound = Bind(statement.Declaration, arguments.Skip(1));
-                Run(msg, statement.Statement, bound, TdsToken.DoneInProc);
+                Run(msg, statement.Statement, bound, TdsToken.DoneInProc, Status.More);
                 Outputs(msg, bound);
                 break;
             }
 
             case Procedure.Unprepare:
                 prepared.Remove(Convert.ToInt32(arguments[0].Value));
-                Done(msg, TdsToken.DoneInProc, Status.Final, 0);
+                Done(msg, TdsToken.DoneInProc, Status.More, 0);
                 break;
 
             default:
                 Reset();
-                Done(msg, TdsToken.DoneInProc, Status.Final, 0);
+                Done(msg, TdsToken.DoneInProc, Status.More, 0);
                 break;
         }
 
         msg.U8(TdsToken.ReturnStatus).I32(0);
-        Done(msg, TdsToken.DoneProc, Status.Final, 0);
+        Done(msg, TdsToken.DoneProc, closing, 0);
     }
 
     /// What the caller asked to have back. A parameter it marked OUTPUT carries whatever the batch
@@ -1150,7 +1150,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         // write is the write layer written back, and committing per slice would pay that per slice.
         var scratch = new TdsMsg();
         var wrap = transactions == 0;
-        if (wrap) Run(scratch, "BEGIN TRANSACTION", NoParameters, TdsToken.Done);
+        if (wrap) Run(scratch, "BEGIN TRANSACTION", NoParameters, TdsToken.Done, Status.More);
 
         var size = Math.Max(1, 2048 / count);
         var names = new List<string>();
@@ -1191,7 +1191,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                 if (rows.Count == size) full = parameters;
             }
 
-            Execute(scratch, plan!, parameters, TdsToken.DoneInProc, last: false, translated);
+            Execute(scratch, plan!, parameters, TdsToken.DoneInProc, Status.More, translated);
             // A response nobody reads still costs what is written into it.
             scratch.Clear();
             return rowCount;
@@ -1221,13 +1221,13 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             }
 
             if (batch.Count > 0) total += Insert(batch);
-            if (wrap) Run(scratch, "COMMIT", NoParameters, TdsToken.Done);
+            if (wrap) Run(scratch, "COMMIT", NoParameters, TdsToken.Done, Status.More);
             return total;
         }
         catch
         {
             if (wrap)
-                try { Run(scratch, "ROLLBACK", NoParameters, TdsToken.Done); }
+                try { Run(scratch, "ROLLBACK", NoParameters, TdsToken.Done, Status.More); }
                 catch
                 {
                     // A rollback that could not be delivered must not leave the session believing
@@ -1255,18 +1255,18 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         switch (request)
         {
             case 5: // TM_BEGIN_XACT
-                Run(msg, "BEGIN TRANSACTION", NoParameters, TdsToken.Done);
+                Run(msg, "BEGIN TRANSACTION", NoParameters, TdsToken.Done, Status.More);
                 descriptor++;
                 Transaction(msg, 8, descriptor, 0);
                 break;
 
             case 7: // TM_COMMIT_XACT
-                Run(msg, "COMMIT", NoParameters, TdsToken.Done);
+                Run(msg, "COMMIT", NoParameters, TdsToken.Done, Status.More);
                 Transaction(msg, 9, 0, descriptor);
                 break;
 
             case 8: // TM_ROLLBACK_XACT
-                Run(msg, "ROLLBACK", NoParameters, TdsToken.Done);
+                Run(msg, "ROLLBACK", NoParameters, TdsToken.Done, Status.More);
                 Transaction(msg, 10, 0, descriptor);
                 break;
 
@@ -1290,7 +1290,8 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
     // ---- tokens ----------------------------------------------------------------------------------
 
-    static class Status
+    /// `More` on every DONE token but a response's last: SqlClient stops reading at one without it.
+    internal static class Status
     {
         public const int Final = 0x0000, More = 0x0001, Error = 0x0002, Count = 0x0010, Attention = 0x0020;
     }
