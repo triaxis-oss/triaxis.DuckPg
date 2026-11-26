@@ -51,7 +51,8 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
 
 ## TDS
 
-- **Every packet the door sends is a tabular result (type 4), the prelogin answer included.**
+- **Every packet the door sends is a tabular result (type 4), the prelogin answer included** -- all
+  but the TLS handshake's, which travel as PRELOGIN (below).
   SqlClient reads that answer whatever its type, so nothing it runs could tell; FreeTDS and
   go-mssqldb refuse anything else, and FreeTDS then retries as a Sybase login -- which is why a
   refused FreeTDS client shows up in the log as `unsupported TDS message type 2`.
@@ -64,8 +65,22 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
 - **DuckDB reports a decimal column as plain `Decimal`.** Precision and scale come from
   `reader.GetSchemaTable()`, and TDS has to declare both in COLMETADATA or every value truncates
   to an integer.
-- **Encryption is refused with `ENCRYPT_NOT_SUP`**, which is why `Encrypt=False` is part of the
-  connection string. TDS otherwise encrypts the login packet even in a plaintext session.
+- **Encryption is for a client that insists on it.** One asking for `ENCRYPT_ON` or `ENCRYPT_REQ`
+  gets TLS; every other one is answered `ENCRYPT_NOT_SUP` and stays in plaintext, since
+  `ENCRYPT_OFF` would have it encrypt its login packet. The TLS handshake rides inside PRELOGIN
+  packets (`PreloginTunnel`, type 0x12 both ways), and after it TLS runs on the bare socket. Only
+  TLS 1.2: under 1.3 the server sends its session tickets after the client has stopped tunnelling,
+  and SqlClient reads the packet header in front of them as a corrupted frame. The certificate is a
+  self-signed ECDSA one made the first time a client asks -- a P-256 key takes milliseconds, an RSA
+  one a noticeable fraction of a second -- so a client has to be told to trust it
+  (`TrustServerCertificate=True`, `-C`). `Encrypt=Strict` (TLS before any TDS) is not offered:
+  SqlClient 7 validates the chain there even with `TrustServerCertificate=True`, and refuses a
+  self-signed certificate as an untrusted root.
+- **A cancel under TLS is noticed on the socket.** `TdsWire.DataAvailable` asks the `NetworkStream`
+  underneath, since the TLS stream cannot say whether anything is waiting; asked of the TLS stream,
+  the whole result goes out before the Attention is read. `TdsTests.ACancelStopsAStreamingResult`
+  counts the bytes either way. What it cannot see is an Attention the TLS stream already read into
+  its own buffer, which takes a client sending one in the same breath as its request.
 - **A cancel arrives on the same connection as the query**, unlike PostgreSQL's second connection.
   It is only noticed between row packets; see `TdsSession.Canceled`.
 - **The packet size a client asks for in LOGIN7 is a request, not a setting.** TDS lets the server

@@ -651,6 +651,45 @@ public class TdsTests : IDisposable
     }
 
     [Fact]
+    public void EncryptsForAClientThatInsists()
+    {
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            "Encrypt=True;TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
+        connection.Open();
+
+        using var command = new SqlCommand("SELECT 'in the clear' AS v", connection);
+        Assert.Equal("in the clear", command.ExecuteScalar());
+        Assert.Equal(-1, delivery.Captured.AsSpan().IndexOf(System.Text.Encoding.Unicode.GetBytes("in the clear")));
+    }
+
+    /// Counted in bytes, since a cancel the server misses still ends -- after the whole result.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ACancelStopsAStreamingResult(bool encrypt)
+    {
+        using var delivery = new SplitDelivery(lake.TdsPort, piece: 64 * 1024).Start();
+        using var connection = new SqlConnection(
+            $"Server=127.0.0.1,{delivery.Port};Database=lake;User ID=sa;Password=duckpg;" +
+            $"Encrypt={encrypt};TrustServerCertificate=True;Connect Timeout=15;Pooling=false");
+        connection.Open();
+
+        using var command = new SqlCommand("SELECT r FROM range(20000000) t(r)", connection) { CommandTimeout = 60 };
+        using (var reader = command.ExecuteReader())
+        {
+            for (var i = 0; i < 1000; i++) Assert.True(reader.Read());
+            command.Cancel();
+        }
+
+        // Ten bytes a row, so the whole result is 200 MB.
+        Assert.InRange(delivery.Captured.Length, 0, 20_000_000);
+        using var after = new SqlCommand("SELECT 1", connection);
+        Assert.Equal(1, after.ExecuteScalar());
+    }
+
+    [Fact]
     public void ConnectsAndAnswers()
     {
         using var connection = Open();

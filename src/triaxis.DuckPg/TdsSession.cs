@@ -120,25 +120,32 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
                           TraceId = 5, FedAuthRequired = 6, Terminator = 0xFF;
     }
 
-    /// Encryption is refused outright, which is what `Encrypt=False` in the connection string
-    /// agrees to. TDS otherwise encrypts the login packet even when the session is plaintext, and
-    /// that handshake needs a certificate this tool has no business owning.
+    static class Encryption
+    {
+        public const byte Off = 0, On = 1, NotSupported = 2, Required = 3;
+    }
+
     void PreLogin(byte[] payload, int length)
     {
         var requested = new List<byte>();
+        var encrypt = false;
         var reader = new TdsReader(payload, length);
         while (!reader.AtEnd)
         {
             var token = reader.U8();
             if (token == Option.Terminator) break;
             requested.Add(token);
-            reader.Skip(4);
+            var at = reader.U8() << 8 | reader.U8();
+            reader.Skip(2);
+            if (token == Option.Encryption && at < length)
+                encrypt = payload[at] is Encryption.On or Encryption.Required;
         }
 
         var options = new List<(byte Token, byte[] Value)>
         {
             (Option.Version, [16, 0, 0, 0, 0, 0]),
-            (Option.Encryption, [2]), // ENCRYPT_NOT_SUP
+            // Not `Off`, which would have the client encrypt its login.
+            (Option.Encryption, [encrypt ? Encryption.On : Encryption.NotSupported]),
             (Option.Mars, [0]),
         };
         if (requested.Contains(Option.FedAuthRequired)) options.Add((Option.FedAuthRequired, [0]));
@@ -154,6 +161,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         foreach (var (_, value) in options) msg.Raw(value);
 
         wire.Send(msg);
+        if (encrypt) wire.Encrypt();
     }
 
     void Login(byte[] payload, int length)

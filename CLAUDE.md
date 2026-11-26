@@ -36,7 +36,7 @@ publish a temp-directory convention as API.
 | `Gateway.cs` | Statement translation: catalog shims, GUC no-ops, DML rewriting. `Shims` lives here. |
 | `Doorway.cs` | A front door's sockets: the listener, the connections it accepted, and closing both. |
 | `PgWire.cs`, `PgTypes.cs`, `PgServer.cs`, `PgSession.cs` | The PostgreSQL protocol. Rarely the thing that is wrong. |
-| `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, tokens, RPC, transactions. |
+| `TdsWire.cs`, `TdsTypes.cs`, `TdsServer.cs`, `TdsSession.cs` | The TDS protocol: packets, TLS, tokens, RPC, transactions. |
 | `TSql/` | Lexer, parser, AST and DuckDB renderer for the T-SQL a client sends. |
 | `HostFunctions.cs` | The SQL Server functions answered in .NET: `pwdencrypt`, `pwdcompare`, `CONVERT` styles. |
 | `SqlText.cs` | Enough SQL scanning to find top-level keywords without a parser. |

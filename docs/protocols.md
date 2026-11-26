@@ -86,10 +86,12 @@ using var connection = new SqlConnection("Server=127.0.0.1,1433;Database=lake;Us
 using var command = new SqlCommand("SELECT TOP 10 [order_id], ISNULL([note], '') FROM [dbo].[orders]", connection);
 ```
 
-**`Encrypt=False` is required.** duckpg answers PRELOGIN with `ENCRYPT_NOT_SUP`, because TDS encrypts
-the login packet even when the session itself is plaintext, and that needs a certificate this tool has
-no business owning. Bind it to localhost. Both doors share one lake, one catalog and one write layer:
-a row inserted over TDS is in the same file a `psql` session reads a moment later.
+**`Encrypt=False` is the way to connect.** A client that insists on encryption gets TLS 1.2 with a
+self-signed certificate made for the run, so it needs `TrustServerCertificate=True` (`-C` for
+sqlcmd); `Encrypt=Strict` is not offered. Encryption buys nothing on the localhost the door should be
+bound to -- it is there for clients that cannot be talked out of it. Both doors share one lake, one
+catalog and one write layer: a row inserted over TDS is in the same file a `psql` session reads a
+moment later.
 
 **The packet size is the server's to decide.** A client asks for one — SqlClient's `Packet Size`
 defaults to 8000 — and the login response answers with what the door will actually use, which is
@@ -115,7 +117,7 @@ buffer; nothing else wants smaller packets.
 | `SUM` of an integer column, `UBIGINT`, `HUGEINT` | `DECIMAL(38,0)` — a number, since no SQL Server integer is that wide |
 | `SqlBulkCopy` — `INSERT BULK` and the bulk load stream | the same insert path a statement takes: keys, references and defaults hold, one transaction per stream |
 
-Not implemented: TLS and SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
+Not implemented: SQL logins are not verified (trust auth, as on the PostgreSQL side), MARS,
 table-valued parameters, output parameters, and `sys.*` / `INFORMATION_SCHEMA` emulation — so SSMS
 and EF Core scaffolding will not introspect the lake, though hand-written queries run.
 
