@@ -509,7 +509,7 @@ public class TdsTests : IDisposable
 
         var msg = new TdsMsg();
         msg.Raw(new byte[2000]);
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
 
         Assert.DoesNotContain(8, writes);
         Assert.Equal(2000 + 4 * 8, Assert.Single(writes));
@@ -574,8 +574,9 @@ public class TdsTests : IDisposable
         ], Dones(delivery.Captured));
     }
 
+    /// Past the first response, which answers the prelogin with options rather than tokens.
     static List<List<(byte Token, int Status)>> Dones(byte[] captured) =>
-        [.. Messages(captured).Where(m => m.Type == TdsMessage.Result).Select(m => DonesIn(m.Body))];
+        [.. Messages(captured).Skip(1).Select(m => DonesIn(m.Body))];
 
     static List<(byte Token, int Status)> DonesIn(byte[] body)
     {
@@ -636,6 +637,17 @@ public class TdsTests : IDisposable
             Assert.True(reader.Read(), $"no row after a {size}-byte value");
             Assert.Equal("marker", reader.GetName(0));
         }
+    }
+
+    /// Raw, since SqlClient reads the answer whatever its type; FreeTDS and go-mssqldb do not.
+    [Fact]
+    public void ThePreloginAnswerIsATabularResult()
+    {
+        using var tcp = new TcpClient("127.0.0.1", lake.TdsPort);
+        var stream = tcp.GetStream();
+        stream.Write([TdsMessage.PreLogin, 1, 0, 9, 0, 0, 0, 0, 0xFF]);
+
+        Assert.Equal(TdsMessage.Result, stream.ReadByte());
     }
 
     [Fact]

@@ -51,6 +51,11 @@ What a client can rely on is [protocols.md](../protocols.md); this is what each 
 
 ## TDS
 
+- **Every packet the door sends is a tabular result (type 4), the prelogin answer included.**
+  SqlClient reads that answer whatever its type, so nothing it runs could tell; FreeTDS and
+  go-mssqldb refuse anything else, and FreeTDS then retries as a Sybase login -- which is why a
+  refused FreeTDS client shows up in the log as `unsupported TDS message type 2`.
+  `TdsTests.ThePreloginAnswerIsATabularResult` checks the byte.
 - **The TDS version in LOGINACK is big-endian**, though LOGIN7 sends it little-endian. Get it wrong
   and SqlClient says "invalid or unsupported protocol version" with no further clue.
 - **The login response must carry a collation (ENVCHANGE 7).** Without one SqlClient throws a

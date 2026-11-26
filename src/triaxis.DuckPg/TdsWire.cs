@@ -276,7 +276,7 @@ sealed class TdsWire(Stream stream, ILogger logger)
     /// rest stays buffered. A packet ends where the message says one may -- a whole payload in, or
     /// early, at a cut keeping a length out of the seam -- and the last may be short at
     /// <paramref name="count"/> itself, which is how a caller keeps a row out of it too.
-    public void SendUpTo(byte type, TdsMsg msg, int count)
+    public void SendUpTo(TdsMsg msg, int count)
     {
         var body = msg.Body;
         var sent = 0;
@@ -286,18 +286,18 @@ sealed class TdsWire(Stream stream, ILogger logger)
             while (sent < count)
             {
                 var end = Math.Min(msg.NextBoundary(sent, Payload), count);
-                Packet(type, body[sent..end], end: false);
+                Packet(body[sent..end], end: false);
                 sent = end;
             }
             output.Flush();
         }
 
-        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length}", type, sent);
+        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Length}", sent);
         msg.Consume(sent);
     }
 
     /// Sends everything the buffer holds, ending the message.
-    public void Send(byte type, TdsMsg msg)
+    public void Send(TdsMsg msg)
     {
         var body = msg.Body;
         var sent = 0;
@@ -308,21 +308,22 @@ sealed class TdsWire(Stream stream, ILogger logger)
             {
                 var end = msg.NextBoundary(sent, Payload);
                 if (end >= body.Length) break;
-                Packet(type, body[sent..end], end: false);
+                Packet(body[sent..end], end: false);
                 sent = end;
             }
 
-            Packet(type, body[sent..], end: true);
+            Packet(body[sent..], end: true);
             output.Flush();
         }
 
-        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Type} {Length} end", type, body.Length);
+        if (logger.IsEnabled(LogLevel.Trace)) logger.LogTrace(">> {Length} end", body.Length);
         msg.Consume(body.Length);
     }
 
-    void Packet(byte type, ReadOnlySpan<byte> body, bool end)
+    void Packet(ReadOnlySpan<byte> body, bool end)
     {
-        header[0] = type;
+        // The prelogin answer too: FreeTDS and go-mssqldb refuse one sent as anything else.
+        header[0] = TdsMessage.Result;
         header[1] = (byte)(end ? 0x01 : 0x00);
         BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(2), (ushort)(body.Length + 8));
         BinaryPrimitives.WriteUInt16BigEndian(header.AsSpan(4), 0);

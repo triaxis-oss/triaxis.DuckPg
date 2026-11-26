@@ -103,7 +103,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             {
                 var msg = new TdsMsg();
                 Done(msg, TdsToken.Done, Status.Attention, 0);
-                wire.Send(TdsMessage.Result, msg);
+                wire.Send(msg);
                 return;
             }
 
@@ -153,7 +153,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         msg.U8(Option.Terminator);
         foreach (var (_, value) in options) msg.Raw(value);
 
-        wire.Send(TdsMessage.PreLogin, msg);
+        wire.Send(msg);
     }
 
     void Login(byte[] payload, int length)
@@ -206,7 +206,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
 
         msg.U8(TdsToken.LoginAck).U16(ack.Length).Raw(ack.Body);
         Done(msg, TdsToken.Done, Status.Final, 0);
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
 
         logger.LogDebug("{User}@{Application} connected to {Database}",
             login["user"], login["application_name"], login["database"]);
@@ -259,7 +259,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             Failed(msg, e);
             return;
         }
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
     }
 
     /// Ends a response with the failure, in the message it was being built in: part of it may be on
@@ -273,7 +273,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         logger.LogWarning("{Error}", e.Message.ReplaceLineEndings(" "));
         Error(msg, e);
         Done(msg, TdsToken.Done, Status.Error, 0);
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
     }
 
     /// Every batch and RPC carries a block of stream headers -- transaction descriptor, trace
@@ -711,7 +711,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         // it was going out -- a cancel is only visible between packets.
         bool Flush(int count)
         {
-            wire.SendUpTo(TdsMessage.Result, msg, count);
+            wire.SendUpTo(msg, count);
             return Canceled();
         }
 
@@ -839,7 +839,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             return;
         }
 
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
     }
 
     /// One argument of a call, as it arrived: what the caller named it, what it sent, the column an
@@ -1113,7 +1113,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
             Failed(msg, e);
             return;
         }
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
     }
 
     /// The stream is the tokens a server sends -- column metadata, then rows -- written by the
@@ -1275,7 +1275,7 @@ sealed class TdsSession(TcpClient client, Gateway gateway, DuckDBConnection duck
         }
 
         Done(msg, TdsToken.Done, Status.Final, 0);
-        wire.Send(TdsMessage.Result, msg);
+        wire.Send(msg);
     }
 
     /// The client keeps the descriptor and quotes it back in the headers of everything it sends
